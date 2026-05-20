@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema://providers/workflow-plugin-product-capture/browser/v1",
+  "title": "Workflow product capture browser provider runtime",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "runtime": {
+      "type": "string",
+      "enum": ["podman", "docker", "nerdctl"],
+      "description": "OCI runtime available to the workflow-compute agent."
+    },
+    "browser_image": {
+      "type": "string",
+      "description": "OCI image containing node and Playwright browser dependencies."
+    },
+    "browser_image_digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Pinned digest for the browser runtime image."
+    },
+    "rootfs_digest": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Measured root filesystem digest reported by the worker."
+    }
+  },
+  "required": ["browser_image_digest", "rootfs_digest"]
+}

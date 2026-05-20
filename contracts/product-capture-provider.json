@@ -1,0 +1,41 @@
+{
+  "protocol_version": "v1",
+  "id": "product-capture-browser-v1",
+  "plugin_id": "workflow-plugin-product-capture",
+  "provider_id": "browser",
+  "contract_id": "product-capture.browser.v1",
+  "version": "v1.0.0",
+  "display_name": "Browser Product Capture",
+  "config_schema_ref": "schema://providers/workflow-plugin-product-capture/browser/v1",
+  "config_schema_digest": "sha256:f1abd4387ac0a14b8f87b30689b5ccaf477b0417fae5d6a97e71b200304a73d5",
+  "operating_modes": ["batch"],
+  "workload_kinds": ["product-capture"],
+  "executor_providers": ["product-capture-browser"],
+  "execution_security_tiers": ["sandboxed-container"],
+  "proof_tiers": ["artifact-hash"],
+  "network_modes": ["direct"],
+  "runtime_contract": {
+    "profiles": [
+      {
+        "id": "product-capture-browser-sandboxed-container-artifact-hash-runtime",
+        "runtime_profile": "sandboxed-oci-v1",
+        "executor_provider": "product-capture-browser",
+        "execution_security_tier": "sandboxed-container",
+        "proof_tier": "artifact-hash",
+        "allowed_runtime_tools": ["podman", "docker", "nerdctl"],
+        "image_digest_required": true,
+        "rootfs_digest_required": true,
+        "allowed_mount_refs": ["workspace"],
+        "writable_paths": ["/tmp"],
+        "writable_rootfs": "forbidden",
+        "privileged": "forbidden",
+        "host_namespaces": "forbidden",
+        "host_socket": "forbidden",
+        "seccomp_disable": "forbidden",
+        "no_new_privileges_disable": "forbidden",
+        "allowed_capabilities": [],
+        "conformance_profiles": ["sandboxed-oci-v1", "product-capture-v1"]
+      }
+    ]
+  }
+}

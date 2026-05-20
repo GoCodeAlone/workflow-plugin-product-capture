@@ -1,0 +1,45 @@
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go test ./...
+
+builds:
+  - id: workflow-plugin-product-capture
+    main: ./cmd/workflow-plugin-product-capture
+    binary: workflow-plugin-product-capture
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X github.com/GoCodeAlone/workflow-plugin-product-capture/internal/plugin.Version={{.Version}}
+  - id: product-capture-provider
+    main: ./cmd/product-capture-provider
+    binary: product-capture-provider
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin, windows]
+    goarch: [amd64, arm64]
+    ldflags:
+      - -s -w -X github.com/GoCodeAlone/workflow-plugin-product-capture/internal/provider.Version={{.Version}}
+
+archives:
+  - formats: [tar.gz]
+    name_template: "{{ .ProjectName }}-{{ .Os }}-{{ .Arch }}"
+    files:
+      - plugin.json
+      - plugin.contracts.json
+      - contracts/product-capture-provider.json
+      - schemas/product-capture-provider.schema.json
+      - LICENSE
+
+checksum:
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+
+release:
+  draft: true

@@ -1,0 +1,23 @@
+name: Tag immutability
+on:
+  create:
+  delete:
+permissions:
+  contents: read
+jobs:
+  guard:
+    if: github.event.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Refuse tag deletion
+        if: github.event_name == 'delete'
+        run: |
+          echo "::error::Release tags are immutable. Create a new version tag instead of deleting or moving an existing one."
+          exit 1
+      - name: Validate release tag format
+        if: github.event_name == 'create'
+        run: |
+          case "${{ github.event.ref }}" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::Release tags must use vN.N.N"; exit 1 ;;
+          esac
