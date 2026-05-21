@@ -102,3 +102,26 @@ func TestExtractAmazonThirdPartySellerAndNonPrimeShipping(t *testing.T) {
 		t.Fatalf("shipping summary: %q", got.ShippingSummary)
 	}
 }
+
+func TestExtractAmazonFallsBackToHiddenProductTitleValue(t *testing.T) {
+	html := `<!doctype html>
+<html><head><link rel="canonical" href="https://www.amazon.com/dp/B08H75RTZ8"></head>
+<body>
+  <input type="hidden" id="productTitle" name="productTitle" value="Xbox Series X - Gaming Console"/>
+  <div id="corePrice_feature_div"><span class="a-offscreen">$637.00</span></div>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/xbox.jpg">
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/dp/B08H75RTZ8",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.Title != "Xbox Series X - Gaming Console" {
+		t.Fatalf("title: %q", got.Title)
+	}
+	if got.Confidence != "high" {
+		t.Fatalf("confidence: %q", got.Confidence)
+	}
+}

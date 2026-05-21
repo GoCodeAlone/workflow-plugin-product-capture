@@ -343,17 +343,38 @@ func TestPlaywrightScriptDoesNotAutomateInterstitialOrAdvertiseStealth(t *testin
 	for _, disallowed := range []string{
 		"Continue shopping",
 		"button.click",
-		"navigator.webdriver",
-		"--disable-blink-features",
 		"stealth",
-		"userAgent",
+		"HeadlessChrome",
 	} {
 		if strings.Contains(playwrightCaptureScript, disallowed) {
 			t.Fatalf("playwright script contains disallowed automation marker %q", disallowed)
 		}
 	}
+	for _, required := range []string{
+		"userAgent",
+		"Mozilla/5.0",
+		"AppleWebKit/537.36",
+		"Chrome/",
+		"navigator",
+		"webdriver",
+		"undefined",
+		"--disable-blink-features=AutomationControlled",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("playwright script missing browser identity guard %q", required)
+		}
+	}
 	if !strings.Contains(playwrightCaptureScript, "validateCaptcha") || !strings.Contains(playwrightCaptureScript, "manual review") {
 		t.Fatalf("playwright script must fail closed on CAPTCHA/interstitial pages")
+	}
+}
+
+func TestPlaywrightScriptWaitsForVisibleProductTitleSpan(t *testing.T) {
+	if strings.Contains(playwrightCaptureScript, "locator('#productTitle').waitFor") {
+		t.Fatalf("playwright script uses strict #productTitle locator; Amazon may render a visible span and hidden input with that id")
+	}
+	if !strings.Contains(playwrightCaptureScript, "waitForFunction") || !strings.Contains(playwrightCaptureScript, "input#productTitle") {
+		t.Fatalf("playwright script should wait for either visible product title text or hidden title input value")
 	}
 }
 
