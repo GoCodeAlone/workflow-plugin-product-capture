@@ -21,11 +21,14 @@ import (
 )
 
 const (
-	ProviderName       = "workflow-plugin-product-capture"
-	ExecutorProvider   = "product-capture-browser"
-	WorkloadKind       = "product-capture"
-	CaptureModeBrowser = "browser"
-	CaptureModeMeta    = "metadata"
+	ProviderName           = "workflow-plugin-product-capture"
+	ExecutorProvider       = "product-capture-browser"
+	WorkloadKind           = "provider"
+	CaptureOperation       = "capture_product"
+	ProductJSONArtifact    = "product_json"
+	CaptureModeBrowser     = "browser"
+	CaptureModeMeta        = "metadata"
+	ComputeProtocolVersion = "compute.v1alpha1"
 )
 
 var Version = "0.1.0"
@@ -37,6 +40,22 @@ var supportedAmazonHosts = map[string]struct{}{
 
 type Request struct {
 	Workload Workload `json:"workload"`
+}
+
+type dynamicEnvelope struct {
+	ProtocolVersion string          `json:"protocol_version"`
+	TaskID          string          `json:"task_id"`
+	LeaseID         string          `json:"lease_id"`
+	ProviderConfig  providerConfig  `json:"provider_config"`
+	Operation       string          `json:"operation"`
+	Input           json.RawMessage `json:"input"`
+}
+
+type providerConfig struct {
+	PluginID   string `json:"plugin_id"`
+	ProviderID string `json:"provider_id"`
+	ContractID string `json:"contract_id"`
+	Version    string `json:"version"`
 }
 
 type Workload struct {
@@ -78,7 +97,7 @@ func WriteProbe(w io.Writer) error {
 	return enc.Encode(resp)
 }
 
-func Main(args []string, stdout, stderr io.Writer) int {
+func Main(args []string, stdout, stderr io.Writer, stdin ...io.Reader) int {
 	fs := flag.NewFlagSet("product-capture-provider", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	requestPath := fs.String("request", "", "path to product capture request JSON")
@@ -94,8 +113,19 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
+	if *requestPath == "" && *outputPath == "" {
+		input := io.Reader(os.Stdin)
+		if len(stdin) > 0 && stdin[0] != nil {
+			input = stdin[0]
+		}
+		if err := runDynamic(input, stdout); err != nil {
+			fmt.Fprintf(stderr, "product capture: %v\n", err)
+			return 1
+		}
+		return 0
+	}
 	if *requestPath == "" || *outputPath == "" {
-		fmt.Fprintln(stderr, "--request and --output are required")
+		fmt.Fprintln(stderr, "--request and --output are both required")
 		return 2
 	}
 	if err := run(*requestPath, *outputPath); err != nil {
@@ -110,23 +140,90 @@ func run(requestPath, outputPath string) error {
 	if err != nil {
 		return err
 	}
-	if err := validateWorkload(req.Workload); err != nil {
+	return runWorkload(req.Workload, outputPath)
+}
+
+func runDynamic(r io.Reader, stdout io.Writer) error {
+	env, err := readDynamicEnvelope(r)
+	if err != nil {
+		return err
+	}
+	if err := validateDynamicEnvelope(env); err != nil {
+		return err
+	}
+	var workload Workload
+	dec := json.NewDecoder(bytes.NewReader(env.Input))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&workload); err != nil {
+		return fmt.Errorf("decode operation input: %w", err)
+	}
+	var extra struct{}
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("decode operation input: multiple JSON values")
+	}
+	if err := runWorkload(workload, ProductJSONArtifact); err != nil {
+		return err
+	}
+	resp := struct {
+		Artifacts []string `json:"artifacts"`
+	}{
+		Artifacts: []string{ProductJSONArtifact},
+	}
+	enc := json.NewEncoder(stdout)
+	return enc.Encode(resp)
+}
+
+func readDynamicEnvelope(r io.Reader) (dynamicEnvelope, error) {
+	var env dynamicEnvelope
+	dec := json.NewDecoder(r)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&env); err != nil {
+		return dynamicEnvelope{}, fmt.Errorf("decode provider envelope: %w", err)
+	}
+	var extra struct{}
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return dynamicEnvelope{}, errors.New("decode provider envelope: multiple JSON values")
+	}
+	return env, nil
+}
+
+func validateDynamicEnvelope(env dynamicEnvelope) error {
+	if env.ProtocolVersion != ComputeProtocolVersion {
+		return fmt.Errorf("unsupported protocol_version %q", env.ProtocolVersion)
+	}
+	if env.ProviderConfig.PluginID != ProviderName ||
+		env.ProviderConfig.ProviderID != "browser" ||
+		env.ProviderConfig.ContractID != "product-capture.browser.v1" ||
+		env.ProviderConfig.Version != "v1.0.0" {
+		return fmt.Errorf("provider_config does not match product-capture browser v1")
+	}
+	if env.Operation != CaptureOperation {
+		return fmt.Errorf("unsupported operation %q", env.Operation)
+	}
+	if len(env.Input) == 0 {
+		return errors.New("input is required")
+	}
+	return nil
+}
+
+func runWorkload(workload Workload, outputPath string) error {
+	if err := validateWorkload(workload); err != nil {
 		return err
 	}
 
-	htmlText, err := captureHTML(req.Workload)
+	htmlText, err := captureHTML(workload)
 	if err != nil {
 		return err
 	}
 	snap, err := snapshot.ExtractAmazon(htmlText, snapshot.ExtractOptions{
-		URL:        req.Workload.URL,
+		URL:        workload.URL,
 		CapturedAt: time.Now().UTC(),
 	})
 	if err != nil {
 		return err
 	}
-	if req.Workload.MaxImageCount > 0 && len(snap.Images) > req.Workload.MaxImageCount {
-		snap.Images = snap.Images[:req.Workload.MaxImageCount]
+	if workload.MaxImageCount > 0 && len(snap.Images) > workload.MaxImageCount {
+		snap.Images = snap.Images[:workload.MaxImageCount]
 	}
 	return writeSnapshot(outputPath, snap)
 }
@@ -322,19 +419,11 @@ async function main() {
   const url = process.argv[2];
   const timeout = Number(process.argv[3] || 45000);
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  });
-  const page = await context.newPage();
+  const page = await browser.newPage();
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
-    const button = page.locator('form[action*="/errors/validateCaptcha"] button, form[action*="/errors/validateCaptcha"] input[type="submit"], button:has-text("Continue shopping")').first();
-    if (await button.count()) {
-      await button.click({ timeout: Math.min(timeout, 10000) });
-      await page.waitForLoadState('domcontentloaded', { timeout });
-    }
     if (await page.locator('form[action*="/errors/validateCaptcha"]').count()) {
-      throw new Error('amazon interstitial still present after continue');
+      throw new Error('amazon interstitial requires manual review');
     }
     await page.locator('#productTitle').waitFor({ timeout: Math.min(timeout, 15000) });
     process.stdout.write(await page.content());

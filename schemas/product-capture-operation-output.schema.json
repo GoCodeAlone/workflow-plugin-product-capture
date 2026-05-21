@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/output/v1",
+  "title": "Product capture operation output",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["product_json"]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    }
+  },
+  "required": ["artifacts"]
+}
