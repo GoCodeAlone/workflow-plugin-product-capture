@@ -148,6 +148,11 @@ func TestWriteProbeReportsComputeCapabilities(t *testing.T) {
 	if got["workload_kind"] != WorkloadKind {
 		t.Fatalf("workload_kind: %v", got["workload_kind"])
 	}
+	for _, tool := range got["runtime_tools"].([]any) {
+		if tool == "playwright" {
+			t.Fatalf("probe must not advertise playwright runtime: %v", got["runtime_tools"])
+		}
+	}
 }
 
 func TestMainRejectsUnknownRequestFields(t *testing.T) {
@@ -245,12 +250,14 @@ func TestMainRunsWorkflowComputeDynamicProviderEnvelope(t *testing.T) {
 	  "protocol_version":"compute.v1alpha1",
 	  "task_id":"task-123",
 	  "lease_id":"lease-123",
-	  "provider_config":{
-	    "plugin_id":"workflow-plugin-product-capture",
-	    "provider_id":"browser",
-	    "contract_id":"product-capture.browser.v1",
-	    "version":"v1.0.0"
-	  },
+		  "provider_config":{
+		    "plugin_id":"workflow-plugin-product-capture",
+		    "provider_id":"browser",
+		    "contract_id":"product-capture.browser.v1",
+		    "version":"v1.0.0",
+		    "config_ref":"config://network-products/product-capture/browser",
+		    "config_digest":"sha256:optional"
+		  },
 	  "operation":"capture_product",
 	  "input":{
 	    "url":"https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8",

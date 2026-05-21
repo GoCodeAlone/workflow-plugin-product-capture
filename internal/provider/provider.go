@@ -52,10 +52,12 @@ type dynamicEnvelope struct {
 }
 
 type providerConfig struct {
-	PluginID   string `json:"plugin_id"`
-	ProviderID string `json:"provider_id"`
-	ContractID string `json:"contract_id"`
-	Version    string `json:"version"`
+	PluginID     string `json:"plugin_id"`
+	ProviderID   string `json:"provider_id"`
+	ContractID   string `json:"contract_id"`
+	Version      string `json:"version"`
+	ConfigRef    string `json:"config_ref,omitempty"`
+	ConfigDigest string `json:"config_digest,omitempty"`
 }
 
 type Workload struct {
@@ -90,7 +92,7 @@ func WriteProbe(w io.Writer) error {
 		ExecutionSecurityTier: "sandboxed-container",
 		ProofTier:             "artifact-hash",
 		SupportedHosts:        supportedHosts(),
-		RuntimeTools:          []string{"node", "playwright"},
+		RuntimeTools:          []string{"node"},
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
