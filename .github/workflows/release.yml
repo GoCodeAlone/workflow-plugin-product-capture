@@ -34,7 +34,7 @@ jobs:
       - name: Notify workflow-registry of new release
         uses: peter-evans/repository-dispatch@v3
         with:
-          token: ${{ secrets.REGISTRY_PAT }}
+          token: ${{ secrets.REPO_DISPATCH_TOKEN }}
           repository: GoCodeAlone/workflow-registry
           event-type: plugin-release
           client-payload: >-
