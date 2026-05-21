@@ -420,14 +420,27 @@ const { chromium } = require('playwright');
 async function main() {
   const url = process.argv[2];
   const timeout = Number(process.argv[3] || 45000);
-  const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--disable-blink-features=AutomationControlled'],
+  });
+  const page = await browser.newPage({
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  });
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
     if (await page.locator('form[action*="/errors/validateCaptcha"]').count()) {
       throw new Error('amazon interstitial requires manual review');
     }
-    await page.locator('#productTitle').waitFor({ timeout: Math.min(timeout, 15000) });
+    await page.waitForFunction(() => {
+      const visibleTitle = document.querySelector('span#productTitle');
+      if (visibleTitle && visibleTitle.textContent && visibleTitle.textContent.trim()) return true;
+      const hiddenTitle = document.querySelector('input#productTitle');
+      return Boolean(hiddenTitle && hiddenTitle.value && hiddenTitle.value.trim());
+    }, { timeout: Math.min(timeout, 15000) });
     process.stdout.write(await page.content());
   } finally {
     await browser.close();

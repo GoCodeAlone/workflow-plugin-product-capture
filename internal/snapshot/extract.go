@@ -35,7 +35,10 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 		CapturedAt:               now,
 		RequiresUserConfirmation: true,
 	}
-	out.Title = firstTextByID(root, "productTitle")
+	out.Title = firstNonEmpty(
+		firstTextByID(root, "productTitle"),
+		firstAttrByID(root, "productTitle", "value"),
+	)
 	out.CanonicalURL = firstAttr(root, "link", "rel", "canonical", "href")
 	if out.CanonicalURL == "" {
 		out.CanonicalURL = opts.URL
