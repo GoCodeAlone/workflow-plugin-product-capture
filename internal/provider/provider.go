@@ -322,7 +322,10 @@ async function main() {
   const url = process.argv[2];
   const timeout = Number(process.argv[3] || 45000);
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage();
+  const context = await browser.newContext({
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  });
+  const page = await context.newPage();
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
     const button = page.locator('form[action*="/errors/validateCaptcha"] button, form[action*="/errors/validateCaptcha"] input[type="submit"], button:has-text("Continue shopping")').first();
