@@ -1,1 +1,7 @@
-[]
+[
+  {
+    "id": "product-capture.browser.v1",
+    "path": "contracts/product-capture-provider.json",
+    "schema": "schemas/product-capture-provider.schema.json"
+  }
+]

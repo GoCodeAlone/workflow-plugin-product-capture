@@ -1,5 +1,5 @@
 {
-  "protocol_version": "v1",
+  "protocol_version": "compute.v1alpha1",
   "id": "product-capture-browser-v1",
   "plugin_id": "workflow-plugin-product-capture",
   "provider_id": "browser",
@@ -9,11 +9,21 @@
   "config_schema_ref": "schema://providers/workflow-plugin-product-capture/browser/v1",
   "config_schema_digest": "sha256:f1abd4387ac0a14b8f87b30689b5ccaf477b0417fae5d6a97e71b200304a73d5",
   "operating_modes": ["batch"],
-  "workload_kinds": ["product-capture"],
+  "workload_kinds": ["provider"],
   "executor_providers": ["product-capture-browser"],
   "execution_security_tiers": ["sandboxed-container"],
   "proof_tiers": ["artifact-hash"],
   "network_modes": ["direct"],
+  "operations": [
+    {
+      "id": "capture_product",
+      "input_schema_ref": "schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/input/v1",
+      "input_schema_digest": "sha256:062d99dde8f4f6c421a67abd1aecda862361e039817bd4d86aacffe2b8066c25",
+      "output_schema_ref": "schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/output/v1",
+      "output_schema_digest": "sha256:cfcc9eaec5fa2d444235a1e7d4d2219d22bb0ae1b5a51ca735f8f723bf6cf389",
+      "artifacts": ["product_json"]
+    }
+  ],
   "runtime_contract": {
     "profiles": [
       {

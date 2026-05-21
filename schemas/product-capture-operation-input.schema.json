@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/input/v1",
+  "title": "Product capture operation input",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "HTTP or HTTPS product detail page URL to capture."
+    },
+    "allowed_hosts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "minItems": 1,
+      "uniqueItems": true,
+      "description": "Exact host allow-list for the submitted URL."
+    },
+    "capture_mode": {
+      "type": "string",
+      "enum": ["browser", "metadata"]
+    },
+    "timeout_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 300
+    },
+    "max_html_bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 10485760
+    },
+    "max_image_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "metadata_only": {
+      "type": "boolean"
+    }
+  },
+  "required": ["url", "allowed_hosts"]
+}
