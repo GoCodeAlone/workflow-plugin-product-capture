@@ -7,7 +7,7 @@
   "version": "v1.0.0",
   "display_name": "Browser Product Capture",
   "config_schema_ref": "schema://providers/workflow-plugin-product-capture/browser/v1",
-  "config_schema_digest": "sha256:f1abd4387ac0a14b8f87b30689b5ccaf477b0417fae5d6a97e71b200304a73d5",
+  "config_schema_digest": "sha256:9d80a225f8be36b9124ccd84e0ca24512cfb7a598470e6f53d77473a23de4dfc",
   "operating_modes": ["batch"],
   "workload_kinds": ["provider"],
   "executor_providers": ["product-capture-browser"],

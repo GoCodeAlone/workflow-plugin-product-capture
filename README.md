@@ -32,3 +32,23 @@ PRODUCT_CAPTURE_HTML_FIXTURE=internal/snapshot/testdata/amazon_xbox.html \
 Live browser capture requires `node` plus Playwright in the worker image. Local
 development can set `NODE_PATH` to a Playwright install; fixture mode is used by
 unit tests and never emits raw HTML in the provider response.
+
+## Worker runtime image
+
+Provider workloads must use a digest-pinned browser runtime image. Tagged
+releases publish:
+
+```text
+ghcr.io/gocodealone/workflow-plugin-product-capture/product-capture-browser:<tag>
+```
+
+Use the published digest from the release workflow summary when configuring
+workflow-compute:
+
+```text
+ghcr.io/gocodealone/workflow-plugin-product-capture/product-capture-browser@sha256:<digest>
+```
+
+The image contains Node, the Playwright package, and Google Chrome. It sets
+`PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` so Playwright uses the installed Chrome
+channel rather than downloading bundled Chromium.

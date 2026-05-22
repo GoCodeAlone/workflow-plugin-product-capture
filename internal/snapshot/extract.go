@@ -153,7 +153,7 @@ func amazonShippingPrice(shippingSummary string) (string, string) {
 	if strings.Contains(summary, "free delivery") || strings.Contains(summary, "free shipping") {
 		return "0.00", "USD"
 	}
-	return normalizePrice(shippingSummary)
+	return normalizeUSDPrice(shippingSummary)
 }
 
 func estimatedTotal(price, currency, shippingPrice, shippingCurrency string) (string, string) {
@@ -478,6 +478,15 @@ func normalizePrice(raw string) (string, string) {
 	price := re.FindString(raw)
 	price = strings.ReplaceAll(price, ",", "")
 	return price, currency
+}
+
+func normalizeUSDPrice(raw string) (string, string) {
+	re := regexp.MustCompile(`\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)`)
+	match := re.FindStringSubmatch(raw)
+	if len(match) != 2 {
+		return "", ""
+	}
+	return strings.ReplaceAll(match[1], ",", ""), "USD"
 }
 
 func parseMoneyCents(value string) (int64, bool) {

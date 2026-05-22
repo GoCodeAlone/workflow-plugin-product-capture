@@ -209,3 +209,25 @@ func TestExtractAmazonAddsPaidShippingToEstimatedTotal(t *testing.T) {
 		t.Fatalf("estimated total: %q currency=%q", got.EstimatedTotal, got.EstimatedTotalCurrency)
 	}
 }
+
+func TestExtractAmazonShippingPriceIgnoresDeliveryDates(t *testing.T) {
+	html := `<!doctype html>
+<html><body>
+  <span id="productTitle">Xbox Series X - Gaming Console</span>
+  <div id="corePrice_feature_div"><span class="a-offscreen">$637.00</span></div>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/xbox.jpg">
+  <div id="mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE">
+    Delivery May 28 for $12.49
+  </div>
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/dp/B08H75RTZ8",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.ShippingPrice != "12.49" || got.EstimatedTotal != "649.49" {
+		t.Fatalf("shipping should use dollar amount, not delivery date: shipping=%q total=%q", got.ShippingPrice, got.EstimatedTotal)
+	}
+}

@@ -92,7 +92,7 @@ func WriteProbe(w io.Writer) error {
 		ExecutionSecurityTier: "sandboxed-container",
 		ProofTier:             "artifact-hash",
 		SupportedHosts:        supportedHosts(),
-		RuntimeTools:          []string{"node"},
+		RuntimeTools:          []string{"node", "chrome"},
 	}
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
