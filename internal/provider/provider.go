@@ -417,13 +417,18 @@ func supportedHosts() []string {
 const playwrightCaptureScript = `
 const { chromium } = require('playwright');
 
-async function main() {
-  const url = process.argv[2];
-  const timeout = Number(process.argv[3] || 45000);
-  const browser = await chromium.launch({
+async function launchChromeBrowser() {
+  return await chromium.launch({
+    channel: 'chrome',
     headless: true,
     args: ['--disable-blink-features=AutomationControlled'],
   });
+}
+
+async function main() {
+  const url = process.argv[2];
+  const timeout = Number(process.argv[3] || 45000);
+  const browser = await launchChromeBrowser();
   const page = await browser.newPage({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });

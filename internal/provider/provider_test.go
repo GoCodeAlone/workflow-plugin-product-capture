@@ -369,6 +369,26 @@ func TestPlaywrightScriptDoesNotAutomateInterstitialOrAdvertiseStealth(t *testin
 	}
 }
 
+func TestPlaywrightScriptPrefersStandardChromeChannel(t *testing.T) {
+	for _, required := range []string{
+		"channel: 'chrome'",
+		"launchChromeBrowser",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("playwright script should launch standard Chrome instead of bundled Chromium; missing %q", required)
+		}
+	}
+	for _, disallowed := range []string{
+		"channel of",
+		"msedge",
+		"chromium.launch(launchOptions)",
+	} {
+		if strings.Contains(playwrightCaptureScript, disallowed) {
+			t.Fatalf("playwright script should not silently fall back to non-Chrome launch path %q", disallowed)
+		}
+	}
+}
+
 func TestPlaywrightScriptWaitsForVisibleProductTitleSpan(t *testing.T) {
 	if strings.Contains(playwrightCaptureScript, "locator('#productTitle').waitFor") {
 		t.Fatalf("playwright script uses strict #productTitle locator; Amazon may render a visible span and hidden input with that id")

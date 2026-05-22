@@ -43,8 +43,12 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 	if out.CanonicalURL == "" {
 		out.CanonicalURL = opts.URL
 	}
-	out.ImageURL = firstAttrByID(root, "landingImage", "src")
-	out.Images = dynamicImages(firstAttrByID(root, "landingImage", "data-a-dynamic-image"))
+	out.ImageURL = firstNonEmpty(
+		firstAttrByID(root, "landingImage", "src"),
+		firstProductImageAttr(root, "data-old-hires"),
+		firstProductImageAttr(root, "src"),
+	)
+	out.Images = uniqueNonEmpty(dynamicImages(firstAttrByID(root, "landingImage", "data-a-dynamic-image")))
 	if out.ImageURL != "" && !contains(out.Images, out.ImageURL) {
 		out.Images = append([]string{out.ImageURL}, out.Images...)
 	}
@@ -118,6 +122,8 @@ func amazonShipsFrom(root *html.Node, seller string) string {
 func amazonShippingSummary(root *html.Node) string {
 	return firstNonEmpty(
 		firstTextByID(root, "mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE"),
+		firstTextByID(root, "mir-layout-DELIVERY_BLOCK-slot-SECONDARY_DELIVERY_MESSAGE_LARGE"),
+		firstTextByID(root, "deliveryBlockMessage"),
 		firstTextByID(root, "primeShippingMessage_feature_div"),
 	)
 }
@@ -295,6 +301,31 @@ func firstAttr(root *html.Node, tag, attrName, attrValue, want string) string {
 	return strings.TrimSpace(found)
 }
 
+func firstProductImageAttr(root *html.Node, name string) string {
+	for _, id := range []string{"imgTagWrapperId", "main-image-container"} {
+		container := nodeByID(root, id)
+		if container == nil {
+			continue
+		}
+		if value := firstImageAttr(container, name); value != "" {
+			return value
+		}
+	}
+	return firstImageAttr(root, name)
+}
+
+func firstImageAttr(root *html.Node, name string) string {
+	var found string
+	walk(root, func(n *html.Node) bool {
+		if n.Type == html.ElementNode && n.Data == "img" {
+			found = attr(n, name)
+			return found == ""
+		}
+		return true
+	})
+	return strings.TrimSpace(found)
+}
+
 func nodeByID(root *html.Node, id string) *html.Node {
 	var found *html.Node
 	walk(root, func(n *html.Node) bool {
@@ -389,6 +420,18 @@ func dynamicImages(raw string) []string {
 	out := make([]string, 0, len(parsed))
 	for img := range parsed {
 		out = append(out, img)
+	}
+	return out
+}
+
+func uniqueNonEmpty(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || contains(out, value) {
+			continue
+		}
+		out = append(out, value)
 	}
 	return out
 }

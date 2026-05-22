@@ -125,3 +125,53 @@ func TestExtractAmazonFallsBackToHiddenProductTitleValue(t *testing.T) {
 		t.Fatalf("confidence: %q", got.Confidence)
 	}
 }
+
+func TestExtractAmazonFallsBackToImageWrapperPhoto(t *testing.T) {
+	html := `<!doctype html>
+<html><body>
+  <span id="productTitle">Xbox Series X - Gaming Console</span>
+  <div id="corePrice_feature_div"><span class="a-offscreen">$637.00</span></div>
+  <div id="imgTagWrapperId">
+    <img data-old-hires="https://m.media-amazon.com/images/I/xbox-hires.jpg"
+         src="https://m.media-amazon.com/images/I/xbox-inline.jpg">
+  </div>
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/dp/B08H75RTZ8",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.ImageURL == "" || len(got.Images) == 0 {
+		t.Fatalf("expected at least one product image: image=%q images=%v", got.ImageURL, got.Images)
+	}
+	if got.ImageURL != "https://m.media-amazon.com/images/I/xbox-hires.jpg" {
+		t.Fatalf("image_url: %q", got.ImageURL)
+	}
+}
+
+func TestExtractAmazonUsesSecondaryDeliveryEstimate(t *testing.T) {
+	html := `<!doctype html>
+<html><body>
+  <span id="productTitle">Xbox Series X - Gaming Console</span>
+  <div id="corePrice_feature_div"><span class="a-offscreen">$637.00</span></div>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/xbox.jpg">
+  <div id="mir-layout-DELIVERY_BLOCK-slot-SECONDARY_DELIVERY_MESSAGE_LARGE">
+    FREE delivery Tuesday, May 26
+  </div>
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/dp/B08H75RTZ8",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.ShippingSummary != "FREE delivery Tuesday, May 26" {
+		t.Fatalf("shipping summary: %q", got.ShippingSummary)
+	}
+	if got.PrimeEligible == nil || *got.PrimeEligible {
+		t.Fatalf("free delivery should be known non-prime unless a prime marker is present: %+v", got.PrimeEligible)
+	}
+}
