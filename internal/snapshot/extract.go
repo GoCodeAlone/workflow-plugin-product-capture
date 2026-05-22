@@ -68,6 +68,9 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 	out.Rating = firstNonEmpty(firstTextByID(root, "acrPopover"), firstTextByClass(root, "a-icon-alt"))
 	out.ReviewCount = firstTextByID(root, "acrCustomerReviewText")
 	out.Description = strings.Join(textsByClassUnderID(root, "feature-bullets", "a-list-item", 8), "\n")
+	if amazonUnavailable(out.Availability) {
+		clearTransactionalFields(&out)
+	}
 	if out.Title == "" {
 		return Snapshot{}, errors.New("amazon product title not found")
 	}
@@ -77,6 +80,26 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 		out.Confidence = "medium"
 	}
 	return out, nil
+}
+
+func amazonUnavailable(availability string) bool {
+	availability = strings.ToLower(clean(availability))
+	return strings.Contains(availability, "currently unavailable") ||
+		strings.Contains(availability, "temporarily out of stock") ||
+		strings.Contains(availability, "out of stock")
+}
+
+func clearTransactionalFields(out *Snapshot) {
+	out.Price = ""
+	out.Currency = ""
+	out.Seller = ""
+	out.ShipsFrom = ""
+	out.ShippingSummary = ""
+	out.ShippingPrice = ""
+	out.ShippingCurrency = ""
+	out.EstimatedTotal = ""
+	out.EstimatedTotalCurrency = ""
+	out.PrimeEligible = nil
 }
 
 func amazonAvailability(root *html.Node) string {
