@@ -80,6 +80,37 @@ func TestExtractAmazonUnavailableProductStillSnapshots(t *testing.T) {
 	}
 }
 
+func TestExtractAmazonUnavailableProductSuppressesTransactionalFields(t *testing.T) {
+	html := `<!doctype html>
+<html><body>
+  <span id="productTitle">Xbox Series X + Elite Core wireless controller blue</span>
+  <div id="availability"><span class="a-size-medium">Currently unavailable.</span></div>
+  <div id="corePrice_feature_div"><span class="a-offscreen">$48.48</span></div>
+  <i class="a-icon a-icon-prime"></i>
+  <div id="mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE">
+    FREE delivery tomorrow
+  </div>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/xbox.jpg">
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/dp/B0CMVPN6GL",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.Price != "" || got.Currency != "" || got.ShippingPrice != "" || got.EstimatedTotal != "" {
+		t.Fatalf("unavailable product should not expose transactional totals: price=%q currency=%q shipping=%q total=%q",
+			got.Price, got.Currency, got.ShippingPrice, got.EstimatedTotal)
+	}
+	if got.PrimeEligible != nil {
+		t.Fatalf("unavailable product should not expose Prime eligibility: %+v", got.PrimeEligible)
+	}
+	if got.Confidence != "medium" {
+		t.Fatalf("confidence: %q", got.Confidence)
+	}
+}
+
 func TestExtractAmazonThirdPartySellerAndNonPrimeShipping(t *testing.T) {
 	data, err := os.ReadFile("testdata/amazon_xbox_third_party.html")
 	if err != nil {
