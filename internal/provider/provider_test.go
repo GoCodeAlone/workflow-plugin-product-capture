@@ -369,6 +369,9 @@ func TestPlaywrightScriptDoesNotAutomateInterstitialOrAdvertiseStealth(t *testin
 		"webdriver",
 		"undefined",
 		"--disable-blink-features=AutomationControlled",
+		"--no-sandbox",
+		"--disable-setuid-sandbox",
+		"--disable-dev-shm-usage",
 	} {
 		if !strings.Contains(playwrightCaptureScript, required) {
 			t.Fatalf("playwright script missing browser identity guard %q", required)
@@ -405,6 +408,22 @@ func TestPlaywrightScriptWaitsForVisibleProductTitleSpan(t *testing.T) {
 	}
 	if !strings.Contains(playwrightCaptureScript, "waitForFunction") || !strings.Contains(playwrightCaptureScript, "input#productTitle") {
 		t.Fatalf("playwright script should wait for either visible product title text or hidden title input value")
+	}
+}
+
+func TestPlaywrightScriptWaitsForCaptureRelevantNodes(t *testing.T) {
+	for _, required := range []string{
+		"optionalWait",
+		"#landingImage",
+		"#corePrice_feature_div .a-offscreen",
+		".priceToPay .a-offscreen",
+		"#deliveryBlockMessage",
+		"#primeShippingMessage_feature_div",
+		".catch(() => {})",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("playwright script missing optional capture wait for %q", required)
+		}
 	}
 }
 
