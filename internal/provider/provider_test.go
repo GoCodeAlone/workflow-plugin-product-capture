@@ -2,6 +2,8 @@ package provider
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -78,6 +80,14 @@ func TestProviderContractAlignsWithWorkflowComputeGenericProviderABI(t *testing.
 	}
 	if capture.InputSchemaRef == "" || capture.OutputSchemaRef == "" {
 		t.Fatalf("operation schema refs missing: %+v", *capture)
+	}
+	schemaData, err := os.ReadFile(filepath.Join("..", "..", "schemas", "product-capture-provider.schema.json"))
+	if err != nil {
+		t.Fatalf("read provider schema: %v", err)
+	}
+	sum := sha256.Sum256(schemaData)
+	if want := "sha256:" + hex.EncodeToString(sum[:]); contract.ConfigSchemaDigest != want {
+		t.Fatalf("config schema digest = %q, want %q", contract.ConfigSchemaDigest, want)
 	}
 	if !strings.HasPrefix(capture.InputSchemaDigest, "sha256:") || !strings.HasPrefix(capture.OutputSchemaDigest, "sha256:") {
 		t.Fatalf("operation schema digests missing: %+v", *capture)
@@ -366,6 +376,26 @@ func TestPlaywrightScriptDoesNotAutomateInterstitialOrAdvertiseStealth(t *testin
 	}
 	if !strings.Contains(playwrightCaptureScript, "validateCaptcha") || !strings.Contains(playwrightCaptureScript, "manual review") {
 		t.Fatalf("playwright script must fail closed on CAPTCHA/interstitial pages")
+	}
+}
+
+func TestPlaywrightScriptPrefersStandardChromeChannel(t *testing.T) {
+	for _, required := range []string{
+		"channel: 'chrome'",
+		"launchChromeBrowser",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("playwright script should launch standard Chrome instead of bundled Chromium; missing %q", required)
+		}
+	}
+	for _, disallowed := range []string{
+		"channel of",
+		"msedge",
+		"chromium.launch(launchOptions)",
+	} {
+		if strings.Contains(playwrightCaptureScript, disallowed) {
+			t.Fatalf("playwright script should not silently fall back to non-Chrome launch path %q", disallowed)
+		}
 	}
 }
 

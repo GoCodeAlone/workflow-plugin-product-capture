@@ -12,7 +12,7 @@
     },
     "browser_image": {
       "type": "string",
-      "description": "OCI image containing node and Playwright browser dependencies."
+      "description": "OCI image repository containing Node, the Playwright package, and Google Chrome. Combine with browser_image_digest as browser_image@browser_image_digest when submitting provider workloads."
     },
     "browser_image_digest": {
       "type": "string",
@@ -25,5 +25,5 @@
       "description": "Measured root filesystem digest reported by the worker."
     }
   },
-  "required": ["browser_image_digest", "rootfs_digest"]
+  "required": ["browser_image", "browser_image_digest", "rootfs_digest"]
 }

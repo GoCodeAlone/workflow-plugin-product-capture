@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -43,8 +44,12 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 	if out.CanonicalURL == "" {
 		out.CanonicalURL = opts.URL
 	}
-	out.ImageURL = firstAttrByID(root, "landingImage", "src")
-	out.Images = dynamicImages(firstAttrByID(root, "landingImage", "data-a-dynamic-image"))
+	out.ImageURL = firstNonEmpty(
+		firstAttrByID(root, "landingImage", "src"),
+		firstProductImageAttr(root, "data-old-hires"),
+		firstProductImageAttr(root, "src"),
+	)
+	out.Images = uniqueNonEmpty(dynamicImages(firstAttrByID(root, "landingImage", "data-a-dynamic-image")))
 	if out.ImageURL != "" && !contains(out.Images, out.ImageURL) {
 		out.Images = append([]string{out.ImageURL}, out.Images...)
 	}
@@ -57,6 +62,8 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 	out.Seller = amazonSeller(root)
 	out.ShipsFrom = amazonShipsFrom(root, out.Seller)
 	out.ShippingSummary = amazonShippingSummary(root)
+	out.ShippingPrice, out.ShippingCurrency = amazonShippingPrice(out.ShippingSummary)
+	out.EstimatedTotal, out.EstimatedTotalCurrency = estimatedTotal(out.Price, out.Currency, out.ShippingPrice, out.ShippingCurrency)
 	out.PrimeEligible = amazonPrimeEligible(root, out.ShippingSummary)
 	out.Rating = firstNonEmpty(firstTextByID(root, "acrPopover"), firstTextByClass(root, "a-icon-alt"))
 	out.ReviewCount = firstTextByID(root, "acrCustomerReviewText")
@@ -118,6 +125,8 @@ func amazonShipsFrom(root *html.Node, seller string) string {
 func amazonShippingSummary(root *html.Node) string {
 	return firstNonEmpty(
 		firstTextByID(root, "mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE"),
+		firstTextByID(root, "mir-layout-DELIVERY_BLOCK-slot-SECONDARY_DELIVERY_MESSAGE_LARGE"),
+		firstTextByID(root, "deliveryBlockMessage"),
 		firstTextByID(root, "primeShippingMessage_feature_div"),
 	)
 }
@@ -134,6 +143,32 @@ func amazonPrimeEligible(root *html.Node, shippingSummary string) *bool {
 		return boolPtr(false)
 	}
 	return nil
+}
+
+func amazonShippingPrice(shippingSummary string) (string, string) {
+	summary := strings.ToLower(clean(shippingSummary))
+	if summary == "" {
+		return "", ""
+	}
+	if strings.Contains(summary, "free delivery") || strings.Contains(summary, "free shipping") {
+		return "0.00", "USD"
+	}
+	return normalizeUSDPrice(shippingSummary)
+}
+
+func estimatedTotal(price, currency, shippingPrice, shippingCurrency string) (string, string) {
+	if price == "" || currency == "" || shippingPrice == "" || shippingCurrency == "" || currency != shippingCurrency {
+		return "", ""
+	}
+	priceCents, ok := parseMoneyCents(price)
+	if !ok {
+		return "", ""
+	}
+	shippingCents, ok := parseMoneyCents(shippingPrice)
+	if !ok {
+		return "", ""
+	}
+	return formatMoneyCents(priceCents + shippingCents), currency
 }
 
 func offerDisplayValue(root *html.Node, label string) string {
@@ -295,6 +330,31 @@ func firstAttr(root *html.Node, tag, attrName, attrValue, want string) string {
 	return strings.TrimSpace(found)
 }
 
+func firstProductImageAttr(root *html.Node, name string) string {
+	for _, id := range []string{"imgTagWrapperId", "main-image-container"} {
+		container := nodeByID(root, id)
+		if container == nil {
+			continue
+		}
+		if value := firstImageAttr(container, name); value != "" {
+			return value
+		}
+	}
+	return firstImageAttr(root, name)
+}
+
+func firstImageAttr(root *html.Node, name string) string {
+	var found string
+	walk(root, func(n *html.Node) bool {
+		if n.Type == html.ElementNode && n.Data == "img" {
+			found = attr(n, name)
+			return found == ""
+		}
+		return true
+	})
+	return strings.TrimSpace(found)
+}
+
 func nodeByID(root *html.Node, id string) *html.Node {
 	var found *html.Node
 	walk(root, func(n *html.Node) bool {
@@ -393,6 +453,18 @@ func dynamicImages(raw string) []string {
 	return out
 }
 
+func uniqueNonEmpty(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" || contains(out, value) {
+			continue
+		}
+		out = append(out, value)
+	}
+	return out
+}
+
 func normalizePrice(raw string) (string, string) {
 	raw = clean(raw)
 	if raw == "" {
@@ -406,6 +478,45 @@ func normalizePrice(raw string) (string, string) {
 	price := re.FindString(raw)
 	price = strings.ReplaceAll(price, ",", "")
 	return price, currency
+}
+
+func normalizeUSDPrice(raw string) (string, string) {
+	re := regexp.MustCompile(`\$\s*([0-9][0-9,]*(?:\.[0-9]{2})?)`)
+	match := re.FindStringSubmatch(raw)
+	if len(match) != 2 {
+		return "", ""
+	}
+	return strings.ReplaceAll(match[1], ",", ""), "USD"
+}
+
+func parseMoneyCents(value string) (int64, bool) {
+	parts := strings.Split(value, ".")
+	if len(parts) > 2 || parts[0] == "" {
+		return 0, false
+	}
+	dollars, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	cents := int64(0)
+	if len(parts) == 2 {
+		fraction := parts[1]
+		if len(fraction) == 1 {
+			fraction += "0"
+		}
+		if len(fraction) != 2 {
+			return 0, false
+		}
+		cents, err = strconv.ParseInt(fraction, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+	}
+	return dollars*100 + cents, true
+}
+
+func formatMoneyCents(cents int64) string {
+	return fmt.Sprintf("%d.%02d", cents/100, cents%100)
 }
 
 func cleanAvailability(raw string) string {

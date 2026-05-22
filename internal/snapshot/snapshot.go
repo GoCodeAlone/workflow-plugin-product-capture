@@ -16,6 +16,10 @@ type Snapshot struct {
 	Seller                   string    `json:"seller,omitempty"`
 	ShipsFrom                string    `json:"ships_from,omitempty"`
 	ShippingSummary          string    `json:"shipping_summary,omitempty"`
+	ShippingPrice            string    `json:"shipping_price,omitempty"`
+	ShippingCurrency         string    `json:"shipping_currency,omitempty"`
+	EstimatedTotal           string    `json:"estimated_total,omitempty"`
+	EstimatedTotalCurrency   string    `json:"estimated_total_currency,omitempty"`
 	PrimeEligible            *bool     `json:"prime_eligible,omitempty"`
 	ImageURL                 string    `json:"image_url,omitempty"`
 	Images                   []string  `json:"images,omitempty"`
