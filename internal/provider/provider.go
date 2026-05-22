@@ -421,7 +421,12 @@ async function launchChromeBrowser() {
   return await chromium.launch({
     channel: 'chrome',
     headless: true,
-    args: ['--disable-blink-features=AutomationControlled'],
+    args: [
+      '--disable-blink-features=AutomationControlled',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+    ],
   });
 }
 
@@ -446,6 +451,31 @@ async function main() {
       const hiddenTitle = document.querySelector('input#productTitle');
       return Boolean(hiddenTitle && hiddenTitle.value && hiddenTitle.value.trim());
     }, { timeout: Math.min(timeout, 15000) });
+    const optionalWait = Math.min(Math.max(timeout - 15000, 0), 5000);
+    if (optionalWait > 0) {
+      await page.waitForFunction(() => {
+        const text = (selector) => {
+          const node = document.querySelector(selector);
+          return node && node.textContent && node.textContent.trim();
+        };
+        const attr = (selector, name) => {
+          const node = document.querySelector(selector);
+          return node && node.getAttribute(name);
+        };
+        return Boolean(
+          attr('#landingImage', 'src') ||
+          attr('#landingImage', 'data-a-dynamic-image') ||
+          text('#corePrice_feature_div .a-offscreen') ||
+          text('#apex_desktop .a-offscreen') ||
+          text('.apexPriceToPay .a-offscreen') ||
+          text('.priceToPay .a-offscreen') ||
+          text('#mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE') ||
+          text('#mir-layout-DELIVERY_BLOCK-slot-SECONDARY_DELIVERY_MESSAGE_LARGE') ||
+          text('#deliveryBlockMessage') ||
+          text('#primeShippingMessage_feature_div')
+        );
+      }, { timeout: optionalWait }).catch(() => {});
+    }
     process.stdout.write(await page.content());
   } finally {
     await browser.close();
