@@ -13,10 +13,6 @@ and a nullable `prime_eligible` flag. Unavailable products are still valid
 snapshots; they normally omit price and Prime status while preserving
 `availability`.
 
-BMW currently uses this as an Amazon fallback when the official Amazon API path
-is unavailable. Captured data is not official retailer API data and must be
-confirmed by the user before persistence.
-
 ## Commands
 
 ```sh
