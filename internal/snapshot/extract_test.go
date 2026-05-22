@@ -31,6 +31,12 @@ func TestExtractAmazonObservedXboxShape(t *testing.T) {
 	if got.PrimeEligible == nil || *got.PrimeEligible {
 		t.Fatalf("prime should be known false for free non-prime delivery: %+v", got.PrimeEligible)
 	}
+	if got.ShippingPrice != "0.00" || got.ShippingCurrency != "USD" {
+		t.Fatalf("shipping price: %q currency=%q", got.ShippingPrice, got.ShippingCurrency)
+	}
+	if got.EstimatedTotal != "637.00" || got.EstimatedTotalCurrency != "USD" {
+		t.Fatalf("estimated total: %q currency=%q", got.EstimatedTotal, got.EstimatedTotalCurrency)
+	}
 	if got.ExternalID != "B08H75RTZ8" {
 		t.Fatalf("asin: %q", got.ExternalID)
 	}
@@ -173,5 +179,33 @@ func TestExtractAmazonUsesSecondaryDeliveryEstimate(t *testing.T) {
 	}
 	if got.PrimeEligible == nil || *got.PrimeEligible {
 		t.Fatalf("free delivery should be known non-prime unless a prime marker is present: %+v", got.PrimeEligible)
+	}
+	if got.ShippingPrice != "0.00" || got.EstimatedTotal != "637.00" {
+		t.Fatalf("free shipping should produce zero shipping and price-only total: shipping=%q total=%q", got.ShippingPrice, got.EstimatedTotal)
+	}
+}
+
+func TestExtractAmazonAddsPaidShippingToEstimatedTotal(t *testing.T) {
+	html := `<!doctype html>
+<html><body>
+  <span id="productTitle">Xbox Series X - Gaming Console</span>
+  <div id="corePrice_feature_div"><span class="a-offscreen">$637.00</span></div>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/xbox.jpg">
+  <div id="mir-layout-DELIVERY_BLOCK-slot-PRIMARY_DELIVERY_MESSAGE_LARGE">
+    $12.49 delivery Tuesday, May 26
+  </div>
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/dp/B08H75RTZ8",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.ShippingPrice != "12.49" || got.ShippingCurrency != "USD" {
+		t.Fatalf("shipping price: %q currency=%q", got.ShippingPrice, got.ShippingCurrency)
+	}
+	if got.EstimatedTotal != "649.49" || got.EstimatedTotalCurrency != "USD" {
+		t.Fatalf("estimated total: %q currency=%q", got.EstimatedTotal, got.EstimatedTotalCurrency)
 	}
 }

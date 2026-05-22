@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -61,6 +62,8 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 	out.Seller = amazonSeller(root)
 	out.ShipsFrom = amazonShipsFrom(root, out.Seller)
 	out.ShippingSummary = amazonShippingSummary(root)
+	out.ShippingPrice, out.ShippingCurrency = amazonShippingPrice(out.ShippingSummary)
+	out.EstimatedTotal, out.EstimatedTotalCurrency = estimatedTotal(out.Price, out.Currency, out.ShippingPrice, out.ShippingCurrency)
 	out.PrimeEligible = amazonPrimeEligible(root, out.ShippingSummary)
 	out.Rating = firstNonEmpty(firstTextByID(root, "acrPopover"), firstTextByClass(root, "a-icon-alt"))
 	out.ReviewCount = firstTextByID(root, "acrCustomerReviewText")
@@ -140,6 +143,32 @@ func amazonPrimeEligible(root *html.Node, shippingSummary string) *bool {
 		return boolPtr(false)
 	}
 	return nil
+}
+
+func amazonShippingPrice(shippingSummary string) (string, string) {
+	summary := strings.ToLower(clean(shippingSummary))
+	if summary == "" {
+		return "", ""
+	}
+	if strings.Contains(summary, "free delivery") || strings.Contains(summary, "free shipping") {
+		return "0.00", "USD"
+	}
+	return normalizePrice(shippingSummary)
+}
+
+func estimatedTotal(price, currency, shippingPrice, shippingCurrency string) (string, string) {
+	if price == "" || currency == "" || shippingPrice == "" || shippingCurrency == "" || currency != shippingCurrency {
+		return "", ""
+	}
+	priceCents, ok := parseMoneyCents(price)
+	if !ok {
+		return "", ""
+	}
+	shippingCents, ok := parseMoneyCents(shippingPrice)
+	if !ok {
+		return "", ""
+	}
+	return formatMoneyCents(priceCents + shippingCents), currency
 }
 
 func offerDisplayValue(root *html.Node, label string) string {
@@ -449,6 +478,36 @@ func normalizePrice(raw string) (string, string) {
 	price := re.FindString(raw)
 	price = strings.ReplaceAll(price, ",", "")
 	return price, currency
+}
+
+func parseMoneyCents(value string) (int64, bool) {
+	parts := strings.Split(value, ".")
+	if len(parts) > 2 || parts[0] == "" {
+		return 0, false
+	}
+	dollars, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	cents := int64(0)
+	if len(parts) == 2 {
+		fraction := parts[1]
+		if len(fraction) == 1 {
+			fraction += "0"
+		}
+		if len(fraction) != 2 {
+			return 0, false
+		}
+		cents, err = strconv.ParseInt(fraction, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+	}
+	return dollars*100 + cents, true
+}
+
+func formatMoneyCents(cents int64) string {
+	return fmt.Sprintf("%d.%02d", cents/100, cents%100)
 }
 
 func cleanAvailability(raw string) string {

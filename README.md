@@ -9,6 +9,7 @@ snapshot, and returns provenance-marked data for user confirmation.
 
 Amazon snapshots include title, ASIN, canonical URL, representative images,
 availability, price when present, seller, ships-from party, shipping summary,
+shipping price when Amazon exposes it, estimated product-plus-shipping total,
 and a nullable `prime_eligible` flag. Unavailable products are still valid
 snapshots; they normally omit price and Prime status while preserving
 `availability`.
