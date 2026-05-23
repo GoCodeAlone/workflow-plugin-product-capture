@@ -14,6 +14,7 @@ require (
 	github.com/GoCodeAlone/modular v1.13.0 // indirect
 	github.com/GoCodeAlone/modular/modules/auth v1.15.0 // indirect
 	github.com/GoCodeAlone/modular/modules/eventbus/v2 v2.8.0 // indirect
+	github.com/GoCodeAlone/workflow-compute v0.0.0-20260523064329-58fe23d9f596 // indirect
 	github.com/GoCodeAlone/yaegi v0.17.2 // indirect
 	github.com/IBM/sarama v1.47.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
@@ -84,7 +85,7 @@ require (
 	github.com/itchyny/timefmt-go v0.1.7 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jackc/pgx/v5 v5.9.1 // indirect
+	github.com/jackc/pgx/v5 v5.9.2 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/jcmturner/aescts/v2 v2.0.0 // indirect
 	github.com/jcmturner/dnsutils/v2 v2.0.0 // indirect

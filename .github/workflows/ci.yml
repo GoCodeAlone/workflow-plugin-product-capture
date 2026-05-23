@@ -16,5 +16,12 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
+      - name: Configure private Go modules
+        env:
+          RELEASES_TOKEN: ${{ secrets.RELEASES_TOKEN || github.token }}
+        run: |
+          git config --global url."https://x-access-token:${RELEASES_TOKEN}@github.com/GoCodeAlone/".insteadOf "https://github.com/GoCodeAlone/"
+          go env -w GOPRIVATE=github.com/GoCodeAlone/*
+          go env -w GONOSUMDB=github.com/GoCodeAlone/*
       - run: go test ./... -race -count=1
       - run: go vet ./...
