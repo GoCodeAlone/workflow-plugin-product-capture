@@ -48,3 +48,11 @@ ghcr.io/gocodealone/workflow-plugin-product-capture/product-capture-browser@sha2
 The image contains Node, the Playwright package, and Google Chrome. It sets
 `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` so Playwright uses the installed Chrome
 channel rather than downloading bundled Chromium.
+
+## Workflow step
+
+Use `step.product_capture` when a Workflow app needs to submit a product URL to
+workflow-compute. The step owns product-capture-specific validation and submits
+a generic provider workload using the `product-capture.browser.v1` contract.
+`workflow-plugin-compute` should only provide generic dispatch/wait/catalog
+plumbing.

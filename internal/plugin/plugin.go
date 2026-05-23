@@ -24,9 +24,14 @@ func (productCapturePlugin) Manifest() sdk.PluginManifest {
 }
 
 func (productCapturePlugin) StepTypes() []string {
-	return nil
+	return []string{"step.product_capture"}
 }
 
 func (productCapturePlugin) CreateStep(typeName, name string, config map[string]any) (sdk.StepInstance, error) {
-	return nil, fmt.Errorf("product-capture plugin: unknown step type %q", typeName)
+	switch typeName {
+	case "step.product_capture":
+		return newProductCaptureStep(name, config)
+	default:
+		return nil, fmt.Errorf("product-capture plugin: unknown step type %q", typeName)
+	}
 }
