@@ -11,5 +11,5 @@ func main() {
 	if len(os.Args) > 1 {
 		os.Exit(plugin.NewCLIProvider().RunCLI(os.Args[1:]))
 	}
-	sdk.Serve(plugin.NewPlugin())
+	sdk.Serve(plugin.NewPlugin(), sdk.WithBuildVersion(sdk.ResolveBuildVersion(plugin.Version)))
 }
