@@ -3,7 +3,7 @@ module github.com/GoCodeAlone/workflow-plugin-product-capture
 go 1.26.0
 
 require (
-	github.com/GoCodeAlone/workflow v0.62.0
+	github.com/GoCodeAlone/workflow v0.64.0
 	github.com/GoCodeAlone/workflow-compute v0.0.0-20260523064329-58fe23d9f596
 	golang.org/x/net v0.54.0
 )
