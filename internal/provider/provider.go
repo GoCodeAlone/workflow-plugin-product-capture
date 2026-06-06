@@ -430,6 +430,32 @@ async function launchChromeBrowser() {
   });
 }
 
+function isTransientNavigationError(err) {
+  const message = err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
+  return [
+    'net::ERR_NETWORK_CHANGED',
+    'net::ERR_NETWORK_RESET',
+    'net::ERR_TIMED_OUT',
+  ].some((needle) => message.includes(needle));
+}
+
+async function gotoWithTransientRetry(page, url, timeout) {
+  let lastErr;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 3 || !isTransientNavigationError(err)) {
+        throw err;
+      }
+      await page.waitForTimeout(500 * attempt);
+    }
+  }
+  throw lastErr;
+}
+
 async function main() {
   const url = process.argv[2];
   const timeout = Number(process.argv[3] || 45000);
@@ -441,7 +467,7 @@ async function main() {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+    await gotoWithTransientRetry(page, url, timeout);
     if (await page.locator('form[action*="/errors/validateCaptcha"]').count()) {
       throw new Error('amazon interstitial requires manual review');
     }
