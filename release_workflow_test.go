@@ -83,6 +83,39 @@ func TestRuntimeImageInstallsChromeAndPlaywrightWithoutBundledBrowser(t *testing
 	}
 }
 
+func TestRuntimeImageRunsProductCaptureProviderEntrypoint(t *testing.T) {
+	data, err := os.ReadFile("docker/product-capture-browser/Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerfile := string(data)
+	for _, want := range []string{
+		"COPY docker/product-capture-browser/product-capture-provider /usr/local/bin/product-capture-provider",
+		"ENTRYPOINT [\"/usr/local/bin/product-capture-provider\"]",
+	} {
+		if !strings.Contains(dockerfile, want) {
+			t.Fatalf("runtime image Dockerfile missing %q", want)
+		}
+	}
+}
+
+func TestReleaseWorkflowBuildsRuntimeProviderBinaryBeforeImage(t *testing.T) {
+	data, err := os.ReadFile(".github/workflows/release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	for _, want := range []string{
+		"name: Configure private Go modules for runtime image",
+		"name: Build product capture provider binary",
+		"CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o docker/product-capture-browser/product-capture-provider ./cmd/product-capture-provider",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("release workflow missing %q", want)
+		}
+	}
+}
+
 func assertWorkflowUsesPinnedActions(t *testing.T, path, workflow string) {
 	t.Helper()
 	for _, line := range strings.Split(workflow, "\n") {
