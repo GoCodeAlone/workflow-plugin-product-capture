@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"time"
 
-	"github.com/GoCodeAlone/workflow-compute/pkg/protocol"
+	"github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
 )
 
 func buildTask(cfg taskConfig, workload protocol.WorkloadSpec) protocol.Task {

@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/GoCodeAlone/workflow-compute/pkg/protocol"
+	"github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
 )
 
 const testProviderImageRef = "ghcr.io/gocodealone/workflow-plugin-product-capture/product-capture-browser@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
