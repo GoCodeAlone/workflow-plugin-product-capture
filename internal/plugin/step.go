@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/GoCodeAlone/workflow-compute/pkg/protocol"
+	"github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
 	sdk "github.com/GoCodeAlone/workflow/plugin/external/sdk"
 )
 
@@ -37,7 +37,7 @@ func (c connectionConfig) validate() error {
 	return errors.Join(errs...)
 }
 
-func (c connectionConfig) client(ctx context.Context, metadata, runtimeConfig map[string]any) (*computeClient, error) {
+func (c connectionConfig) client(ctx context.Context, metadata, runtimeConfig map[string]any) (*protocol.Client, error) {
 	_ = ctx
 	token, err := resolveRuntimeRef(c.AuthTokenRef, metadata, runtimeConfig)
 	if err != nil {
@@ -50,7 +50,11 @@ func (c connectionConfig) client(ctx context.Context, metadata, runtimeConfig ma
 			return nil, err
 		}
 	}
-	return newComputeClient(c.ServerURL, token, timeout)
+	return protocol.NewClient(protocol.ClientConfig{
+		ServerURL: c.ServerURL,
+		Token:     token,
+		Timeout:   timeout,
+	})
 }
 
 type taskConfig struct {
@@ -184,7 +188,7 @@ func (s *productCaptureStep) Execute(ctx context.Context, _ map[string]any, _ ma
 	if err := workload.Validate(); err != nil {
 		return errorResult(err.Error()), nil
 	}
-	task, err := client.submitTask(ctx, buildTask(s.config.taskConfig, workload))
+	task, err := client.SubmitTask(ctx, buildTask(s.config.taskConfig, workload))
 	if err != nil {
 		return errorResult(err.Error()), nil
 	}
@@ -223,13 +227,13 @@ func (s *productCaptureStep) productCaptureProviderConfig() protocol.ProviderCon
 	return cfg
 }
 
-func (s *productCaptureStep) waitForProductCapture(ctx context.Context, client *computeClient, taskID string) (map[string]any, error) {
+func (s *productCaptureStep) waitForProductCapture(ctx context.Context, client *protocol.Client, taskID string) (map[string]any, error) {
 	pollInterval := durationOrDefault(s.config.PollInterval, time.Second)
 	timeout := durationOrDefault(s.config.WaitTimeout, 5*time.Minute)
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	for {
-		task, found, stalls, err := client.taskSnapshot(waitCtx, taskID)
+		task, found, stalls, err := client.TaskSnapshot(waitCtx, taskID)
 		if err != nil {
 			return nil, err
 		}
@@ -246,7 +250,7 @@ func (s *productCaptureStep) waitForProductCapture(ctx context.Context, client *
 			return output, nil
 		}
 		if isTerminalTaskStatus(task.Status) {
-			proof, hasProof, err := client.findProof(waitCtx, task.ID)
+			proof, hasProof, err := client.FindProof(waitCtx, task.ID)
 			if err != nil {
 				return nil, err
 			}
@@ -370,7 +374,7 @@ func flattenedPreviewField(key string) bool {
 	}
 }
 
-func addStallOutput(output map[string]any, stall taskStall) {
+func addStallOutput(output map[string]any, stall protocol.TaskStall) {
 	output["stall_reason"] = stall.Reason
 	if stall.LeaseID != "" {
 		output["lease_id"] = stall.LeaseID
@@ -383,18 +387,18 @@ func addStallOutput(output map[string]any, stall taskStall) {
 	}
 }
 
-func taskWaitError(task protocol.Task, stalls []taskStall) string {
+func taskWaitError(task protocol.Task, stalls []protocol.TaskStall) string {
 	if len(stalls) > 0 {
 		return fmt.Sprintf("task %q stalled: %s", task.ID, stalls[0].Reason)
 	}
 	return fmt.Sprintf("task %q %s", task.ID, task.Status)
 }
 
-func actionableStalls(stalls []taskStall, requireProof bool) []taskStall {
+func actionableStalls(stalls []protocol.TaskStall, requireProof bool) []protocol.TaskStall {
 	if requireProof {
 		return stalls
 	}
-	actionable := make([]taskStall, 0, len(stalls))
+	actionable := make([]protocol.TaskStall, 0, len(stalls))
 	for _, stall := range stalls {
 		if stall.Reason == "proof_missing" {
 			continue
