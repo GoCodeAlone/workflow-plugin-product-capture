@@ -114,6 +114,11 @@ func TestReleaseWorkflowBuildsRuntimeProviderBinaryBeforeImage(t *testing.T) {
 			t.Fatalf("release workflow missing %q", want)
 		}
 	}
+	buildProviderIndex := strings.Index(workflow, "name: Build product capture provider binary")
+	buildImageIndex := strings.Index(workflow, "name: Build and push product capture browser image")
+	if buildProviderIndex < 0 || buildImageIndex < 0 || buildProviderIndex > buildImageIndex {
+		t.Fatal("release workflow must build the provider binary before building the runtime image")
+	}
 }
 
 func assertWorkflowUsesPinnedActions(t *testing.T, path, workflow string) {
