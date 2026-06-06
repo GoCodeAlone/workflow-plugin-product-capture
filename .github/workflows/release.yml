@@ -23,8 +23,6 @@ jobs:
           git config --global url."https://x-access-token:${RELEASES_TOKEN}@github.com/GoCodeAlone/".insteadOf "https://github.com/GoCodeAlone/"
           go env -w GOPRIVATE=github.com/GoCodeAlone/*
           go env -w GONOSUMDB=github.com/GoCodeAlone/*
-      - name: Prepare release manifest
-        run: go run ./cmd/release-prep --tag "${{ github.ref_name }}" --write
       - name: Install wfctl v0.74.5
         run: |
           mkdir -p "${RUNNER_TEMP}/wfctl-bin"
@@ -32,8 +30,6 @@ jobs:
             -o "${RUNNER_TEMP}/wfctl-bin/wfctl" \
             "https://github.com/GoCodeAlone/workflow/releases/download/v0.74.5/wfctl-linux-amd64"
           chmod +x "${RUNNER_TEMP}/wfctl-bin/wfctl"
-      - name: Validate plugin contract for publish (pre-build)
-        run: "${{ runner.temp }}/wfctl-bin/wfctl plugin validate-contract --for-publish --tag ${{ github.ref_name }} ."
       - uses: goreleaser/goreleaser-action@5daf1e915a5f0af01ddbcd89a43b8061ff4f1a89 # v7.2.2
         with:
           distribution: goreleaser
@@ -41,6 +37,7 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WFCTL_BIN: ${{ runner.temp }}/wfctl-bin/wfctl
       # workflow#765: runtime truth-check via plugin verify-capabilities.
       - name: Verify capabilities (runtime truth-check)
         run: |
