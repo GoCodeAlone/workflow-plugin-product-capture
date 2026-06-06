@@ -20,5 +20,8 @@ RUN set -eux; \
     apt-get purge -y --auto-remove curl gnupg; \
     rm -rf /var/lib/apt/lists/*
 
+COPY docker/product-capture-browser/product-capture-provider /usr/local/bin/product-capture-provider
+
 USER node
 WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/product-capture-provider"]
