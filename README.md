@@ -56,3 +56,6 @@ workflow-compute. The step owns product-capture-specific validation and submits
 a generic provider workload using the `product-capture.browser.v1` contract.
 `workflow-plugin-compute` should only provide generic dispatch/wait/catalog
 plumbing.
+
+BuyMyWishlist live wiring details are in
+[`docs/buymywishlist-live-usage.md`](docs/buymywishlist-live-usage.md).
