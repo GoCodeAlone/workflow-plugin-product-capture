@@ -1,6 +1,6 @@
 module github.com/GoCodeAlone/workflow-plugin-product-capture
 
-go 1.26.0
+go 1.26.4
 
 require (
 	github.com/GoCodeAlone/workflow v0.74.5
