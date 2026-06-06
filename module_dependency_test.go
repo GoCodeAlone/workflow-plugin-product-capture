@@ -1,7 +1,9 @@
-package productcapture
+package productcapture_test
 
 import (
+	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -18,18 +20,24 @@ func TestProductCaptureUsesPublicComputeCoreSDK(t *testing.T) {
 	if !strings.Contains(text, "github.com/GoCodeAlone/workflow-plugin-compute-core") {
 		t.Fatal("product-capture must consume the public workflow-plugin-compute-core SDK")
 	}
-	for _, path := range []string{
-		"internal/plugin/sign.go",
-		"internal/plugin/step.go",
-		"internal/plugin/plugin_test.go",
-	} {
+	err = filepath.WalkDir("internal/plugin", func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || filepath.Ext(path) != ".go" {
+			return nil
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			t.Fatalf("read %s: %v", path, err)
+			return err
 		}
 		if strings.Contains(string(data), "github.com/GoCodeAlone/workflow-compute/pkg/protocol") {
 			t.Fatalf("%s imports private workflow-compute protocol package", path)
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan internal/plugin: %v", err)
 	}
 	if _, err := os.Stat("internal/plugin/client.go"); err == nil {
 		t.Fatal("product-capture must use compute-core protocol.Client instead of a duplicate local compute client")
