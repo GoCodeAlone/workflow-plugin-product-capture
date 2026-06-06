@@ -427,6 +427,24 @@ func TestPlaywrightScriptWaitsForCaptureRelevantNodes(t *testing.T) {
 	}
 }
 
+func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
+	for _, required := range []string{
+		"isTransientNavigationError",
+		"net::ERR_NETWORK_CHANGED",
+		"net::ERR_NETWORK_RESET",
+		"net::ERR_TIMED_OUT",
+		"for (let attempt = 1; attempt <= 3; attempt++)",
+		"await page.goto(url, { waitUntil: 'domcontentloaded', timeout });",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("playwright script must retry transient navigation failure path %q", required)
+		}
+	}
+	if strings.Contains(playwrightCaptureScript, "manual review') && isTransientNavigationError") {
+		t.Fatal("playwright script must not retry manual-review CAPTCHA/interstitial failures")
+	}
+}
+
 func containsString(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
