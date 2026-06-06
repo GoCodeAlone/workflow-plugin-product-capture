@@ -431,7 +431,7 @@ async function launchChromeBrowser() {
 }
 
 function isTransientNavigationError(err) {
-  const message = err && (err.stack || err.message || String(err));
+  const message = err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
   return [
     'net::ERR_NETWORK_CHANGED',
     'net::ERR_NETWORK_RESET',

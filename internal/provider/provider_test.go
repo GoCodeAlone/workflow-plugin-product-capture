@@ -435,13 +435,16 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 		"net::ERR_TIMED_OUT",
 		"for (let attempt = 1; attempt <= 3; attempt++)",
 		"await page.goto(url, { waitUntil: 'domcontentloaded', timeout });",
+		"String(err)",
 	} {
 		if !strings.Contains(playwrightCaptureScript, required) {
 			t.Fatalf("playwright script must retry transient navigation failure path %q", required)
 		}
 	}
-	if strings.Contains(playwrightCaptureScript, "manual review') && isTransientNavigationError") {
-		t.Fatal("playwright script must not retry manual-review CAPTCHA/interstitial failures")
+	retryIndex := strings.Index(playwrightCaptureScript, "await gotoWithTransientRetry(page, url, timeout);")
+	captchaIndex := strings.Index(playwrightCaptureScript, `form[action*="/errors/validateCaptcha"]`)
+	if retryIndex < 0 || captchaIndex < 0 || captchaIndex < retryIndex {
+		t.Fatal("playwright script must check CAPTCHA/interstitials after retryable navigation only")
 	}
 }
 
