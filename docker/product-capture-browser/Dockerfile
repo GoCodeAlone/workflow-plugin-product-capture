@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
 
 ENV NODE_PATH=/usr/local/lib/node_modules \
     HOME=/tmp \
