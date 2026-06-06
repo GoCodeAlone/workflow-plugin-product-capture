@@ -4,6 +4,8 @@ before:
   hooks:
     - go mod tidy
     - go test ./...
+    - go run ./cmd/release-prep --tag "{{ .Tag }}" --write
+    - "{{ .Env.WFCTL_BIN }} plugin validate-contract --for-publish --tag {{ .Tag }} ."
 
 builds:
   - id: workflow-plugin-product-capture

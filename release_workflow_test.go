@@ -29,10 +29,29 @@ func TestReleaseWorkflowUsesGlobalDispatchToken(t *testing.T) {
 	if !strings.Contains(workflow, "needs: [release, runtime-image]") {
 		t.Fatal("registry notification must wait for the runtime image publish")
 	}
-	if !strings.Contains(workflow, "go run ./cmd/release-prep --tag \"${{ github.ref_name }}\" --write") {
-		t.Fatal("release workflow must rewrite plugin.json metadata from the release tag before validation")
+	if strings.Contains(workflow, "go run ./cmd/release-prep --tag \"${{ github.ref_name }}\" --write") {
+		t.Fatal("release workflow must not dirty tracked plugin.json before GoReleaser starts")
+	}
+	if !strings.Contains(workflow, "WFCTL_BIN: ${{ runner.temp }}/wfctl-bin/wfctl") {
+		t.Fatal("release workflow must pass wfctl path into GoReleaser hooks")
 	}
 	assertWorkflowUsesPinnedActions(t, ".github/workflows/release.yml", workflow)
+}
+
+func TestGoReleaserPreparesReleaseManifestInsideLifecycle(t *testing.T) {
+	data, err := os.ReadFile(".goreleaser.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := string(data)
+	for _, want := range []string{
+		`go run ./cmd/release-prep --tag "{{ .Tag }}" --write`,
+		`"{{ .Env.WFCTL_BIN }} plugin validate-contract --for-publish --tag {{ .Tag }} ."`,
+	} {
+		if !strings.Contains(config, want) {
+			t.Fatalf(".goreleaser.yml missing release hook %q", want)
+		}
+	}
 }
 
 func TestCIWorkflowChecksReleaseManifest(t *testing.T) {
