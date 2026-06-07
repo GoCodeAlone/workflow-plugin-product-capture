@@ -29,17 +29,28 @@ Live browser capture requires `node` plus Playwright in the worker image. Local
 development can set `NODE_PATH` to a Playwright install; fixture mode is used by
 unit tests and never emits raw HTML in the provider response.
 
-## Worker runtime image
+## Worker runtime
 
-Provider workloads must use a digest-pinned browser runtime image. Tagged
-releases publish:
+Provider workloads should use the promoted component runtime that wfcompute
+distributes to capable agents:
+
+```text
+provider://workflow-plugin-product-capture/browser/runtime
+```
+
+Set `provider_component_digest` to the promoted runtime payload digest recorded
+by the wfcompute package campaign. The digest binds the submitted workload to
+the exact agent-local runtime payload.
+
+Digest-pinned image refs remain supported for deployments that have not adopted
+promoted provider components. Tagged releases publish:
 
 ```text
 ghcr.io/gocodealone/workflow-plugin-product-capture/product-capture-browser:<tag>
 ```
 
-Use the published digest from the release workflow summary when configuring
-workflow-compute:
+Use the published image digest from the release workflow summary when
+configuring an image-backed workflow-compute deployment:
 
 ```text
 ghcr.io/gocodealone/workflow-plugin-product-capture/product-capture-browser@sha256:<digest>
@@ -54,8 +65,9 @@ channel rather than downloading bundled Chromium.
 Use `step.product_capture` when a Workflow app needs to submit a product URL to
 workflow-compute. The step owns product-capture-specific validation and submits
 a generic provider workload using the `product-capture.browser.v1` contract.
-`workflow-plugin-compute` should only provide generic dispatch/wait/catalog
-plumbing.
+Configure either `provider_component_ref` plus `provider_component_digest`, or
+the compatibility `provider_image_ref`. `workflow-plugin-compute` should only
+provide generic dispatch/wait/catalog plumbing.
 
 BuyMyWishlist live wiring details are in
 [`docs/buymywishlist-live-usage.md`](docs/buymywishlist-live-usage.md).
