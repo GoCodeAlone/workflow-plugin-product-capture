@@ -90,22 +90,24 @@ func (c taskConfig) validate() error {
 type productCaptureStepConfig struct {
 	connectionConfig
 	taskConfig
-	ProviderID            string   `json:"provider_id,omitempty"`
-	ProviderVersion       string   `json:"provider_version,omitempty"`
-	ProviderConfigRef     string   `json:"provider_config_ref,omitempty"`
-	ProviderConfigDigest  string   `json:"provider_config_digest,omitempty"`
-	ProviderImageRef      string   `json:"provider_image_ref"`
-	URL                   string   `json:"url,omitempty"`
-	URLField              string   `json:"url_field,omitempty"`
-	AllowedHosts          []string `json:"allowed_hosts"`
-	CaptureMode           string   `json:"capture_mode,omitempty"`
-	CaptureTimeoutSeconds int      `json:"capture_timeout_seconds,omitempty"`
-	MaxHTMLBytes          int64    `json:"max_html_bytes,omitempty"`
-	MaxImageCount         int      `json:"max_image_count,omitempty"`
-	MetadataOnly          bool     `json:"metadata_only,omitempty"`
-	PollInterval          string   `json:"poll_interval,omitempty"`
-	WaitTimeout           string   `json:"wait_timeout,omitempty"`
-	RequireProof          *bool    `json:"require_proof,omitempty"`
+	ProviderID              string   `json:"provider_id,omitempty"`
+	ProviderVersion         string   `json:"provider_version,omitempty"`
+	ProviderConfigRef       string   `json:"provider_config_ref,omitempty"`
+	ProviderConfigDigest    string   `json:"provider_config_digest,omitempty"`
+	ProviderImageRef        string   `json:"provider_image_ref,omitempty"`
+	ProviderComponentRef    string   `json:"provider_component_ref,omitempty"`
+	ProviderComponentDigest string   `json:"provider_component_digest,omitempty"`
+	URL                     string   `json:"url,omitempty"`
+	URLField                string   `json:"url_field,omitempty"`
+	AllowedHosts            []string `json:"allowed_hosts"`
+	CaptureMode             string   `json:"capture_mode,omitempty"`
+	CaptureTimeoutSeconds   int      `json:"capture_timeout_seconds,omitempty"`
+	MaxHTMLBytes            int64    `json:"max_html_bytes,omitempty"`
+	MaxImageCount           int      `json:"max_image_count,omitempty"`
+	MetadataOnly            bool     `json:"metadata_only,omitempty"`
+	PollInterval            string   `json:"poll_interval,omitempty"`
+	WaitTimeout             string   `json:"wait_timeout,omitempty"`
+	RequireProof            *bool    `json:"require_proof,omitempty"`
 }
 
 type productCaptureStep struct {
@@ -127,8 +129,8 @@ func newProductCaptureStep(name string, raw map[string]any) (*productCaptureStep
 	if len(cfg.AllowedHosts) == 0 {
 		return nil, fmt.Errorf("step.product_capture %q: allowed_hosts is required", name)
 	}
-	if err := validateProviderImageRef(cfg.ProviderImageRef); err != nil {
-		return nil, fmt.Errorf("step.product_capture %q: provider_image_ref: %w", name, err)
+	if err := validateProviderRuntimeRef(cfg.ProviderImageRef, cfg.ProviderComponentRef, cfg.ProviderComponentDigest); err != nil {
+		return nil, fmt.Errorf("step.product_capture %q: %w", name, err)
 	}
 	if cfg.PollInterval != "" {
 		if d, err := time.ParseDuration(cfg.PollInterval); err != nil {
@@ -179,10 +181,12 @@ func (s *productCaptureStep) Execute(ctx context.Context, _ map[string]any, _ ma
 	workload := protocol.WorkloadSpec{
 		Kind: protocol.WorkloadProvider,
 		Provider: &protocol.ProviderWorkload{
-			ProviderConfig: s.productCaptureProviderConfig(),
-			Operation:      "capture_product",
-			ImageRef:       s.config.ProviderImageRef,
-			Input:          inputBytes,
+			ProviderConfig:  s.productCaptureProviderConfig(),
+			Operation:       "capture_product",
+			ImageRef:        s.config.ProviderImageRef,
+			ComponentRef:    s.config.ProviderComponentRef,
+			ComponentDigest: s.config.ProviderComponentDigest,
+			Input:           inputBytes,
 		},
 	}
 	if err := workload.Validate(); err != nil {
@@ -280,6 +284,26 @@ func (s *productCaptureStep) requireProof() bool {
 	return s.config.RequireProof == nil || *s.config.RequireProof
 }
 
+func validateProviderRuntimeRef(imageRef, componentRef, componentDigest string) error {
+	hasImage := strings.TrimSpace(imageRef) != ""
+	hasComponent := strings.TrimSpace(componentRef) != "" || strings.TrimSpace(componentDigest) != ""
+	switch {
+	case hasImage && hasComponent:
+		return errors.New("provider_image_ref and provider_component_ref/provider_component_digest are mutually exclusive")
+	case hasImage:
+		if err := validateProviderImageRef(imageRef); err != nil {
+			return fmt.Errorf("provider_image_ref: %w", err)
+		}
+	case hasComponent:
+		if err := validateProviderComponentRef(componentRef, componentDigest); err != nil {
+			return err
+		}
+	default:
+		return errors.New("provider_image_ref or provider_component_ref/provider_component_digest is required")
+	}
+	return nil
+}
+
 func validateProviderImageRef(value string) error {
 	if strings.TrimSpace(value) == "" {
 		return errors.New("is required")
@@ -290,6 +314,29 @@ func validateProviderImageRef(value string) error {
 	_, digest, ok := strings.Cut(value, "@")
 	if !ok || !validSHA256Digest(digest) {
 		return errors.New("must be digest-pinned with @sha256:<64 hex>")
+	}
+	return nil
+}
+
+func validateProviderComponentRef(componentRef, componentDigest string) error {
+	if strings.TrimSpace(componentRef) == "" {
+		return errors.New("provider_component_ref is required when provider_component_digest is set")
+	}
+	if strings.TrimSpace(componentDigest) == "" {
+		return errors.New("provider_component_digest is required when provider_component_ref is set")
+	}
+	if strings.TrimSpace(componentRef) != componentRef || strings.ContainsAny(componentRef, "\t\r\n \x00") {
+		return errors.New("provider_component_ref must not contain whitespace or NUL")
+	}
+	if strings.TrimSpace(componentDigest) != componentDigest || strings.ContainsAny(componentDigest, "\t\r\n \x00") {
+		return errors.New("provider_component_digest must not contain whitespace or NUL")
+	}
+	const prefix = "provider://workflow-plugin-product-capture/"
+	if !strings.HasPrefix(componentRef, prefix) || strings.TrimPrefix(componentRef, prefix) == "" {
+		return errors.New("provider_component_ref must target workflow-plugin-product-capture")
+	}
+	if !validSHA256Digest(componentDigest) {
+		return errors.New("provider_component_digest must be sha256:<64 hex>")
 	}
 	return nil
 }

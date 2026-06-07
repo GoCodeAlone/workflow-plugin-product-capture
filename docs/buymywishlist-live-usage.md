@@ -13,8 +13,8 @@ have:
 - provider contract `product-capture.browser.v1` registered from this plugin;
 - a network product such as `bmw-product-capture` whose provider config points
   at `workflow-plugin-product-capture` provider `browser`;
-- a digest-pinned provider image ref from this plugin release;
-- a promoted provider package or runtime image available to agents;
+- a promoted provider package or runtime image available to agents, with the
+  expected component ref and digest recorded for submissions;
 - at least one online agent advertising executor provider
   `product-capture-browser`, workload kind `provider`, execution tier
   `sandboxed-container`, and proof tier `artifact-hash`;
@@ -46,7 +46,8 @@ steps:
       allowed_hosts:
         - www.amazon.com
         - amazon.com
-      provider_image_ref: ghcr.io/gocodealone/workflow-plugin-product-capture/product-capture-browser@sha256:<digest>
+      provider_component_ref: provider://workflow-plugin-product-capture/browser/runtime
+      provider_component_digest: sha256:<promoted-runtime-digest>
       capture_timeout_seconds: 60
       max_html_bytes: 1048576
       max_image_count: 8
@@ -56,6 +57,15 @@ steps:
 
 The step submits a generic `provider` workload with operation
 `capture_product`. It does not call a product-capture-specific wfcompute API.
+Use `provider_image_ref` only for a compatibility deployment that has not
+promoted provider components to agents:
+
+```yaml
+provider_image_ref: ghcr.io/gocodealone/workflow-plugin-product-capture/product-capture-browser@sha256:<digest>
+```
+
+Do not set `provider_image_ref` together with `provider_component_ref` or
+`provider_component_digest`.
 
 ## Application Handling
 

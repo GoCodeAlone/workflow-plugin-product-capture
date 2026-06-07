@@ -14,6 +14,8 @@ import (
 )
 
 const testProviderImageRef = "ghcr.io/gocodealone/workflow-plugin-product-capture/product-capture-browser@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+const testProviderComponentRef = "provider://workflow-plugin-product-capture/browser/runtime"
+const testProviderComponentDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 func TestManifest(t *testing.T) {
 	manifest := NewPlugin().Manifest()
@@ -144,6 +146,71 @@ func TestProductCaptureStepDispatchesDynamicURLAndReturnsPreview(t *testing.T) {
 	}
 }
 
+func TestProductCaptureStepDispatchesPromotedComponentRuntime(t *testing.T) {
+	var submitted protocol.Task
+	var taskCalls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/tasks":
+			if err := json.NewDecoder(r.Body).Decode(&submitted); err != nil {
+				t.Fatalf("decode task: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"task": submitted})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/tasks":
+			taskCalls++
+			status := protocol.TaskQueued
+			if taskCalls > 1 {
+				status = protocol.TaskSucceeded
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []protocol.Task{{
+				ID:     submitted.ID,
+				OrgID:  submitted.OrgID,
+				PoolID: submitted.PoolID,
+				Status: status,
+			}}, "stalls": []any{}})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/proofs":
+			_ = json.NewEncoder(w).Encode(map[string]any{"proofs": []protocol.ProofReceipt{proofReceipt(submitted.ID)}})
+		default:
+			t.Fatalf("request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := productCaptureConfigMap(srv.URL)
+	delete(cfg, "provider_image_ref")
+	cfg["provider_component_ref"] = testProviderComponentRef
+	cfg["provider_component_digest"] = testProviderComponentDigest
+	cfg["poll_interval"] = "1ms"
+	cfg["wait_timeout"] = "100ms"
+	step, err := newProductCaptureStep("capture", cfg)
+	if err != nil {
+		t.Fatalf("newProductCaptureStep: %v", err)
+	}
+	result, err := step.Execute(context.Background(), nil, nil, nil, nil, runtimeSecrets())
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if result.StopPipeline {
+		t.Fatalf("unexpected stop: %+v", result.Output)
+	}
+	if submitted.Workload.Provider.ProviderConfig != productCaptureProviderConfig("wishlist-product-capture") {
+		t.Fatalf("provider config: %+v", submitted.Workload.Provider.ProviderConfig)
+	}
+	if submitted.Workload.Provider.Operation != "capture_product" {
+		t.Fatalf("operation: %q", submitted.Workload.Provider.Operation)
+	}
+	if submitted.Workload.Provider.ImageRef != "" {
+		t.Fatalf("component-backed capture should not submit image_ref: %q", submitted.Workload.Provider.ImageRef)
+	}
+	if submitted.Workload.Provider.ComponentRef != testProviderComponentRef {
+		t.Fatalf("component ref: %q", submitted.Workload.Provider.ComponentRef)
+	}
+	if submitted.Workload.Provider.ComponentDigest != testProviderComponentDigest {
+		t.Fatalf("component digest: %q", submitted.Workload.Provider.ComponentDigest)
+	}
+}
+
 func TestProductCaptureStepRejectsUnknownConfig(t *testing.T) {
 	cfg := productCaptureConfigMap("https://compute.example.test")
 	cfg["url_field"] = "url"
@@ -163,6 +230,67 @@ func TestProductCaptureStepAcceptsWorkflowInternalConfigDir(t *testing.T) {
 	cfg["_config_dir"] = "/app"
 	if _, err := newProductCaptureStep("capture", cfg); err != nil {
 		t.Fatalf("expected Workflow-injected _config_dir to be accepted: %v", err)
+	}
+}
+
+func TestProductCaptureStepRejectsInvalidRuntimeRefs(t *testing.T) {
+	tests := []struct {
+		name      string
+		mutate    func(map[string]any)
+		wantError string
+	}{
+		{
+			name: "image and component",
+			mutate: func(cfg map[string]any) {
+				cfg["provider_component_ref"] = testProviderComponentRef
+				cfg["provider_component_digest"] = testProviderComponentDigest
+			},
+			wantError: "mutually exclusive",
+		},
+		{
+			name: "component without digest",
+			mutate: func(cfg map[string]any) {
+				delete(cfg, "provider_image_ref")
+				cfg["provider_component_ref"] = testProviderComponentRef
+			},
+			wantError: "provider_component_digest is required",
+		},
+		{
+			name: "digest without component",
+			mutate: func(cfg map[string]any) {
+				delete(cfg, "provider_image_ref")
+				cfg["provider_component_digest"] = testProviderComponentDigest
+			},
+			wantError: "provider_component_ref is required",
+		},
+		{
+			name: "wrong component plugin",
+			mutate: func(cfg map[string]any) {
+				delete(cfg, "provider_image_ref")
+				cfg["provider_component_ref"] = "provider://workflow-plugin-other/browser/runtime"
+				cfg["provider_component_digest"] = testProviderComponentDigest
+			},
+			wantError: "workflow-plugin-product-capture",
+		},
+		{
+			name: "bad component digest",
+			mutate: func(cfg map[string]any) {
+				delete(cfg, "provider_image_ref")
+				cfg["provider_component_ref"] = testProviderComponentRef
+				cfg["provider_component_digest"] = "sha256:not-hex"
+			},
+			wantError: "sha256:<64 hex>",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := productCaptureConfigMap("https://compute.example.test")
+			tt.mutate(cfg)
+			_, err := newProductCaptureStep("capture", cfg)
+			if err == nil || !strings.Contains(err.Error(), tt.wantError) {
+				t.Fatalf("error = %v, want containing %q", err, tt.wantError)
+			}
+		})
 	}
 }
 
