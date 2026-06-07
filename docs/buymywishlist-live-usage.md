@@ -25,6 +25,34 @@ The deployment is not live-ready until a BMW-shaped provider task returns an
 accepted proof from a `product-capture-browser` agent in the target wfcompute
 environment.
 
+## Verified wfcompute Staging Baseline
+
+The latest wfcompute staging proof for this plugin release completed on
+2026-06-07 against:
+
+- wfcompute server:
+  `https://workflow-compute-staging-ocysa.ondigitalocean.app`;
+- workflow-compute commit:
+  `560f04a4911afbecca502f6bca228a3bb3f8c84f`;
+- plugin release/runtime image:
+  `workflow-plugin-product-capture` `v0.1.17`,
+  `ghcr.io/gocodealone/workflow-plugin-product-capture/product-capture-browser@sha256:e73cc41e3a1deb0e886ad157111f3099b3214cbcf63257dc8d72a7a19c23b1f4`;
+- promoted provider component:
+  `provider://workflow-plugin-product-capture/browser/runtime` with
+  component digest
+  `sha256:dd98a14d05ef03f2372f3b1ad9ad16a217b3c8ec9c9dcf3ee15c71616c3595d0`;
+- package metadata version:
+  `v0.1.17-staging.27096063947.1`;
+- task/proof:
+  `task-product-capture-1780844446-4311` and
+  `proof-task-product-capture-1780844446-4311-product-capture-staging-worker-1780844446-4311`;
+- verifier result:
+  `signed_receipt` with status `accepted`.
+
+These staging IDs are evidence, not production configuration. BuyMyWishlist
+should use the target wfcompute environment's current package/component digest,
+network product id, and scoped task credential when enabling live traffic.
+
 ## Workflow Step
 
 Use `step.product_capture` with a secret reference for the scoped wfcompute
