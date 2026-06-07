@@ -49,7 +49,7 @@ The latest wfcompute staging proof for this plugin release completed on
 - verifier result:
   `signed_receipt` with status `accepted`.
 
-These staging ids are evidence, not production configuration. BuyMyWishlist
+These staging IDs are evidence, not production configuration. BuyMyWishlist
 should use the target wfcompute environment's current package/component digest,
 network product id, and scoped task credential when enabling live traffic.
 
