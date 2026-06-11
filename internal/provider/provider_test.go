@@ -9,6 +9,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	coreprotocol "github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 func TestProviderContractAlignsWithWorkflowComputeGenericProviderABI(t *testing.T) {
@@ -266,7 +270,7 @@ func TestMainRunsWorkflowComputeDynamicProviderEnvelope(t *testing.T) {
 		    "contract_id":"product-capture.browser.v1",
 		    "version":"v1.0.0",
 		    "config_ref":"config://network-products/product-capture/browser",
-		    "config_digest":"sha256:optional"
+		    "config_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 		  },
 	  "operation":"capture_product",
 	  "input":{
@@ -312,6 +316,293 @@ func TestMainRunsWorkflowComputeDynamicProviderEnvelope(t *testing.T) {
 	}
 }
 
+func TestMainRunsWorkflowComputeProviderEnvelopeWithRuntimeMetadata(t *testing.T) {
+	dir := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(wd, "..", "snapshot", "testdata", "amazon_xbox.html")
+	t.Setenv("PRODUCT_CAPTURE_HTML_FIXTURE", fixture)
+	t.Chdir(dir)
+	envelope := validWorkflowComputeProviderEnvelope(t)
+	input := marshalNestedProviderEnvelopeFromValidatedRuntimeRequest(t, envelope)
+
+	var stdout, stderr bytes.Buffer
+	code := Main(nil, &stdout, &stderr, bytes.NewReader(input))
+	if code != 0 {
+		t.Fatalf("capture failed: stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	var result struct {
+		Artifacts []string `json:"artifacts"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode provider result: %v\n%s", err, stdout.String())
+	}
+	if !containsString(result.Artifacts, ProductJSONArtifact) {
+		t.Fatalf("artifacts = %v, want %q", result.Artifacts, ProductJSONArtifact)
+	}
+}
+
+func TestMainRejectsInvalidWorkflowComputeRuntimeMetadata(t *testing.T) {
+	dir := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(wd, "..", "snapshot", "testdata", "amazon_xbox.html")
+	t.Setenv("PRODUCT_CAPTURE_HTML_FIXTURE", fixture)
+	t.Chdir(dir)
+
+	tests := []struct {
+		name    string
+		mutate  func(*dynamicEnvelope)
+		wantErr string
+	}{
+		{
+			name: "partial runtime profile",
+			mutate: func(env *dynamicEnvelope) {
+				env.RuntimeProfile = coreprotocol.ProviderRuntimeProfile{
+					ExecutionSecurityTier: coreprotocol.ExecutionTrustedNative,
+				}
+			},
+			wantErr: "runtime_profile",
+		},
+		{
+			name: "backend without matching executor",
+			mutate: func(env *dynamicEnvelope) {
+				env.RuntimeBackend.Executors = nil
+			},
+			wantErr: "runtime_backend",
+		},
+		{
+			name: "backend summary missing executor provider",
+			mutate: func(env *dynamicEnvelope) {
+				env.RuntimeBackend.ExecutorProviders = nil
+			},
+			wantErr: "runtime_backend",
+		},
+		{
+			name: "backend executor below security floor",
+			mutate: func(env *dynamicEnvelope) {
+				env.Executor = coreprotocol.ExecutorRef{}
+				env.RuntimeBackend.Executors[0].ExecutionSecurityTier = coreprotocol.ExecutionTrustedNative
+			},
+			wantErr: "runtime_backend",
+		},
+		{
+			name: "backend executor version mismatch",
+			mutate: func(env *dynamicEnvelope) {
+				env.RuntimeBackend.Executors[0].Version = "v2"
+			},
+			wantErr: "runtime_backend",
+		},
+		{
+			name: "backend missing selected runtime profile",
+			mutate: func(env *dynamicEnvelope) {
+				env.RuntimeBackend.RuntimeProfiles = []coreprotocol.RuntimeProfile{coreprotocol.RuntimeProfileContainerBuild}
+			},
+			wantErr: "runtime_backend",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			env := validWorkflowComputeProviderEnvelope(t)
+			tc.mutate(&env)
+
+			var stdout, stderr bytes.Buffer
+			code := Main(nil, &stdout, &stderr, bytes.NewReader(marshalNestedProviderEnvelopeFromValidatedRuntimeRequest(t, env)))
+			if code == 0 {
+				t.Fatalf("expected failure, stdout=%s", stdout.String())
+			}
+			if !strings.Contains(stderr.String(), tc.wantErr) {
+				t.Fatalf("stderr = %q, want %q", stderr.String(), tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestMainRejectsInvalidWorkflowComputeProviderConfig(t *testing.T) {
+	dir := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := filepath.Join(wd, "..", "snapshot", "testdata", "amazon_xbox.html")
+	t.Setenv("PRODUCT_CAPTURE_HTML_FIXTURE", fixture)
+	t.Chdir(dir)
+
+	env := validWorkflowComputeProviderEnvelope(t)
+	env.ProviderConfig.ConfigRef = "https://example.invalid/config.json"
+	input, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal provider envelope: %v", err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := Main(nil, &stdout, &stderr, bytes.NewReader(input))
+	if code == 0 {
+		t.Fatalf("expected failure, stdout=%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "provider_config") {
+		t.Fatalf("stderr = %q, want provider_config", stderr.String())
+	}
+}
+
+func TestProviderSchemaAcceptsBuyMyWishlistLiveInputAndRejectsDemoFields(t *testing.T) {
+	compiler := jsonschema.NewCompiler()
+	schemaPath := filepath.Join("..", "..", "schemas", "product-capture-operation-input.schema.json")
+	schema, err := compiler.Compile(schemaPath)
+	if err != nil {
+		t.Fatalf("compile input schema: %v", err)
+	}
+
+	liveInput := map[string]any{
+		"url":             "https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8",
+		"allowed_hosts":   []any{"www.amazon.com", "amazon.com"},
+		"capture_mode":    "browser",
+		"timeout_seconds": float64(60),
+		"max_html_bytes":  float64(1048576),
+		"max_image_count": float64(8),
+		"metadata_only":   false,
+	}
+	if err := schema.Validate(liveInput); err != nil {
+		t.Fatalf("BuyMyWishlist live input rejected: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		field string
+		value any
+	}{
+		{name: "mock html", field: "mock_html", value: "<html></html>"},
+		{name: "fixture path", field: "fixture_path", value: "internal/provider/testdata/demo.html"},
+		{name: "demo product id", field: "demo_product_id", value: "demo-123"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			demoOnly := map[string]any{
+				"url":           "https://www.amazon.com/dp/B08H75RTZ8",
+				"allowed_hosts": []any{"www.amazon.com"},
+				"capture_mode":  "browser",
+				tc.field:        tc.value,
+			}
+			if err := schema.Validate(demoOnly); err == nil {
+				t.Fatalf("schema accepted demo-only field %q", tc.field)
+			}
+		})
+	}
+}
+
+func validWorkflowComputeProviderEnvelope(t *testing.T) dynamicEnvelope {
+	t.Helper()
+	input := json.RawMessage(`{
+	  "url":"https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8",
+	  "allowed_hosts":["www.amazon.com"],
+	  "capture_mode":"browser",
+	  "timeout_seconds":30,
+	  "max_html_bytes":1048576,
+	  "max_image_count":1
+	}`)
+	executor := coreprotocol.ExecutorRef{
+		Provider:              ExecutorProvider,
+		Version:               "v1",
+		ExecutionSecurityTier: coreprotocol.ExecutionSandboxedContainer,
+		ProofTier:             coreprotocol.ProofArtifactHash,
+		ImageDigest:           "sha256:" + strings.Repeat("b", 64),
+		RootFSDigest:          "sha256:" + strings.Repeat("c", 64),
+	}
+	return dynamicEnvelope{
+		ProtocolVersion: ComputeProtocolVersion,
+		TaskID:          "task-product-capture-live",
+		LeaseID:         "lease-product-capture-live",
+		WorkloadKind:    coreprotocol.WorkloadProvider,
+		ProviderConfig: coreprotocol.ProviderConfig{
+			PluginID:     ProviderName,
+			ProviderID:   "browser",
+			ContractID:   "product-capture.browser.v1",
+			Version:      "v1.0.0",
+			ConfigRef:    "config://network-products/product-capture/browser",
+			ConfigDigest: "sha256:" + strings.Repeat("a", 64),
+		},
+		Operation: CaptureOperation,
+		Input:     input,
+		Executor:  executor,
+		RuntimeProfile: coreprotocol.ProviderRuntimeProfile{
+			ID:                     "product-capture-browser-sandboxed-container-artifact-hash-runtime",
+			RuntimeProfile:         coreprotocol.RuntimeProfileSandboxedOCI,
+			ExecutorProvider:       ExecutorProvider,
+			ExecutionSecurityTier:  coreprotocol.ExecutionSandboxedContainer,
+			ProofTier:              coreprotocol.ProofArtifactHash,
+			AllowedRuntimeTools:    []coreprotocol.ContainerRuntimeTool{coreprotocol.ContainerRuntimePodman},
+			ImageDigestRequired:    true,
+			RootFSDigestRequired:   true,
+			AllowedMountRefs:       []string{"workspace"},
+			WritablePaths:          []string{"/tmp"},
+			WritableRootFS:         coreprotocol.RuntimePermissionForbidden,
+			Privileged:             coreprotocol.RuntimePermissionForbidden,
+			HostNamespaces:         coreprotocol.RuntimePermissionForbidden,
+			HostSocket:             coreprotocol.RuntimePermissionForbidden,
+			SeccompDisable:         coreprotocol.RuntimePermissionForbidden,
+			NoNewPrivilegesDisable: coreprotocol.RuntimePermissionForbidden,
+			ConformanceProfiles:    []string{"sandboxed-oci-v1", "product-capture-v1"},
+		},
+		RuntimeBackend: coreprotocol.RuntimeBackendReport{
+			ProtocolVersion:     ComputeProtocolVersion,
+			BackendID:           "podman-rootless",
+			Family:              coreprotocol.RuntimeBackendFamilyPodman,
+			Tool:                coreprotocol.ContainerRuntimePodman,
+			Version:             "5.0.0",
+			OS:                  "linux",
+			Arch:                "amd64",
+			Status:              coreprotocol.RuntimeBackendSupported,
+			IsolationMode:       coreprotocol.RuntimeIsolationUserNamespace,
+			InstallBurden:       coreprotocol.RuntimeInstallSystemInstalled,
+			RuntimeProfiles:     []coreprotocol.RuntimeProfile{coreprotocol.RuntimeProfileSandboxedOCI},
+			ExecutorProviders:   []string{ExecutorProvider},
+			Executors:           []coreprotocol.ExecutorRef{executor},
+			ConformanceProfiles: []string{"sandboxed-oci-v1", "product-capture-v1"},
+			Evidence: coreprotocol.RuntimeBackendEvidence{
+				Digest:    "sha256:" + strings.Repeat("d", 64),
+				Workspace: true,
+				Network:   true,
+				Env:       true,
+				Proof:     true,
+				Cleanup:   true,
+			},
+			GeneratedAt: time.Date(2026, 6, 11, 0, 0, 0, 0, time.UTC),
+		},
+		Env: map[string]string{"PRODUCT_CAPTURE_MODE": "browser"},
+		Limits: coreprotocol.ResourceLimits{
+			RuntimeSeconds: 60,
+			OutputBytes:    10 << 20,
+		},
+	}
+}
+
+func marshalNestedProviderEnvelopeFromValidatedRuntimeRequest(t *testing.T, env dynamicEnvelope) []byte {
+	t.Helper()
+	input, err := json.Marshal(env)
+	if err != nil {
+		t.Fatalf("marshal provider envelope: %v", err)
+	}
+	req := coreprotocol.RuntimeExecutionRequest{
+		ProtocolVersion: ComputeProtocolVersion,
+		TaskID:          env.TaskID,
+		LeaseID:         env.LeaseID,
+		WorkloadKind:    coreprotocol.WorkloadProvider,
+		ProviderConfig:  env.ProviderConfig,
+		Operation:       "run-dynamic-provider",
+		Input:           input,
+		Env:             map[string]string{"WF_PROVIDER_ENVELOPE": "compute-core"},
+		Limits:          env.Limits,
+	}
+	if err := req.Validate(); err != nil {
+		t.Fatalf("runtime execution request should be compute-core valid: %v", err)
+	}
+	return req.Input
+}
+
 func TestMainRejectsUnknownDynamicEnvelopeFields(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	code := Main(nil, &stdout, &stderr, strings.NewReader(`{
@@ -337,7 +628,7 @@ func TestMainRejectsUnsupportedDynamicOperation(t *testing.T) {
 	  "protocol_version":"compute.v1alpha1",
 	  "task_id":"task-123",
 	  "lease_id":"lease-123",
-	  "provider_config":{"plugin_id":"workflow-plugin-product-capture","provider_id":"browser","contract_id":"product-capture.browser.v1","version":"v1.0.0"},
+	  "provider_config":{"plugin_id":"workflow-plugin-product-capture","provider_id":"browser","contract_id":"product-capture.browser.v1","version":"v1.0.0","config_ref":"config://network-products/product-capture/browser"},
 	  "operation":"scrape_checkout",
 	  "input":{"url":"https://www.amazon.com/dp/B08H75RTZ8","allowed_hosts":["www.amazon.com"]}
 	}`))

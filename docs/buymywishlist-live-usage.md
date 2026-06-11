@@ -18,12 +18,21 @@ have:
 - at least one online agent advertising executor provider
   `product-capture-browser`, workload kind `provider`, execution tier
   `sandboxed-container`, and proof tier `artifact-hash`;
+- supported runtime backend evidence for the agent runtime that will execute the
+  browser provider. A degraded or unsupported runtime backend must disable live
+  capture rather than fall back to trusted-native execution;
 - a scoped task token for BuyMyWishlist. Do not use a dashboard admin,
   bootstrap, or operator token from the application.
 
 The deployment is not live-ready until a BMW-shaped provider task returns an
 accepted proof from a `product-capture-browser` agent in the target wfcompute
 environment.
+
+Agent installation should come from a wfcompute setup invite or the projectless
+`wfctl plugin run --ensure-installed workflow-plugin-compute -- compute agent
+setup ...` path. BuyMyWishlist operators should not guess worker IDs, org IDs,
+pool IDs, or agent tokens; those values are issued by the wfcompute control
+plane and embedded in the invite/setup flow.
 
 ## Verified wfcompute Staging Baseline
 
@@ -52,6 +61,14 @@ The latest wfcompute staging proof for this plugin release completed on
 These staging IDs are evidence, not production configuration. BuyMyWishlist
 should use the target wfcompute environment's current package/component digest,
 network product id, and scoped task credential when enabling live traffic.
+
+A later T544 runtime compatibility proof on 2026-06-11 used wfcompute commit
+`80ad80dfc80dd21052fd73184baf5ce3c119097f` and confirmed the current provider
+envelope and runtime precondition behavior. That run reported `status:
+skipped`, `structured_runtime_precondition: true`, and no supported backend
+because the runner's podman/docker candidates failed conformance and nerdctl was
+unavailable. Treat that as correct fail-closed behavior, not live-readiness
+evidence.
 
 ## Workflow Step
 
@@ -94,6 +111,14 @@ provider_image_ref: ghcr.io/gocodealone/workflow-plugin-product-capture/product-
 
 Do not set `provider_image_ref` together with `provider_component_ref` or
 `provider_component_digest`.
+
+wfcompute may include additive compute-core runtime metadata in the provider
+envelope: `workload_kind`, `executor`, `runtime_profile`, `runtime_backend`,
+`env`, and `limits`. The provider validates that this metadata still describes
+`product-capture-browser` running as `sandboxed-container` with `artifact-hash`
+proofs on a supported backend. The nested operation input stays schema-strict
+and rejects demo-only fields such as mock HTML, fixture paths, or demo product
+IDs.
 
 ## Application Handling
 
