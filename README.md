@@ -69,5 +69,12 @@ Configure either `provider_component_ref` plus `provider_component_digest`, or
 the compatibility `provider_image_ref`. `workflow-plugin-compute` should only
 provide generic dispatch/wait/catalog plumbing.
 
+The provider binary accepts the current wfcompute dynamic-provider envelope and
+additive compute-core runtime metadata for the selected executor, provider
+runtime profile, supported runtime backend report, environment, and limits.
+Operation input remains strict: live submissions use product URL, allowed host,
+capture bounds, and capture mode fields only; demo or fixture fields are
+rejected.
+
 BuyMyWishlist live wiring details are in
 [`docs/buymywishlist-live-usage.md`](docs/buymywishlist-live-usage.md).

@@ -13,10 +13,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"time"
 
+	coreprotocol "github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
 	"github.com/GoCodeAlone/workflow-plugin-product-capture/internal/snapshot"
 )
 
@@ -43,21 +45,18 @@ type Request struct {
 }
 
 type dynamicEnvelope struct {
-	ProtocolVersion string          `json:"protocol_version"`
-	TaskID          string          `json:"task_id"`
-	LeaseID         string          `json:"lease_id"`
-	ProviderConfig  providerConfig  `json:"provider_config"`
-	Operation       string          `json:"operation"`
-	Input           json.RawMessage `json:"input"`
-}
-
-type providerConfig struct {
-	PluginID     string `json:"plugin_id"`
-	ProviderID   string `json:"provider_id"`
-	ContractID   string `json:"contract_id"`
-	Version      string `json:"version"`
-	ConfigRef    string `json:"config_ref,omitempty"`
-	ConfigDigest string `json:"config_digest,omitempty"`
+	ProtocolVersion string                              `json:"protocol_version"`
+	TaskID          string                              `json:"task_id"`
+	LeaseID         string                              `json:"lease_id"`
+	WorkloadKind    coreprotocol.WorkloadKind           `json:"workload_kind,omitempty"`
+	ProviderConfig  coreprotocol.ProviderConfig         `json:"provider_config"`
+	Operation       string                              `json:"operation"`
+	Input           json.RawMessage                     `json:"input"`
+	Executor        coreprotocol.ExecutorRef            `json:"executor,omitzero"`
+	RuntimeProfile  coreprotocol.ProviderRuntimeProfile `json:"runtime_profile,omitzero"`
+	RuntimeBackend  coreprotocol.RuntimeBackendReport   `json:"runtime_backend,omitzero"`
+	Env             map[string]string                   `json:"env,omitempty"`
+	Limits          coreprotocol.ResourceLimits         `json:"limits,omitzero"`
 }
 
 type Workload struct {
@@ -193,6 +192,12 @@ func validateDynamicEnvelope(env dynamicEnvelope) error {
 	if env.ProtocolVersion != ComputeProtocolVersion {
 		return fmt.Errorf("unsupported protocol_version %q", env.ProtocolVersion)
 	}
+	if env.WorkloadKind != "" && env.WorkloadKind != coreprotocol.WorkloadProvider {
+		return fmt.Errorf("unsupported workload_kind %q", env.WorkloadKind)
+	}
+	if err := env.ProviderConfig.Validate(); err != nil {
+		return fmt.Errorf("provider_config: %w", err)
+	}
 	if env.ProviderConfig.PluginID != ProviderName ||
 		env.ProviderConfig.ProviderID != "browser" ||
 		env.ProviderConfig.ContractID != "product-capture.browser.v1" ||
@@ -202,10 +207,168 @@ func validateDynamicEnvelope(env dynamicEnvelope) error {
 	if env.Operation != CaptureOperation {
 		return fmt.Errorf("unsupported operation %q", env.Operation)
 	}
+	if err := validateExecutorMetadata(env.Executor); err != nil {
+		return fmt.Errorf("executor: %w", err)
+	}
+	if err := validateRuntimeProfileMetadata(env.RuntimeProfile); err != nil {
+		return fmt.Errorf("runtime_profile: %w", err)
+	}
+	if err := validateRuntimeBackendMetadata(env.RuntimeBackend); err != nil {
+		return fmt.Errorf("runtime_backend: %w", err)
+	}
+	if err := validateRuntimeMetadataConsistency(env); err != nil {
+		return err
+	}
+	if err := env.Limits.Validate(); err != nil {
+		return fmt.Errorf("limits: %w", err)
+	}
 	if len(env.Input) == 0 {
 		return errors.New("input is required")
 	}
 	return nil
+}
+
+func validateExecutorMetadata(executor coreprotocol.ExecutorRef) error {
+	if executor == (coreprotocol.ExecutorRef{}) {
+		return nil
+	}
+	if executor.Provider != ExecutorProvider {
+		return fmt.Errorf("provider %q does not match %q", executor.Provider, ExecutorProvider)
+	}
+	if executor.ExecutionSecurityTier != "" && executor.ExecutionSecurityTier != coreprotocol.ExecutionSandboxedContainer {
+		return fmt.Errorf("execution_security_tier %q is unsupported", executor.ExecutionSecurityTier)
+	}
+	if executor.ProofTier != "" && executor.ProofTier != coreprotocol.ProofArtifactHash {
+		return fmt.Errorf("proof_tier %q is unsupported", executor.ProofTier)
+	}
+	if err := executor.ValidateForProof(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateRuntimeProfileMetadata(profile coreprotocol.ProviderRuntimeProfile) error {
+	if isZeroMetadata(profile) {
+		return nil
+	}
+	if profile.ExecutorProvider != ExecutorProvider {
+		return fmt.Errorf("executor_provider %q does not match %q", profile.ExecutorProvider, ExecutorProvider)
+	}
+	if profile.RuntimeProfile != coreprotocol.RuntimeProfileSandboxedOCI {
+		return fmt.Errorf("runtime_profile %q is unsupported", profile.RuntimeProfile)
+	}
+	if profile.ExecutionSecurityTier != coreprotocol.ExecutionSandboxedContainer {
+		return fmt.Errorf("execution_security_tier %q is unsupported", profile.ExecutionSecurityTier)
+	}
+	if profile.ProofTier != coreprotocol.ProofArtifactHash {
+		return fmt.Errorf("proof_tier %q is unsupported", profile.ProofTier)
+	}
+	if err := profile.Validate(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateRuntimeBackendMetadata(report coreprotocol.RuntimeBackendReport) error {
+	if isZeroMetadata(report) {
+		return nil
+	}
+	if err := report.Validate(); err != nil {
+		return err
+	}
+	if report.Status != coreprotocol.RuntimeBackendSupported {
+		return fmt.Errorf("status %q is unsupported", report.Status)
+	}
+	if !slices.Contains(report.ExecutorProviders, ExecutorProvider) {
+		return fmt.Errorf("executor provider %q is not supported by backend %q", ExecutorProvider, report.BackendID)
+	}
+	return nil
+}
+
+func validateRuntimeMetadataConsistency(env dynamicEnvelope) error {
+	if isZeroMetadata(env.RuntimeBackend) {
+		return nil
+	}
+	if !runtimeBackendHasProductCaptureExecutor(env.RuntimeBackend) {
+		return fmt.Errorf("runtime_backend does not include a matching %q executor", ExecutorProvider)
+	}
+	if !isZeroMetadata(env.Executor) && !runtimeBackendHasMatchingExecutor(env.RuntimeBackend, env.Executor) {
+		return fmt.Errorf("runtime_backend does not match selected executor %q", env.Executor.Provider)
+	}
+	if !isZeroMetadata(env.RuntimeProfile) {
+		if !slices.Contains(env.RuntimeBackend.RuntimeProfiles, env.RuntimeProfile.RuntimeProfile) {
+			return fmt.Errorf("runtime_backend does not support runtime profile %q", env.RuntimeProfile.RuntimeProfile)
+		}
+		if !slices.Contains(env.RuntimeProfile.ConformanceProfiles, "product-capture-v1") ||
+			!slices.Contains(env.RuntimeBackend.ConformanceProfiles, "product-capture-v1") {
+			return errors.New("runtime_backend and runtime_profile must include product-capture-v1 conformance")
+		}
+	}
+	return nil
+}
+
+func runtimeBackendHasProductCaptureExecutor(report coreprotocol.RuntimeBackendReport) bool {
+	for _, executor := range report.Executors {
+		if executorMeetsProductCaptureFloor(executor) {
+			return true
+		}
+	}
+	return false
+}
+
+func executorMeetsProductCaptureFloor(executor coreprotocol.ExecutorRef) bool {
+	if executor.Provider != ExecutorProvider {
+		return false
+	}
+	if executor.ExecutionSecurityTier != coreprotocol.ExecutionSandboxedContainer {
+		return false
+	}
+	if executor.ProofTier != coreprotocol.ProofArtifactHash {
+		return false
+	}
+	return executor.ValidateForProof() == nil
+}
+
+func runtimeBackendHasMatchingExecutor(report coreprotocol.RuntimeBackendReport, want coreprotocol.ExecutorRef) bool {
+	for _, got := range report.Executors {
+		if got.Provider != want.Provider {
+			continue
+		}
+		if want.Version != "" && got.Version != want.Version {
+			continue
+		}
+		if want.ExecutionSecurityTier != "" && got.ExecutionSecurityTier != want.ExecutionSecurityTier {
+			continue
+		}
+		if want.ProofTier != "" && got.ProofTier != want.ProofTier {
+			continue
+		}
+		if want.ImageDigest != "" && got.ImageDigest != want.ImageDigest {
+			continue
+		}
+		if want.RootFSDigest != "" && got.RootFSDigest != want.RootFSDigest {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func isZeroMetadata(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	if !reflected.IsValid() {
+		return true
+	}
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if reflected.IsNil() {
+			return true
+		}
+	}
+	return reflected.IsZero()
 }
 
 func runWorkload(workload Workload, outputPath string) error {
