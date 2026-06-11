@@ -355,7 +355,20 @@ func runtimeBackendHasMatchingExecutor(report coreprotocol.RuntimeBackendReport,
 }
 
 func isZeroMetadata(value any) bool {
-	return reflect.ValueOf(value).IsZero()
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	if !reflected.IsValid() {
+		return true
+	}
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		if reflected.IsNil() {
+			return true
+		}
+	}
+	return reflected.IsZero()
 }
 
 func runWorkload(workload Workload, outputPath string) error {

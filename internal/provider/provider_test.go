@@ -450,6 +450,21 @@ func TestMainRejectsInvalidWorkflowComputeProviderConfig(t *testing.T) {
 	}
 }
 
+func TestIsZeroMetadataHandlesNil(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("isZeroMetadata panicked for nil: %v", r)
+		}
+	}()
+	if !isZeroMetadata(nil) {
+		t.Fatal("nil metadata should be treated as zero")
+	}
+	var profile *coreprotocol.ProviderRuntimeProfile
+	if !isZeroMetadata(profile) {
+		t.Fatal("typed nil metadata should be treated as zero")
+	}
+}
+
 func TestProviderSchemaAcceptsBuyMyWishlistLiveInputAndRejectsDemoFields(t *testing.T) {
 	compiler := jsonschema.NewCompiler()
 	schemaPath := filepath.Join("..", "..", "schemas", "product-capture-operation-input.schema.json")
