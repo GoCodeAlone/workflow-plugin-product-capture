@@ -4,7 +4,7 @@ before:
   hooks:
     - go mod tidy
     - go test ./...
-    - go run ./cmd/release-prep --tag "{{ .Tag }}" --write
+    - go run ./cmd/release-prep --tag "{{ .Tag }}"
     - "{{ .Env.WFCTL_BIN }} plugin validate-contract --for-publish --tag {{ .Tag }} ."
 
 builds:

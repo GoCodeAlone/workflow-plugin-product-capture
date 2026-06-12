@@ -78,6 +78,20 @@ func TestRunWritesPreparedManifest(t *testing.T) {
 	}
 }
 
+func TestCommittedManifestMatchesSourceReleaseMetadata(t *testing.T) {
+	manifest, err := Read(filepath.Join("..", "..", "plugin.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := Prepare(manifest, "v"+manifest.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Check(manifest, expected); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestPrepareRejectsNonReleaseTag(t *testing.T) {
 	for _, tag := range []string{"0.2.0", "v0.2.0-rc.1", "v0.2.0+build"} {
 		if _, err := Prepare(sampleManifest(), tag); err == nil {
