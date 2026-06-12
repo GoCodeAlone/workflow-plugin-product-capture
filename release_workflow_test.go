@@ -45,12 +45,15 @@ func TestGoReleaserPreparesReleaseManifestInsideLifecycle(t *testing.T) {
 	}
 	config := string(data)
 	for _, want := range []string{
-		`go run ./cmd/release-prep --tag "{{ .Tag }}" --write`,
+		`go run ./cmd/release-prep --tag "{{ .Tag }}"`,
 		`"{{ .Env.WFCTL_BIN }} plugin validate-contract --for-publish --tag {{ .Tag }} ."`,
 	} {
 		if !strings.Contains(config, want) {
 			t.Fatalf(".goreleaser.yml missing release hook %q", want)
 		}
+	}
+	if strings.Contains(config, `go run ./cmd/release-prep --tag "{{ .Tag }}" --write`) {
+		t.Fatal(".goreleaser.yml must check committed release metadata instead of rewriting plugin.json during release")
 	}
 }
 

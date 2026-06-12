@@ -34,10 +34,23 @@ setup ...` path. BuyMyWishlist operators should not guess worker IDs, org IDs,
 pool IDs, or agent tokens; those values are issued by the wfcompute control
 plane and embedded in the invite/setup flow.
 
+## Current Release Target
+
+Use `workflow-plugin-product-capture` `v0.1.19` for the next BuyMyWishlist
+live-incorporation pass. Downstream workflow-compute scenarios, staging proof
+defaults, and BuyMyWishlist plugin pins should all reference this tag once its
+release workflow has published the matching browser runtime image digest.
+
+Do not copy a digest from this source tree. The digest that matters is the
+GHCR `product-capture-browser@sha256:<digest>` emitted by the `v0.1.19`
+release workflow. For component-backed deployments, use the wfcompute package
+campaign's promoted component digest for
+`provider://workflow-plugin-product-capture/browser/runtime`.
+
 ## Verified wfcompute Staging Baseline
 
-The latest wfcompute staging proof for this plugin release completed on
-2026-06-07 against:
+The last accepted wfcompute staging proof before the `v0.1.19` incorporation
+refresh completed on 2026-06-07 against:
 
 - wfcompute server:
   `https://workflow-compute-staging-ocysa.ondigitalocean.app`;
