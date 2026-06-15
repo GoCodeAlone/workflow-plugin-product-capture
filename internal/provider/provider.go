@@ -596,24 +596,66 @@ async function launchChromeBrowser() {
 function isTransientNavigationError(err) {
   const message = err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
   return [
+    'Timeout',
     'net::ERR_NETWORK_CHANGED',
     'net::ERR_NETWORK_RESET',
     'net::ERR_TIMED_OUT',
   ].some((needle) => message.includes(needle));
 }
 
-async function gotoWithTransientRetry(page, url, timeout) {
+async function productTitleReady(page) {
+  return await page.evaluate(() => {
+    const visibleTitle = document.querySelector('span#productTitle');
+    if (visibleTitle && visibleTitle.textContent && visibleTitle.textContent.trim()) return true;
+    const hiddenTitle = document.querySelector('input#productTitle');
+    return Boolean(hiddenTitle && hiddenTitle.value && hiddenTitle.value.trim());
+  }).catch(() => false);
+}
+
+function remainingTimeout(deadline) {
+  return Math.max(0, deadline - Date.now());
+}
+
+function requireTimeout(deadline, label, max = Infinity) {
+  const timeout = Math.min(remainingTimeout(deadline), max);
+  if (timeout <= 0) throw new Error(label + ' timed out');
+  return timeout;
+}
+
+async function waitForProductTitle(page, deadline) {
+  const timeout = remainingTimeout(deadline);
+  if (timeout <= 0) return await productTitleReady(page);
+  return await page.waitForFunction(() => {
+    const visibleTitle = document.querySelector('span#productTitle');
+    if (visibleTitle && visibleTitle.textContent && visibleTitle.textContent.trim()) return true;
+    const hiddenTitle = document.querySelector('input#productTitle');
+    return Boolean(hiddenTitle && hiddenTitle.value && hiddenTitle.value.trim());
+  }, { timeout }).then(() => true).catch(() => productTitleReady(page));
+}
+
+async function gotoWithTransientRetry(page, url, deadline) {
   let lastErr;
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (let attempt = 0; attempt < 3 && remainingTimeout(deadline) > 0; attempt++) {
+    const budget = remainingTimeout(deadline);
+    const timeout = Math.min(budget, attempt === 0 ? Math.max(15000, Math.floor(budget * 0.65)) : budget);
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
       return;
     } catch (err) {
       lastErr = err;
-      if (attempt === 3 || !isTransientNavigationError(err)) {
+      if (!isTransientNavigationError(err)) {
         throw err;
       }
-      await page.waitForTimeout(500 * attempt);
+      if (await productTitleReady(page)) return;
+      if (page.url() && page.url() !== 'about:blank') {
+        const loadTimeout = Math.min(5000, remainingTimeout(deadline));
+        if (loadTimeout > 0) await page.waitForLoadState('domcontentloaded', { timeout: loadTimeout }).catch(() => {});
+        if (await waitForProductTitle(page, deadline)) return;
+      }
+      if (attempt < 2) {
+        const backoff = Math.min(500 * (attempt + 1), remainingTimeout(deadline));
+        if (backoff > 0) await page.waitForTimeout(backoff);
+      }
     }
   }
   throw lastErr;
@@ -622,6 +664,7 @@ async function gotoWithTransientRetry(page, url, timeout) {
 async function main() {
   const url = process.argv[2];
   const timeout = Number(process.argv[3] || 45000);
+  const deadline = Date.now() + timeout;
   const browser = await launchChromeBrowser();
   const page = await browser.newPage({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
@@ -630,7 +673,7 @@ async function main() {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
   try {
-    await gotoWithTransientRetry(page, url, timeout);
+    await gotoWithTransientRetry(page, url, deadline);
     if (await page.locator('form[action*="/errors/validateCaptcha"]').count()) {
       throw new Error('amazon interstitial requires manual review');
     }
@@ -639,8 +682,8 @@ async function main() {
       if (visibleTitle && visibleTitle.textContent && visibleTitle.textContent.trim()) return true;
       const hiddenTitle = document.querySelector('input#productTitle');
       return Boolean(hiddenTitle && hiddenTitle.value && hiddenTitle.value.trim());
-    }, { timeout: Math.min(timeout, 15000) });
-    const optionalWait = Math.min(Math.max(timeout - 15000, 0), 5000);
+    }, { timeout: requireTimeout(deadline, 'product title wait', 15000) });
+    const optionalWait = Math.min(remainingTimeout(deadline), 5000);
     if (optionalWait > 0) {
       await page.waitForFunction(() => {
         const text = (selector) => {

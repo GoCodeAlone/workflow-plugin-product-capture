@@ -736,10 +736,11 @@ func TestPlaywrightScriptWaitsForCaptureRelevantNodes(t *testing.T) {
 func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 	for _, required := range []string{
 		"isTransientNavigationError",
+		"'Timeout',",
 		"net::ERR_NETWORK_CHANGED",
 		"net::ERR_NETWORK_RESET",
 		"net::ERR_TIMED_OUT",
-		"for (let attempt = 1; attempt <= 3; attempt++)",
+		"for (let attempt = 0; attempt < 3 && remainingTimeout(deadline) > 0; attempt++)",
 		"await page.goto(url, { waitUntil: 'domcontentloaded', timeout });",
 		"String(err)",
 	} {
@@ -747,10 +748,32 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 			t.Fatalf("playwright script must retry transient navigation failure path %q", required)
 		}
 	}
-	retryIndex := strings.Index(playwrightCaptureScript, "await gotoWithTransientRetry(page, url, timeout);")
+	retryIndex := strings.Index(playwrightCaptureScript, "await gotoWithTransientRetry(page, url, deadline);")
 	captchaIndex := strings.Index(playwrightCaptureScript, `form[action*="/errors/validateCaptcha"]`)
 	if retryIndex < 0 || captchaIndex < 0 || captchaIndex < retryIndex {
 		t.Fatal("playwright script must check CAPTCHA/interstitials after retryable navigation only")
+	}
+}
+
+func TestPlaywrightScriptRetriesPlainNavigationTimeoutWithinBudget(t *testing.T) {
+	for _, required := range []string{
+		"'Timeout',",
+		"productTitleReady(page)",
+		"waitForProductTitle(page, deadline)",
+		"requireTimeout(deadline, 'product title wait', 15000)",
+		"remainingTimeout(deadline",
+		"Math.floor(budget * 0.65)",
+		"if (loadTimeout > 0) await page.waitForLoadState('domcontentloaded'",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("playwright script should retry plain navigation timeouts within one capture budget; missing %q", required)
+		}
+	}
+	if strings.Contains(playwrightCaptureScript, "for (let attempt = 1; attempt <= 3; attempt++)") {
+		t.Fatalf("playwright script should not spend the full timeout on each retry")
+	}
+	if strings.Contains(playwrightCaptureScript, "return Math.max(floor, deadline - Date.now())") {
+		t.Fatalf("playwright script should not extend expired capture budgets with a timeout floor")
 	}
 }
 
