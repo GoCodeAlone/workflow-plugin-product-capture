@@ -637,6 +637,7 @@ async function gotoWithTransientRetry(page, url, deadline) {
   let lastErr;
   for (let attempt = 0; attempt < 3 && remainingTimeout(deadline) > 0; attempt++) {
     const budget = remainingTimeout(deadline);
+    if (budget <= 0) break;
     const timeout = Math.min(budget, attempt === 0 ? Math.max(15000, Math.floor(budget * 0.65)) : budget);
     try {
       await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
@@ -658,6 +659,7 @@ async function gotoWithTransientRetry(page, url, deadline) {
       }
     }
   }
+  if (!lastErr) throw new Error('navigation timed out before capture started');
   throw lastErr;
 }
 

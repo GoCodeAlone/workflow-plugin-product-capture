@@ -741,6 +741,7 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 		"net::ERR_NETWORK_RESET",
 		"net::ERR_TIMED_OUT",
 		"for (let attempt = 0; attempt < 3 && remainingTimeout(deadline) > 0; attempt++)",
+		"if (budget <= 0) break;",
 		"await page.goto(url, { waitUntil: 'domcontentloaded', timeout });",
 		"String(err)",
 	} {
@@ -764,6 +765,7 @@ func TestPlaywrightScriptRetriesPlainNavigationTimeoutWithinBudget(t *testing.T)
 		"remainingTimeout(deadline",
 		"Math.floor(budget * 0.65)",
 		"if (loadTimeout > 0) await page.waitForLoadState('domcontentloaded'",
+		"navigation timed out before capture started",
 	} {
 		if !strings.Contains(playwrightCaptureScript, required) {
 			t.Fatalf("playwright script should retry plain navigation timeouts within one capture budget; missing %q", required)
