@@ -944,7 +944,7 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 			t.Fatalf("playwright script must retry transient navigation failure path %q", required)
 		}
 	}
-	if strings.Contains(playwrightCaptureScript, "page.goto(url, { waitUntil: 'domcontentloaded'") {
+	if strings.Contains(playwrightCaptureScript, "waitUntil: 'domcontentloaded'") {
 		t.Fatalf("playwright script should not make Amazon DOMContentLoaded the primary navigation gate")
 	}
 	retryIndex := strings.Index(playwrightCaptureScript, "await gotoWithTransientRetry(page, url, deadline);")
