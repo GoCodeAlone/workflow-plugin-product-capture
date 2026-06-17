@@ -1020,6 +1020,164 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptClicksBenignValidateCaptchaContinueShoppingForm(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+const attrs = {};
+const continuationNode = {
+  value: 'Continue Shopping',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
+const captchaForm = { contains: (node) => node === continuationNode };
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+  global.document = {
+    body: { textContent: clicked ? 'Echo Dot' : 'Continue Shopping' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleNodes;
+      if (selector === 'form[action*="/errors/validateCaptcha"]') return clicked ? [] : [captchaForm];
+      if (selector === 'img[src*="captcha" i],img[alt*="captcha" i],input[name*="captcha" i],input[id*="captcha" i],iframe[src*="captcha" i],iframe[src*="challenge" i]') return [];
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return clicked ? [] : [continuationNode];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => clicked ? 0 : 1 };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' && !clicked ? 1 : 0,
+            first: () => ({
+              click: async () => { clicked = true; },
+            }),
+            nth: () => ({
+              click: async () => { clicked = true; },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after benign validateCaptcha continuation form click: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after validateCaptcha continuation: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptDoesNotClickValidateCaptchaContinuationOutsideForm(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+const attrs = {};
+const continuationNode = {
+  value: 'Continue Shopping',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
+const captchaForm = { contains: () => false };
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'Continue Shopping' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      if (selector === 'form[action*="/errors/validateCaptcha"]') return [captchaForm];
+      if (selector === 'img[src*="captcha" i],img[alt*="captcha" i],input[name*="captcha" i],input[id*="captcha" i],iframe[src*="captcha" i],iframe[src*="challenge" i]') return [];
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 1 };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' ? 1 : 0,
+            first: () => ({
+              click: async () => { throw new Error('clicked outside-form continuation'); },
+            }),
+            nth: () => ({
+              click: async () => { throw new Error('clicked outside-form continuation'); },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async () => { throw new TimeoutError('timeout'); },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body>continue shopping outside form</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected outside-form validateCaptcha continuation to fail closed")
+	}
+	if strings.Contains(stderr.String(), "clicked outside-form continuation") || !strings.Contains(stderr.String(), "amazon interstitial requires manual review") {
+		t.Fatalf("stderr missing manual review failure or clicked outside-form gate: %s", stderr.String())
+	}
+}
+
 func TestPlaywrightScriptClicksCaseInsensitiveContinuationSubmitValue(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {
@@ -2064,6 +2222,85 @@ exports.errors = { TimeoutError };
 	} {
 		if strings.Contains(stderr.String(), leak) {
 			t.Fatalf("stderr leaked page detail %q: %s", leak, stderr.String())
+		}
+	}
+}
+
+func TestPlaywrightScriptDiagnosticsDoNotLeakArbitraryControlLabels(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+const privateControl = {
+  value: '',
+  textContent: 'Jane Customer jane@example.com 123 Main Street',
+  getAttribute: () => '',
+  setAttribute: () => {},
+  removeAttribute: () => {},
+};
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'shopping page without product details' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [privateControl];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async () => { throw new TimeoutError('timeout'); },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body>shopping page without product details</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected missing title to fail")
+	}
+	for _, want := range []string{
+		"amazon product page did not expose product title",
+		"continuation_candidates=0",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing diagnostic %q: %s", want, stderr.String())
+		}
+	}
+	for _, leak := range []string{
+		"control_labels=",
+		"Jane",
+		"jane",
+		"example",
+		"123 Main",
+	} {
+		if strings.Contains(stderr.String(), leak) {
+			t.Fatalf("stderr leaked arbitrary control label %q: %s", leak, stderr.String())
 		}
 	}
 }
