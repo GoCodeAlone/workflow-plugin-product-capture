@@ -163,6 +163,263 @@ func TestExtractAmazonFallsBackToHiddenProductTitleValue(t *testing.T) {
 	}
 }
 
+func TestExtractAmazonFallsBackToMetadataProductTitle(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3">
+  <meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker">
+  <meta name="title" content="Ignored fallback">
+</head><body>
+  <div id="corePrice_feature_div"><span class="a-offscreen">$34.99</span></div>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg">
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.Title != "Amazon Echo Dot (newest model) - Vibrant sounding speaker" {
+		t.Fatalf("title: %q", got.Title)
+	}
+	if got.ExternalID != "B09B8V1LZ3" {
+		t.Fatalf("asin: %q", got.ExternalID)
+	}
+	if got.Confidence != "high" {
+		t.Fatalf("confidence: %q", got.Confidence)
+	}
+}
+
+func TestExtractAmazonUsesCanonicalASINWhenRequestHasNoASIN(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3">
+  <meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker">
+</head><body>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg">
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/s?k=echo+dot",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.ExternalID != "B09B8V1LZ3" {
+		t.Fatalf("asin: %q", got.ExternalID)
+	}
+}
+
+func TestExtractAmazonRejectsDOMTitleWhenCanonicalASINDiffers(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B08WRONG11">
+</head><body>
+  <span id="productTitle">Amazon Echo Dot</span>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg">
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		return
+	}
+	t.Fatalf("expected mismatched requested/canonical ASIN to fail closed, got external_id=%q canonical_url=%q", got.ExternalID, got.CanonicalURL)
+}
+
+func TestExtractAmazonMetadataTitleAcceptsPriceContainerEvidence(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3">
+  <meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker">
+</head><body>
+  <div class="priceToPay"><span class="a-offscreen">$34.99</span></div>
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.Title != "Amazon Echo Dot (newest model) - Vibrant sounding speaker" {
+		t.Fatalf("title: %q", got.Title)
+	}
+	if got.Price != "34.99" || got.Confidence != "medium" {
+		t.Fatalf("price/confidence: %q/%q", got.Price, got.Confidence)
+	}
+}
+
+func TestExtractAmazonMetadataTitleAcceptsSecondPriceContainerEvidence(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3">
+  <meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker">
+</head><body>
+  <div class="priceToPay"><span class="other">$0.00</span></div>
+  <div class="priceToPay"><span class="a-offscreen">$34.99</span></div>
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.Title != "Amazon Echo Dot (newest model) - Vibrant sounding speaker" {
+		t.Fatalf("title: %q", got.Title)
+	}
+	if got.Price != "34.99" || got.Confidence != "medium" {
+		t.Fatalf("price/confidence: %q/%q", got.Price, got.Confidence)
+	}
+}
+
+func TestExtractAmazonRejectsMetadataTitleWithMalformedASIN(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/not-a-real-product">
+  <meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker">
+</head><body>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg">
+</body></html>`
+	if _, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/dp/not-a-real-product",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	}); err == nil {
+		t.Fatal("expected malformed ASIN metadata to fail closed")
+	}
+}
+
+func TestExtractAmazonRejectsGenericMetadataProductTitle(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3">
+  <meta property="og:title" content="Amazon.com. Spend less. Smile more.">
+</head><body>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg">
+</body></html>`
+	if _, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	}); err == nil {
+		t.Fatal("expected generic metadata title to fail closed")
+	}
+}
+
+func TestExtractAmazonRejectsMetadataTitleWithoutProductEvidence(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3">
+  <meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker">
+</head><body>
+  <main>Continue Shopping</main>
+</body></html>`
+	if _, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	}); err == nil {
+		t.Fatal("expected metadata title without product evidence to fail closed")
+	}
+}
+
+func TestExtractAmazonRejectsMetadataTitleWithOnlyGenericImage(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3">
+  <meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker">
+</head><body>
+  <img src="https://www.amazon.com/logo.png">
+</body></html>`
+	if _, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	}); err == nil {
+		t.Fatal("expected metadata title with only generic image to fail closed")
+	}
+}
+
+func TestExtractAmazonMetadataTitleDoesNotPromoteGenericImage(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3">
+  <meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker">
+</head><body>
+  <div class="priceToPay"><span class="a-offscreen">$34.99</span></div>
+  <img src="https://www.amazon.com/logo.png">
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.ImageURL != "" || len(got.Images) != 0 {
+		t.Fatalf("metadata-backed capture should not promote generic image: image=%q images=%v", got.ImageURL, got.Images)
+	}
+	if got.Confidence != "medium" {
+		t.Fatalf("confidence should remain medium without a trusted product image: %q", got.Confidence)
+	}
+}
+
+func TestExtractAmazonRejectsMetadataTitleWhenCanonicalASINDiffers(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B08WRONG11">
+  <meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker">
+</head><body>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg">
+</body></html>`
+	if _, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	}); err == nil {
+		t.Fatal("expected metadata title with mismatched canonical ASIN to fail closed")
+	}
+}
+
+func TestExtractAmazonMetadataTitleAcceptsProductImageContainer(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3">
+  <meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker">
+</head><body>
+  <div id="imgTagWrapperId">
+    <img src="https://m.media-amazon.com/images/I/echo-inline.jpg">
+  </div>
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.Title != "Amazon Echo Dot (newest model) - Vibrant sounding speaker" {
+		t.Fatalf("title: %q", got.Title)
+	}
+}
+
+func TestAmazonASINFromURLRecognizesSupportedPaths(t *testing.T) {
+	tests := map[string]string{
+		"https://www.amazon.com/dp/B09B8V1LZ3":                                          "B09B8V1LZ3",
+		"https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3": "B09B8V1LZ3",
+		"https://www.amazon.com/gp/product/B09B8V1LZ3":                                  "B09B8V1LZ3",
+		"https://www.amazon.com/gp/aw/d/B09B8V1LZ3":                                     "B09B8V1LZ3",
+		"https://www.amazon.com/gp/aw":                                                  "",
+		"https://www.amazon.com/gp/anything":                                            "",
+		"https://www.amazon.com/dp/not-a-real-product":                                  "",
+		"https://www.amazon.com/gp/product/ref=nav":                                     "",
+	}
+	for raw, want := range tests {
+		if got := asinFromURL(raw); got != want {
+			t.Fatalf("asinFromURL(%q)=%q want %q", raw, got, want)
+		}
+	}
+}
+
 func TestExtractAmazonFallsBackToImageWrapperPhoto(t *testing.T) {
 	html := `<!doctype html>
 <html><body>

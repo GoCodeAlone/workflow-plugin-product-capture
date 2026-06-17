@@ -27,28 +27,43 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	canonicalURL := firstAttr(root, "link", "rel", "canonical", "href")
+	if canonicalURL == "" {
+		canonicalURL = opts.URL
+	}
+	requestedASIN := asinFromURL(opts.URL)
+	canonicalASIN := asinFromURL(canonicalURL)
+	if requestedASIN != "" && canonicalASIN != "" && requestedASIN != canonicalASIN {
+		return Snapshot{}, fmt.Errorf("amazon canonical ASIN %q does not match requested ASIN %q", canonicalASIN, requestedASIN)
+	}
 	out := Snapshot{
 		Provider:                 "browser_capture",
 		ProviderVersion:          "amazon-dom-v1",
 		Merchant:                 "amazon",
 		URL:                      opts.URL,
-		ExternalID:               asinFromURL(opts.URL),
+		ExternalID:               firstNonEmpty(requestedASIN, canonicalASIN),
 		CapturedAt:               now,
 		RequiresUserConfirmation: true,
+		CanonicalURL:             canonicalURL,
 	}
-	out.Title = firstNonEmpty(
+	domTitle := firstNonEmpty(
 		firstTextByID(root, "productTitle"),
 		firstAttrByID(root, "productTitle", "value"),
 	)
-	out.CanonicalURL = firstAttr(root, "link", "rel", "canonical", "href")
-	if out.CanonicalURL == "" {
-		out.CanonicalURL = opts.URL
-	}
-	out.ImageURL = firstNonEmpty(
+	metadataTitle := amazonMetadataTitle(root, opts.URL, out.CanonicalURL)
+	out.Title = firstNonEmpty(domTitle, metadataTitle)
+	trustedImageURL := firstNonEmpty(
 		firstAttrByID(root, "landingImage", "src"),
-		firstProductImageAttr(root, "data-old-hires"),
-		firstProductImageAttr(root, "src"),
+		firstProductContainerImageAttr(root, "data-old-hires"),
+		firstProductContainerImageAttr(root, "src"),
 	)
+	out.ImageURL = trustedImageURL
+	if domTitle != "" && out.ImageURL == "" {
+		out.ImageURL = firstNonEmpty(
+			firstProductImageAttr(root, "data-old-hires"),
+			firstProductImageAttr(root, "src"),
+		)
+	}
 	out.Images = uniqueNonEmpty(dynamicImages(firstAttrByID(root, "landingImage", "data-a-dynamic-image")))
 	if out.ImageURL != "" && !contains(out.Images, out.ImageURL) {
 		out.Images = append([]string{out.ImageURL}, out.Images...)
@@ -56,6 +71,8 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 	out.Price, out.Currency = normalizePrice(firstNonEmpty(
 		firstTextBySelector(root, "corePrice_feature_div", "a-offscreen"),
 		firstTextBySelector(root, "apex_desktop", "a-offscreen"),
+		firstTextByClassUnderClass(root, "apexPriceToPay", "a-offscreen"),
+		firstTextByClassUnderClass(root, "priceToPay", "a-offscreen"),
 		firstTextByClass(root, "a-offscreen"),
 	))
 	out.Availability = amazonAvailability(root)
@@ -87,6 +104,59 @@ func amazonUnavailable(availability string) bool {
 	return strings.Contains(availability, "currently unavailable") ||
 		strings.Contains(availability, "temporarily out of stock") ||
 		strings.Contains(availability, "out of stock")
+}
+
+func amazonMetadataTitle(root *html.Node, requestedURL, canonicalURL string) string {
+	if !amazonMetadataProductEvidence(root, requestedURL, canonicalURL) {
+		return ""
+	}
+	return firstNonEmpty(
+		cleanAmazonMetadataTitle(firstAttr(root, "meta", "property", "og:title", "content")),
+		cleanAmazonMetadataTitle(firstAttr(root, "meta", "name", "title", "content")),
+	)
+}
+
+func amazonMetadataProductEvidence(root *html.Node, requestedURL, canonicalURL string) bool {
+	requestedASIN := asinFromURL(requestedURL)
+	canonicalASIN := asinFromURL(canonicalURL)
+	if requestedASIN != "" && canonicalASIN != "" && requestedASIN != canonicalASIN {
+		return false
+	}
+	if requestedASIN == "" && canonicalASIN == "" {
+		return false
+	}
+	return firstNonEmpty(
+		firstAttrByID(root, "landingImage", "src"),
+		firstAttrByID(root, "landingImage", "data-a-dynamic-image"),
+		firstProductContainerImageAttr(root, "data-old-hires"),
+		firstProductContainerImageAttr(root, "src"),
+		firstTextBySelector(root, "corePrice_feature_div", "a-offscreen"),
+		firstTextBySelector(root, "apex_desktop", "a-offscreen"),
+		firstTextByClassUnderClass(root, "apexPriceToPay", "a-offscreen"),
+		firstTextByClassUnderClass(root, "priceToPay", "a-offscreen"),
+		amazonAvailability(root),
+	) != ""
+}
+
+func cleanAmazonMetadataTitle(raw string) string {
+	title := clean(raw)
+	if title == "" {
+		return ""
+	}
+	lower := strings.ToLower(title)
+	for _, blocked := range []string{
+		"amazon.com. spend less. smile more.",
+		"robot check",
+		"captcha",
+		"sign in",
+		"unusual activity",
+		"security challenge",
+	} {
+		if strings.Contains(lower, blocked) {
+			return ""
+		}
+	}
+	return title
 }
 
 func clearTransactionalFields(out *Snapshot) {
@@ -301,6 +371,21 @@ func firstTextByClassUnderID(root *html.Node, id, className string) string {
 	return firstTextByClass(container, className)
 }
 
+func firstTextByClassUnderClass(root *html.Node, containerClass, className string) string {
+	var found string
+	walk(root, func(n *html.Node) bool {
+		if !hasClass(n, containerClass) {
+			return true
+		}
+		if text := firstTextByClass(n, className); text != "" {
+			found = text
+			return false
+		}
+		return true
+	})
+	return found
+}
+
 func firstTextBySelector(root *html.Node, id, className string) string {
 	container := nodeByID(root, id)
 	if container == nil {
@@ -364,6 +449,19 @@ func firstProductImageAttr(root *html.Node, name string) string {
 		}
 	}
 	return firstImageAttr(root, name)
+}
+
+func firstProductContainerImageAttr(root *html.Node, name string) string {
+	for _, id := range []string{"imgTagWrapperId", "main-image-container"} {
+		container := nodeByID(root, id)
+		if container == nil {
+			continue
+		}
+		if value := firstImageAttr(container, name); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func firstImageAttr(root *html.Node, name string) string {
@@ -564,14 +662,25 @@ func asinFromURL(raw string) string {
 	}
 	parts := strings.Split(parsed.Path, "/")
 	for i, part := range parts {
-		if (part == "dp" || part == "gp") && i+1 < len(parts) {
-			if part == "gp" && i+2 < len(parts) && parts[i+1] == "product" {
-				return parts[i+2]
-			}
-			return parts[i+1]
+		if part == "dp" && i+1 < len(parts) {
+			return normalizeASIN(parts[i+1])
+		}
+		if part == "gp" && i+2 < len(parts) && parts[i+1] == "product" {
+			return normalizeASIN(parts[i+2])
+		}
+		if part == "gp" && i+3 < len(parts) && parts[i+1] == "aw" && parts[i+2] == "d" {
+			return normalizeASIN(parts[i+3])
 		}
 	}
 	return ""
+}
+
+func normalizeASIN(value string) string {
+	value = strings.ToUpper(strings.TrimSpace(value))
+	if matched, _ := regexp.MatchString(`^[A-Z0-9]{10}$`, value); !matched {
+		return ""
+	}
+	return value
 }
 
 func contains(values []string, value string) bool {
