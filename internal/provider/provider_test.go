@@ -2595,6 +2595,7 @@ func TestPlaywrightScriptRetriesPlainNavigationTimeoutWithinBudget(t *testing.T)
 		"'Timeout',",
 		"productTitleReady(page)",
 		"waitForProductTitle(page, deadline)",
+		"if (timeout <= 0) return await safeProductTitleReady(page)",
 		"const titleWait = Math.min(remainingTimeout(deadline), 15000)",
 		"await waitForProductTitle(page, Date.now() + titleWait)",
 		"remainingTimeout(deadline",

@@ -816,7 +816,7 @@ function remainingTimeout(deadline) {
 
 async function waitForProductTitle(page, deadline) {
   const timeout = remainingTimeout(deadline);
-  if (timeout <= 0) return await productTitleReady(page);
+  if (timeout <= 0) return await safeProductTitleReady(page);
   return await page.waitForFunction(() => {
     const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
     return titleNodes.some((node) => {
