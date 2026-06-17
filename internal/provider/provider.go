@@ -624,14 +624,33 @@ async function productTitleReady(page) {
 }
 
 async function hasAmazonInterstitial(page) {
-  return await page.locator('form[action*="/errors/validateCaptcha"]').count().then((count) => count > 0);
+  const captchaForm = await page.locator('form[action*="/errors/validateCaptcha"]').count().then((count) => count > 0);
+  if (captchaForm) return true;
+  return await page.evaluate(() => {
+    const bodyText = ((document.body && document.body.textContent) || '').replace(/\s+/g, ' ').toLowerCase();
+    return (
+      bodyText.includes('enter the characters you see below') ||
+      bodyText.includes('make sure you are not a robot') ||
+      bodyText.includes('type the characters you see') ||
+      bodyText.includes('validate captcha')
+    );
+  }).catch(() => false);
 }
 
 async function handleAmazonContinuationGate(page, deadline) {
   if (await productTitleReady(page).catch(() => false)) return false;
   if (await hasAmazonInterstitial(page)) return false;
   const continueButton = page.locator(
-    'button:has-text("Continue Shopping"), input[type="submit"][value="Continue Shopping"], a:has-text("Continue Shopping"), text=/^\\s*continue shopping\\s*$/i'
+    [
+      'button:has-text("Continue Shopping")',
+      'input[type="submit" i][value="Continue Shopping" i]',
+      'input[type="button" i][value="Continue Shopping" i]',
+      'input[type="submit" i][aria-label*="Continue Shopping" i]',
+      'input[type="button" i][aria-label*="Continue Shopping" i]',
+      '[role="button"][aria-label*="Continue Shopping" i]',
+      'a:has-text("Continue Shopping")',
+      'text=/^\\s*continue shopping\\s*$/i',
+    ].join(', ')
   );
   const count = await continueButton.count().catch(() => 0);
   if (count <= 0) return false;

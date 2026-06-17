@@ -820,6 +820,19 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: '' },
+    querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: 'Xbox Series X', textContent: '' }] : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
 exports.chromium = {
   launch: async () => ({
     newPage: async () => ({
@@ -830,7 +843,7 @@ exports.chromium = {
         return { count: async () => 0 };
       },
       waitForFunction: async () => { throw new Error('Target page, context or browser has been closed'); },
-      evaluate: async () => true,
+      evaluate: async (fn) => withDocument(fn),
       content: async () => '<html><body><input id="productTitle" value="Xbox Series X"></body></html>',
     }),
     close: async () => {},
@@ -956,6 +969,125 @@ exports.errors = { TimeoutError };
 	}
 	if !strings.Contains(stdout.String(), `id="productTitle"`) {
 		t.Fatalf("capture script did not emit product html after continuation: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptClicksCaseInsensitiveContinuationSubmitValue(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+  global.document = {
+    querySelectorAll: (selector) => selector === '#productTitle' ? titleNodes : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('[value="Continue Shopping" i]')) {
+          return {
+            count: async () => clicked ? 0 : 1,
+            first: () => ({
+              click: async () => { clicked = true; },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after case-insensitive continuation submit click: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after continuation submit: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptDoesNotClickCaptchaLikeContinuation(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'Sorry, we just need to make sure you are not a robot. Enter the characters you see below.' },
+    querySelectorAll: (selector) => selector === '#productTitle' ? [] : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('[value="Continue Shopping" i]') || selector.includes('Continue Shopping')) {
+          return {
+            count: async () => 1,
+            first: () => ({
+              click: async () => { throw new Error('clicked CAPTCHA-like continuation'); },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body>captcha</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected CAPTCHA-like continuation page to fail closed")
+	}
+	if strings.Contains(stderr.String(), "clicked CAPTCHA-like continuation") || !strings.Contains(stderr.String(), "amazon interstitial requires manual review") {
+		t.Fatalf("stderr missing manual review failure or clicked CAPTCHA-like gate: %s", stderr.String())
 	}
 }
 
