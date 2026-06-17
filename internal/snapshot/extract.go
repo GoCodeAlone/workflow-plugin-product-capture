@@ -41,7 +41,6 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 		firstAttrByID(root, "productTitle", "value"),
 		firstAttr(root, "meta", "property", "og:title", "content"),
 		firstAttr(root, "meta", "name", "title", "content"),
-		cleanAmazonDocumentTitle(firstTextByTag(root, "title")),
 	)
 	out.CanonicalURL = firstAttr(root, "link", "rel", "canonical", "href")
 	if out.CanonicalURL == "" {
@@ -90,23 +89,6 @@ func amazonUnavailable(availability string) bool {
 	return strings.Contains(availability, "currently unavailable") ||
 		strings.Contains(availability, "temporarily out of stock") ||
 		strings.Contains(availability, "out of stock")
-}
-
-func cleanAmazonDocumentTitle(title string) string {
-	title = clean(title)
-	if title == "" {
-		return ""
-	}
-	lower := strings.ToLower(title)
-	if lower == "amazon.com" || strings.Contains(lower, "robot check") {
-		return ""
-	}
-	title = strings.TrimSpace(strings.TrimSuffix(title, " - Amazon.com"))
-	title = strings.TrimSpace(strings.TrimPrefix(title, "Amazon.com:"))
-	if strings.EqualFold(title, "Amazon.com") {
-		return ""
-	}
-	return title
 }
 
 func clearTransactionalFields(out *Snapshot) {
@@ -319,18 +301,6 @@ func firstTextByClassUnderID(root *html.Node, id, className string) string {
 		return ""
 	}
 	return firstTextByClass(container, className)
-}
-
-func firstTextByTag(root *html.Node, tag string) string {
-	var found string
-	walk(root, func(n *html.Node) bool {
-		if n.Type == html.ElementNode && strings.EqualFold(n.Data, tag) {
-			found = nodeText(n)
-			return false
-		}
-		return true
-	})
-	return clean(found)
 }
 
 func firstTextBySelector(root *html.Node, id, className string) string {

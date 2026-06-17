@@ -188,6 +188,19 @@ func TestExtractAmazonFallsBackToMetadataProductTitle(t *testing.T) {
 	}
 }
 
+func TestExtractAmazonDoesNotUseGenericDocumentTitleAsProductTitle(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <title>Amazon.com. Spend less. Smile more.</title>
+  <link rel="canonical" href="https://www.amazon.com/dp/B08N5WRWNW">
+</head><body>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg">
+</body></html>`
+	if _, err := ExtractAmazon(html, ExtractOptions{URL: "https://www.amazon.com/dp/B08N5WRWNW"}); err == nil {
+		t.Fatal("expected generic Amazon document title to fail closed")
+	}
+}
+
 func TestExtractAmazonFallsBackToImageWrapperPhoto(t *testing.T) {
 	html := `<!doctype html>
 <html><body>

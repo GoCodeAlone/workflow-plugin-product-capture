@@ -622,10 +622,7 @@ async function productTitleReady(page) {
       const node = document.querySelector(selector);
       if (node && hasText(node.getAttribute('content'))) return true;
     }
-    const documentTitle = document.title || (document.querySelector('title') && document.querySelector('title').textContent);
-    if (!hasText(documentTitle)) return false;
-    if (/^\s*Amazon\.com\s*$/i.test(documentTitle) || /robot check/i.test(documentTitle)) return false;
-    return true;
+    return false;
   });
 }
 
@@ -648,10 +645,7 @@ async function waitForProductTitle(page, deadline) {
       const node = document.querySelector(selector);
       if (node && hasText(node.getAttribute('content'))) return true;
     }
-    const documentTitle = document.title || (document.querySelector('title') && document.querySelector('title').textContent);
-    if (!hasText(documentTitle)) return false;
-    if (/^\s*Amazon\.com\s*$/i.test(documentTitle) || /robot check/i.test(documentTitle)) return false;
-    return true;
+    return false;
   }, { timeout }).then(() => true).catch((err) => {
     if (!isTimeoutError(err)) throw err;
     return productTitleReady(page);

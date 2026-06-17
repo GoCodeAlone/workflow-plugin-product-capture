@@ -856,6 +856,54 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptRejectsGenericDocumentTitleEvidence(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    title: 'Amazon.com. Spend less. Smile more.',
+    querySelectorAll: (selector) => selector === '#productTitle' ? [] : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector !== 'form[action*="/errors/validateCaptcha"]') throw new Error('unexpected selector ' + selector);
+        return { count: async () => 0 };
+      },
+      waitForFunction: async () => { throw new TimeoutError('Timeout 15000ms exceeded'); },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><title>Amazon.com. Spend less. Smile more.</title></head><body></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected generic document title to fail closed")
+	}
+	if !strings.Contains(stderr.String(), "amazon product page did not expose product title") {
+		t.Fatalf("stderr missing product title failure: %s", stderr.String())
+	}
+}
+
 func TestPlaywrightScriptPropagatesNonTimeoutTitleWaitErrors(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {
