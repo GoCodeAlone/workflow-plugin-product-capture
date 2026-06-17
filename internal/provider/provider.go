@@ -624,7 +624,8 @@ async function productTitleReady(page) {
 }
 
 async function hasAmazonInterstitial(page) {
-  const captchaForm = await page.locator('form[action*="/errors/validateCaptcha"]').count().then((count) => count > 0);
+  const captchaFormCount = await page.locator('form[action*="/errors/validateCaptcha"]').count().catch(() => 0);
+  const captchaForm = captchaFormCount > 0;
   if (captchaForm) return true;
   return await page.evaluate(() => {
     const bodyText = ((document.body && document.body.textContent) || '').replace(/\s+/g, ' ').toLowerCase();
