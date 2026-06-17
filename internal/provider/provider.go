@@ -578,7 +578,7 @@ func supportedHosts() []string {
 }
 
 const playwrightCaptureScript = `
-const { chromium } = require('playwright');
+const { chromium, errors } = require('playwright');
 
 async function launchChromeBrowser() {
   return await chromium.launch({
@@ -603,34 +603,47 @@ function isTransientNavigationError(err) {
   ].some((needle) => message.includes(needle));
 }
 
+function isTimeoutError(err) {
+  return Boolean(
+    err &&
+    (
+      (errors && errors.TimeoutError && err instanceof errors.TimeoutError) ||
+      err.name === 'TimeoutError'
+    )
+  );
+}
+
 async function productTitleReady(page) {
   return await page.evaluate(() => {
-    const visibleTitle = document.querySelector('span#productTitle');
-    if (visibleTitle && visibleTitle.textContent && visibleTitle.textContent.trim()) return true;
-    const hiddenTitle = document.querySelector('input#productTitle');
-    return Boolean(hiddenTitle && hiddenTitle.value && hiddenTitle.value.trim());
-  }).catch(() => false);
+    const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
+    return titleNodes.some((node) => {
+      if (node.textContent && node.textContent.trim()) return true;
+      return Boolean(node.value && node.value.trim());
+    });
+  });
+}
+
+async function hasAmazonInterstitial(page) {
+  return await page.locator('form[action*="/errors/validateCaptcha"]').count().then((count) => count > 0);
 }
 
 function remainingTimeout(deadline) {
   return Math.max(0, deadline - Date.now());
 }
 
-function requireTimeout(deadline, label, max = Infinity) {
-  const timeout = Math.min(remainingTimeout(deadline), max);
-  if (timeout <= 0) throw new Error(label + ' timed out');
-  return timeout;
-}
-
 async function waitForProductTitle(page, deadline) {
   const timeout = remainingTimeout(deadline);
   if (timeout <= 0) return await productTitleReady(page);
   return await page.waitForFunction(() => {
-    const visibleTitle = document.querySelector('span#productTitle');
-    if (visibleTitle && visibleTitle.textContent && visibleTitle.textContent.trim()) return true;
-    const hiddenTitle = document.querySelector('input#productTitle');
-    return Boolean(hiddenTitle && hiddenTitle.value && hiddenTitle.value.trim());
-  }, { timeout }).then(() => true).catch(() => productTitleReady(page));
+    const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
+    return titleNodes.some((node) => {
+      if (node.textContent && node.textContent.trim()) return true;
+      return Boolean(node.value && node.value.trim());
+    });
+  }, { timeout }).then(() => true).catch((err) => {
+    if (!isTimeoutError(err)) throw err;
+    return productTitleReady(page);
+  });
 }
 
 async function gotoWithTransientRetry(page, url, deadline) {
@@ -647,7 +660,7 @@ async function gotoWithTransientRetry(page, url, deadline) {
       if (!isTransientNavigationError(err)) {
         throw err;
       }
-      if (await productTitleReady(page)) return;
+      if (await productTitleReady(page).catch(() => false)) return;
       if (page.url() && page.url() !== 'about:blank') {
         const loadTimeout = Math.min(5000, remainingTimeout(deadline));
         if (loadTimeout > 0) await page.waitForLoadState('domcontentloaded', { timeout: loadTimeout }).catch(() => {});
@@ -676,15 +689,13 @@ async function main() {
   });
   try {
     await gotoWithTransientRetry(page, url, deadline);
-    if (await page.locator('form[action*="/errors/validateCaptcha"]').count()) {
+    if (await hasAmazonInterstitial(page)) {
       throw new Error('amazon interstitial requires manual review');
     }
-    await page.waitForFunction(() => {
-      const visibleTitle = document.querySelector('span#productTitle');
-      if (visibleTitle && visibleTitle.textContent && visibleTitle.textContent.trim()) return true;
-      const hiddenTitle = document.querySelector('input#productTitle');
-      return Boolean(hiddenTitle && hiddenTitle.value && hiddenTitle.value.trim());
-    }, { timeout: requireTimeout(deadline, 'product title wait', 15000) });
+    const titleWait = Math.min(remainingTimeout(deadline), 15000);
+    if (titleWait > 0) {
+      await waitForProductTitle(page, Date.now() + titleWait);
+    }
     const optionalWait = Math.min(remainingTimeout(deadline), 5000);
     if (optionalWait > 0) {
       await page.waitForFunction(() => {
@@ -709,6 +720,12 @@ async function main() {
           text('#primeShippingMessage_feature_div')
         );
       }, { timeout: optionalWait }).catch(() => {});
+    }
+    if (await hasAmazonInterstitial(page)) {
+      throw new Error('amazon interstitial requires manual review');
+    }
+    if (!await productTitleReady(page)) {
+      throw new Error('amazon product page did not expose product title');
     }
     process.stdout.write(await page.content());
   } finally {

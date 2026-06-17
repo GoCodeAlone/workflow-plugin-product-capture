@@ -29,6 +29,9 @@ Live browser capture requires `node` plus Playwright in the worker image. Local
 development can set `NODE_PATH` to a Playwright install; fixture mode is used by
 unit tests and never emits raw HTML in the provider response.
 
+Generated Playwright script regressions execute with `node` when it is present.
+CI provisions Node explicitly so those regressions are always exercised there.
+
 ## Worker runtime
 
 Provider workloads should use the promoted component runtime that wfcompute
