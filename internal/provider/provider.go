@@ -683,6 +683,7 @@ async function collectAmazonPageSignals(page) {
       if (node.textContent && node.textContent.trim()) return true;
       return Boolean(node.value && node.value.trim());
     });
+    const captchaForms = Array.from(document.querySelectorAll('form[action*="/errors/validateCaptcha"]'));
     const bodyText = ((document.body && document.body.textContent) || '').replace(/\s+/g, ' ').toLowerCase();
     const captchaChallengeCount = document.querySelectorAll(captchaSelector).length;
     const captchaText = (
@@ -698,21 +699,32 @@ async function collectAmazonPageSignals(page) {
     }
     const controls = Array.from(document.querySelectorAll(controlSelector));
     let continuationCandidates = 0;
+    let formContinuationCandidates = 0;
+    const continuationLabelSamples = [];
     if (!blockedPageText) {
       for (const control of controls) {
+        const inCaptchaForm = captchaForms.some((form) => typeof form.contains === 'function' && form.contains(control));
+        if (captchaForms.length > 0 && !inCaptchaForm) continue;
         const labels = [
           control.textContent,
           control.value,
           control.getAttribute && control.getAttribute('aria-label'),
           control.getAttribute && control.getAttribute('title'),
         ];
+        const normalizedLabels = labels.map(normalize).filter(Boolean);
         if (labels.some(isContinuation)) {
           control.setAttribute(marker, 'true');
           continuationCandidates++;
+          if (inCaptchaForm) formContinuationCandidates++;
+          for (const label of normalizedLabels) {
+            if (isContinuation(label) && !continuationLabelSamples.includes(label) && continuationLabelSamples.length < 5) {
+              continuationLabelSamples.push(label);
+            }
+          }
         }
       }
     }
-    return { titleReady, captchaText, captchaChallengeCount, continuationCandidates };
+    return { titleReady, captchaText, captchaChallengeCount, continuationCandidates, formContinuationCandidates, continuationLabelSamples };
   });
 }
 
@@ -724,10 +736,13 @@ async function hasAmazonInterstitial(page) {
     return true;
   }
   const captchaForm = captchaFormCount > 0;
-  if (captchaForm) return true;
   const signals = await collectAmazonPageSignals(page).catch(() => null);
   if (!signals) return true;
-  return Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
+  const captchaChallenge = Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
+  const benignContinuation = captchaForm
+    ? Number(signals.formContinuationCandidates || 0) > 0
+    : Number(signals.continuationCandidates || 0) > 0;
+  return captchaChallenge || (captchaForm && !benignContinuation);
 }
 
 async function markNormalizedAmazonContinuationCandidate(page) {
@@ -766,9 +781,12 @@ async function amazonCaptureDiagnostics(page) {
     diagnosticsAvailable = false;
     signalsAvailable = false;
     if (!diagnosticsError) diagnosticsError = 'evaluate_failed';
-    signals = { titleReady: false, captchaText: false, captchaChallengeCount: 0, continuationCandidates: 0 };
+    signals = { titleReady: false, captchaText: false, captchaChallengeCount: 0, continuationCandidates: 0, formContinuationCandidates: 0, continuationLabelSamples: [] };
   }
   const captcha = captchaFormCount > 0 || Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
+  const formatLabels = (labels) => Array.isArray(labels) && labels.length > 0
+    ? labels.slice(0, 5).map((label) => String(label).replace(/[^a-z0-9 ._-]/g, '').slice(0, 80)).join('|')
+    : '';
   return [
     'diagnostics_available=' + diagnosticsAvailable,
     diagnosticsError ? 'diagnostics_error=' + diagnosticsError : '',
@@ -777,7 +795,13 @@ async function amazonCaptureDiagnostics(page) {
     diagnosticsAvailable ? 'captcha_form_count=' + captchaFormCount : '',
     diagnosticsAvailable ? 'captcha_challenge_count=' + Number(signals.captchaChallengeCount || 0) : '',
     diagnosticsAvailable ? 'continuation_candidates=' + Number(signals.continuationCandidates || 0) : '',
+    diagnosticsAvailable ? 'form_continuation_candidates=' + Number(signals.formContinuationCandidates || 0) : '',
+    diagnosticsAvailable && formatLabels(signals.continuationLabelSamples) ? 'continuation_labels=' + formatLabels(signals.continuationLabelSamples) : '',
   ].filter(Boolean).join(' ');
+}
+
+async function amazonManualReviewError(page) {
+  return new Error('amazon interstitial requires manual review; ' + await amazonCaptureDiagnostics(page));
 }
 
 async function clickFirstWorkingContinuation(locator, count, deadline) {
@@ -873,11 +897,11 @@ async function main() {
   try {
     await gotoWithTransientRetry(page, url, deadline);
     if (await hasAmazonInterstitial(page)) {
-      throw new Error('amazon interstitial requires manual review');
+      throw await amazonManualReviewError(page);
     }
     await handleAmazonContinuationGate(page, deadline);
     if (await hasAmazonInterstitial(page)) {
-      throw new Error('amazon interstitial requires manual review');
+      throw await amazonManualReviewError(page);
     }
     const titleWait = Math.min(remainingTimeout(deadline), 15000);
     if (titleWait > 0) {
@@ -909,7 +933,7 @@ async function main() {
       }, { timeout: optionalWait }).catch(() => {});
     }
     if (await hasAmazonInterstitial(page)) {
-      throw new Error('amazon interstitial requires manual review');
+      throw await amazonManualReviewError(page);
     }
     if (!await requireProductTitleReady(page)) {
       throw new Error('amazon product page did not expose product title; ' + await amazonCaptureDiagnostics(page));
