@@ -937,12 +937,15 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 		"net::ERR_TIMED_OUT",
 		"for (let attempt = 0; attempt < 3 && remainingTimeout(deadline) > 0; attempt++)",
 		"if (budget <= 0) break;",
-		"await page.goto(url, { waitUntil: 'domcontentloaded', timeout });",
+		"await page.goto(url, { waitUntil: 'commit', timeout });",
 		"String(err)",
 	} {
 		if !strings.Contains(playwrightCaptureScript, required) {
 			t.Fatalf("playwright script must retry transient navigation failure path %q", required)
 		}
+	}
+	if strings.Contains(playwrightCaptureScript, "waitUntil: 'domcontentloaded'") {
+		t.Fatalf("playwright script should not make Amazon DOMContentLoaded the primary navigation gate")
 	}
 	retryIndex := strings.Index(playwrightCaptureScript, "await gotoWithTransientRetry(page, url, deadline);")
 	captchaIndex := strings.Index(playwrightCaptureScript, "if (await hasAmazonInterstitial(page))")
