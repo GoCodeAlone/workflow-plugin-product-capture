@@ -615,11 +615,17 @@ function isTimeoutError(err) {
 
 async function productTitleReady(page) {
   return await page.evaluate(() => {
+    const hasText = (value) => Boolean(value && String(value).trim());
     const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
-    return titleNodes.some((node) => {
-      if (node.textContent && node.textContent.trim()) return true;
-      return Boolean(node.value && node.value.trim());
-    });
+    if (titleNodes.some((node) => hasText(node.textContent) || hasText(node.value))) return true;
+    for (const selector of ['meta[property="og:title"]', 'meta[name="title"]']) {
+      const node = document.querySelector(selector);
+      if (node && hasText(node.getAttribute('content'))) return true;
+    }
+    const documentTitle = document.title || (document.querySelector('title') && document.querySelector('title').textContent);
+    if (!hasText(documentTitle)) return false;
+    if (/^\s*Amazon\.com\s*$/i.test(documentTitle) || /robot check/i.test(documentTitle)) return false;
+    return true;
   });
 }
 
@@ -635,11 +641,17 @@ async function waitForProductTitle(page, deadline) {
   const timeout = remainingTimeout(deadline);
   if (timeout <= 0) return await productTitleReady(page);
   return await page.waitForFunction(() => {
+    const hasText = (value) => Boolean(value && String(value).trim());
     const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
-    return titleNodes.some((node) => {
-      if (node.textContent && node.textContent.trim()) return true;
-      return Boolean(node.value && node.value.trim());
-    });
+    if (titleNodes.some((node) => hasText(node.textContent) || hasText(node.value))) return true;
+    for (const selector of ['meta[property="og:title"]', 'meta[name="title"]']) {
+      const node = document.querySelector(selector);
+      if (node && hasText(node.getAttribute('content'))) return true;
+    }
+    const documentTitle = document.title || (document.querySelector('title') && document.querySelector('title').textContent);
+    if (!hasText(documentTitle)) return false;
+    if (/^\s*Amazon\.com\s*$/i.test(documentTitle) || /robot check/i.test(documentTitle)) return false;
+    return true;
   }, { timeout }).then(() => true).catch((err) => {
     if (!isTimeoutError(err)) throw err;
     return productTitleReady(page);

@@ -804,6 +804,58 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptAcceptsMetadataProductTitleEvidence(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const metaNodes = [{ getAttribute: (name) => name === 'content' ? 'Echo Dot (5th Gen)' : '' }];
+  global.document = {
+    querySelectorAll: (selector) => selector === '#productTitle' ? [] : [],
+    querySelector: (selector) => selector === 'meta[property="og:title"]' ? metaNodes[0] : null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector !== 'form[action*="/errors/validateCaptcha"]') throw new Error('unexpected selector ' + selector);
+        return { count: async () => 0 };
+      },
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B08N5WRWNW"><meta property="og:title" content="Echo Dot (5th Gen)"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed with metadata title evidence: %v\nstderr=%s", err, stderr.String())
+	}
+	snap, err := snapshot.ExtractAmazon(stdout.String(), snapshot.ExtractOptions{URL: "https://www.amazon.com/dp/B08N5WRWNW"})
+	if err != nil {
+		t.Fatalf("captured html should remain extractable: %v", err)
+	}
+	if snap.Title != "Echo Dot (5th Gen)" {
+		t.Fatalf("title: %q", snap.Title)
+	}
+}
+
 func TestPlaywrightScriptPropagatesNonTimeoutTitleWaitErrors(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {

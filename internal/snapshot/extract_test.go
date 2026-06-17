@@ -163,6 +163,31 @@ func TestExtractAmazonFallsBackToHiddenProductTitleValue(t *testing.T) {
 	}
 }
 
+func TestExtractAmazonFallsBackToMetadataProductTitle(t *testing.T) {
+	html := `<!doctype html>
+<html><head>
+  <link rel="canonical" href="https://www.amazon.com/dp/B08N5WRWNW">
+  <meta property="og:title" content="Echo Dot (5th Gen, 2022 release) | Smart speaker">
+  <meta name="title" content="Ignored fallback">
+</head><body>
+  <div id="corePrice_feature_div"><span class="a-offscreen">$49.99</span></div>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg">
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/dp/B08N5WRWNW",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.Title != "Echo Dot (5th Gen, 2022 release) | Smart speaker" {
+		t.Fatalf("title: %q", got.Title)
+	}
+	if got.Confidence != "high" {
+		t.Fatalf("confidence: %q", got.Confidence)
+	}
+}
+
 func TestExtractAmazonFallsBackToImageWrapperPhoto(t *testing.T) {
 	html := `<!doctype html>
 <html><body>
