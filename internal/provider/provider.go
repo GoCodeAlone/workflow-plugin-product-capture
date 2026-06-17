@@ -627,6 +627,28 @@ async function hasAmazonInterstitial(page) {
   return await page.locator('form[action*="/errors/validateCaptcha"]').count().then((count) => count > 0);
 }
 
+async function handleAmazonContinuationGate(page, deadline) {
+  if (await productTitleReady(page).catch(() => false)) return false;
+  if (await hasAmazonInterstitial(page)) return false;
+  const continueButton = page.locator(
+    'button:has-text("Continue Shopping"), input[type="submit"][value="Continue Shopping"], a:has-text("Continue Shopping"), text=/^\\s*continue shopping\\s*$/i'
+  );
+  const count = await continueButton.count().catch(() => 0);
+  if (count <= 0) return false;
+  const clickTimeout = Math.min(5000, remainingTimeout(deadline));
+  if (clickTimeout <= 0) return false;
+  try {
+    await continueButton.first().click({ timeout: clickTimeout });
+  } catch {
+    return false;
+  }
+  const loadTimeout = Math.min(10000, remainingTimeout(deadline));
+  if (loadTimeout > 0) {
+    await page.waitForLoadState('domcontentloaded', { timeout: loadTimeout }).catch(() => {});
+  }
+  return true;
+}
+
 function remainingTimeout(deadline) {
   return Math.max(0, deadline - Date.now());
 }
@@ -689,6 +711,10 @@ async function main() {
   });
   try {
     await gotoWithTransientRetry(page, url, deadline);
+    if (await hasAmazonInterstitial(page)) {
+      throw new Error('amazon interstitial requires manual review');
+    }
+    await handleAmazonContinuationGate(page, deadline);
     if (await hasAmazonInterstitial(page)) {
       throw new Error('amazon interstitial requires manual review');
     }

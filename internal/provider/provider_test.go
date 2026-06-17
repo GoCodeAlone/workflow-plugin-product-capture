@@ -657,10 +657,8 @@ func TestMainRejectsUnsupportedDynamicOperation(t *testing.T) {
 	}
 }
 
-func TestPlaywrightScriptDoesNotAutomateInterstitialOrAdvertiseStealth(t *testing.T) {
+func TestPlaywrightScriptHandlesOnlyBenignAmazonContinuationGates(t *testing.T) {
 	for _, disallowed := range []string{
-		"Continue shopping",
-		"button.click",
 		"stealth",
 		"HeadlessChrome",
 	} {
@@ -687,6 +685,16 @@ func TestPlaywrightScriptDoesNotAutomateInterstitialOrAdvertiseStealth(t *testin
 	}
 	if !strings.Contains(playwrightCaptureScript, "validateCaptcha") || !strings.Contains(playwrightCaptureScript, "manual review") {
 		t.Fatalf("playwright script must fail closed on CAPTCHA/interstitial pages")
+	}
+	for _, required := range []string{
+		"handleAmazonContinuationGate",
+		"Continue Shopping",
+		"continue shopping",
+		"continueButton.first().click",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("playwright script must handle benign Amazon continuation gate; missing %q", required)
+		}
 	}
 }
 
@@ -891,6 +899,181 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptClicksContinueShoppingBeforeTitleWait(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+  global.document = {
+    querySelectorAll: (selector) => selector === '#productTitle' ? titleNodes : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return {
+            count: async () => clicked ? 0 : 1,
+            first: () => ({
+              click: async () => { clicked = true; },
+            }),
+          };
+        }
+        throw new Error('unexpected selector ' + selector);
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after continuation click: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after continuation: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptTreatsContinuationPrecheckErrorAsOptional(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let evaluateCalls = 0;
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: '', textContent: ' Echo Dot ' }] : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return { count: async () => 0, first: () => ({ click: async () => {} }) };
+        }
+        throw new Error('unexpected selector ' + selector);
+      },
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => {
+        evaluateCalls++;
+        if (evaluateCalls === 1) throw new Error('Execution context was destroyed');
+        return withDocument(fn);
+      },
+      content: async () => '<html><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script should treat continuation precheck errors as optional: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not continue to title wait: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptTreatsContinuationClickTimeoutAsOptional(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: '', textContent: ' Echo Dot ' }] : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return {
+            count: async () => 1,
+            first: () => ({
+              click: async () => { throw new TimeoutError('Timeout 5000ms exceeded'); },
+            }),
+          };
+        }
+        throw new Error('unexpected selector ' + selector);
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script should treat continuation click timeouts as optional: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not continue to title wait: %s", stdout.String())
+	}
+}
+
 func runPlaywrightScriptWithFake(t *testing.T, fakePlaywright string) (bytes.Buffer, bytes.Buffer, error) {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
@@ -948,7 +1131,13 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 		t.Fatalf("playwright script should not make Amazon DOMContentLoaded the primary navigation gate")
 	}
 	retryIndex := strings.Index(playwrightCaptureScript, "await gotoWithTransientRetry(page, url, deadline);")
-	captchaIndex := strings.Index(playwrightCaptureScript, "if (await hasAmazonInterstitial(page))")
+	captchaIndex := -1
+	if retryIndex >= 0 {
+		afterRetry := playwrightCaptureScript[retryIndex:]
+		if relative := strings.Index(afterRetry, "if (await hasAmazonInterstitial(page))"); relative >= 0 {
+			captchaIndex = retryIndex + relative
+		}
+	}
 	if retryIndex < 0 || captchaIndex < 0 || captchaIndex < retryIndex {
 		t.Fatal("playwright script must check CAPTCHA/interstitials after retryable navigation only")
 	}
