@@ -623,6 +623,80 @@ function isTimeoutError(err) {
 
 async function productTitleReady(page) {
   return await page.evaluate(() => {
+    const hasText = (value) => Boolean(value && String(value).trim());
+    const text = (selector) => {
+      const node = document.querySelector(selector);
+      return node && node.textContent && node.textContent.trim();
+    };
+    const attr = (selector, name) => {
+      const node = document.querySelector(selector);
+      return node && node.getAttribute(name);
+    };
+    const asinFromURL = (value) => {
+      if (!String(value || '').trim()) return '';
+      try {
+        const base = typeof location !== 'undefined' ? location.href : 'https://www.amazon.com/';
+        const parsed = new URL(String(value || ''), base);
+        const parts = parsed.pathname.split('/');
+        for (let index = 0; index < parts.length; index++) {
+          if (parts[index] === 'dp' && parts[index + 1]) return normalizedASIN(parts[index + 1]);
+          if (parts[index] === 'gp' && parts[index + 1] === 'product' && parts[index + 2]) return normalizedASIN(parts[index + 2]);
+          if (parts[index] === 'gp' && parts[index + 1] === 'aw' && parts[index + 2] === 'd' && parts[index + 3]) return normalizedASIN(parts[index + 3]);
+        }
+      } catch {}
+      return '';
+    };
+    const normalizedASIN = (value) => {
+      const normalized = String(value || '').trim().toUpperCase();
+      return /^[A-Z0-9]{10}$/.test(normalized) ? normalized : '';
+    };
+    const hasMetadataProductEvidence = () => {
+      const canonical = attr('link[rel="canonical"]', 'href') || '';
+      const requestedURL = typeof globalThis !== 'undefined' ? globalThis.__productCaptureRequestedURL : '';
+      const canonicalASIN = asinFromURL(canonical);
+      const requestedASIN = asinFromURL(requestedURL);
+      if (requestedASIN && canonicalASIN && requestedASIN !== canonicalASIN) return false;
+      if (!requestedASIN && !canonicalASIN) return false;
+      return Boolean(
+        attr('#landingImage', 'src') ||
+        attr('#landingImage', 'data-a-dynamic-image') ||
+        attr('#imgTagWrapperId img', 'src') ||
+        attr('#imgTagWrapperId img', 'data-old-hires') ||
+        attr('#main-image-container img', 'src') ||
+        attr('#main-image-container img', 'data-old-hires') ||
+        text('#corePrice_feature_div .a-offscreen') ||
+        text('#apex_desktop .a-offscreen') ||
+        text('.apexPriceToPay .a-offscreen') ||
+        text('.priceToPay .a-offscreen') ||
+        text('#availability') ||
+        text('#outOfStock')
+      );
+    };
+    const usableMetadataTitle = (value) => {
+      const title = String(value || '').replace(/\s+/g, ' ').trim();
+      if (!title) return false;
+      const lower = title.toLowerCase();
+      return ![
+        'amazon.com. spend less. smile more.',
+        'robot check',
+        'captcha',
+        'sign in',
+        'unusual activity',
+        'security challenge',
+      ].some((blocked) => lower.includes(blocked));
+    };
+    const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
+    if (titleNodes.some((node) => hasText(node.textContent) || hasText(node.value))) return true;
+    for (const selector of ['meta[property="og:title"]', 'meta[name="title"]']) {
+      const node = document.querySelector(selector);
+      if (node && usableMetadataTitle(node.getAttribute('content')) && hasMetadataProductEvidence()) return true;
+    }
+    return false;
+  });
+}
+
+async function productDomTitleReady(page) {
+  return await page.evaluate(() => {
     const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
     return titleNodes.some((node) => {
       if (node.textContent && node.textContent.trim()) return true;
@@ -633,6 +707,10 @@ async function productTitleReady(page) {
 
 async function safeProductTitleReady(page) {
   return await productTitleReady(page).catch(() => false);
+}
+
+async function safeProductDomTitleReady(page) {
+  return await productDomTitleReady(page).catch(() => false);
 }
 
 function errorMessage(err) {
@@ -678,13 +756,81 @@ async function collectAmazonPageSignals(page) {
       if (blockedLabelTerms.some((term) => normalized.includes(term))) return false;
       return continuationLabels.includes(normalized);
     };
+    const hasText = (value) => Boolean(value && String(value).trim());
+    const text = (selector) => {
+      const node = document.querySelector(selector);
+      return node && node.textContent && node.textContent.trim();
+    };
+    const attr = (selector, name) => {
+      const node = document.querySelector(selector);
+      return node && node.getAttribute(name);
+    };
+    const asinFromURL = (value) => {
+      if (!String(value || '').trim()) return '';
+      try {
+        const base = typeof location !== 'undefined' ? location.href : 'https://www.amazon.com/';
+        const parsed = new URL(String(value || ''), base);
+        const parts = parsed.pathname.split('/');
+        for (let index = 0; index < parts.length; index++) {
+          if (parts[index] === 'dp' && parts[index + 1]) return normalizedASIN(parts[index + 1]);
+          if (parts[index] === 'gp' && parts[index + 1] === 'product' && parts[index + 2]) return normalizedASIN(parts[index + 2]);
+          if (parts[index] === 'gp' && parts[index + 1] === 'aw' && parts[index + 2] === 'd' && parts[index + 3]) return normalizedASIN(parts[index + 3]);
+        }
+      } catch {}
+      return '';
+    };
+    const normalizedASIN = (value) => {
+      const normalized = String(value || '').trim().toUpperCase();
+      return /^[A-Z0-9]{10}$/.test(normalized) ? normalized : '';
+    };
+    const hasMetadataProductEvidence = () => {
+      const canonical = attr('link[rel="canonical"]', 'href') || '';
+      const requestedURL = typeof globalThis !== 'undefined' ? globalThis.__productCaptureRequestedURL : '';
+      const canonicalASIN = asinFromURL(canonical);
+      const requestedASIN = asinFromURL(requestedURL);
+      if (requestedASIN && canonicalASIN && requestedASIN !== canonicalASIN) return false;
+      if (!requestedASIN && !canonicalASIN) return false;
+      return Boolean(
+        attr('#landingImage', 'src') ||
+        attr('#landingImage', 'data-a-dynamic-image') ||
+        attr('#imgTagWrapperId img', 'src') ||
+        attr('#imgTagWrapperId img', 'data-old-hires') ||
+        attr('#main-image-container img', 'src') ||
+        attr('#main-image-container img', 'data-old-hires') ||
+        text('#corePrice_feature_div .a-offscreen') ||
+        text('#apex_desktop .a-offscreen') ||
+        text('.apexPriceToPay .a-offscreen') ||
+        text('.priceToPay .a-offscreen') ||
+        text('#availability') ||
+        text('#outOfStock')
+      );
+    };
+    const usableMetadataTitle = (value) => {
+      const title = String(value || '').replace(/\s+/g, ' ').trim();
+      if (!title) return false;
+      const lower = title.toLowerCase();
+      return ![
+        'amazon.com. spend less. smile more.',
+        'robot check',
+        'captcha',
+        'sign in',
+        'unusual activity',
+        'security challenge',
+      ].some((blocked) => lower.includes(blocked));
+    };
     const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
-    const titleReady = titleNodes.some((node) => {
-      if (node.textContent && node.textContent.trim()) return true;
-      return Boolean(node.value && node.value.trim());
-    });
+    const domTitleReady = titleNodes.some((node) => hasText(node.textContent) || hasText(node.value));
+    let metadataTitleReady = false;
+    for (const selector of ['meta[property="og:title"]', 'meta[name="title"]']) {
+      const node = document.querySelector(selector);
+      if (node && usableMetadataTitle(node.getAttribute('content')) && hasMetadataProductEvidence()) {
+        metadataTitleReady = true;
+        break;
+      }
+    }
+    const titleReady = domTitleReady || metadataTitleReady;
     const captchaForms = Array.from(document.querySelectorAll('form[action*="/errors/validateCaptcha"]'));
-    const bodyText = ((document.body && document.body.textContent) || '').replace(/\s+/g, ' ').toLowerCase();
+    const bodyText = ((document.body && document.body.textContent) || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const captchaChallengeCount = document.querySelectorAll(captchaSelector).length;
     const captchaText = (
       bodyText.includes('enter the characters you see below') ||
@@ -694,6 +840,13 @@ async function collectAmazonPageSignals(page) {
       bodyText.includes('validate captcha')
     );
     const blockedPageText = blockedBodyTerms.some((term) => bodyText.includes(term));
+    const continuationGateText = (
+      bodyText === 'continue shopping' ||
+      bodyText === 'continue browsing' ||
+      bodyText.includes('click the button below to continue shopping') ||
+      bodyText.includes('click below to continue shopping') ||
+      bodyText.includes('continue shopping to view this item')
+    );
     for (const marked of Array.from(document.querySelectorAll('[' + marker + ']'))) {
       if (typeof marked.removeAttribute === 'function') marked.removeAttribute(marker);
     }
@@ -724,7 +877,7 @@ async function collectAmazonPageSignals(page) {
         }
       }
     }
-    return { titleReady, captchaText, captchaChallengeCount, continuationCandidates, formContinuationCandidates, continuationLabelSamples };
+    return { titleReady, metadataTitleReady, continuationGateText, captchaText, captchaChallengeCount, continuationCandidates, formContinuationCandidates, continuationLabelSamples };
   });
 }
 
@@ -739,15 +892,7 @@ async function hasAmazonInterstitial(page) {
   const signals = await collectAmazonPageSignals(page).catch(() => null);
   if (!signals) return true;
   const captchaChallenge = Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
-  const benignContinuation = captchaForm
-    ? Number(signals.formContinuationCandidates || 0) > 0
-    : Number(signals.continuationCandidates || 0) > 0;
-  return captchaChallenge || (captchaForm && !benignContinuation);
-}
-
-async function markNormalizedAmazonContinuationCandidate(page) {
-  const signals = await collectAmazonPageSignals(page).catch(() => null);
-  return Boolean(signals && signals.continuationCandidates > 0);
+  return captchaChallenge || captchaForm;
 }
 
 async function clearAmazonContinuationMarkers(page) {
@@ -781,7 +926,7 @@ async function amazonCaptureDiagnostics(page) {
     diagnosticsAvailable = false;
     signalsAvailable = false;
     if (!diagnosticsError) diagnosticsError = 'evaluate_failed';
-    signals = { titleReady: false, captchaText: false, captchaChallengeCount: 0, continuationCandidates: 0, formContinuationCandidates: 0, continuationLabelSamples: [] };
+    signals = { titleReady: false, metadataTitleReady: false, continuationGateText: false, captchaText: false, captchaChallengeCount: 0, continuationCandidates: 0, formContinuationCandidates: 0, continuationLabelSamples: [] };
   }
   const captcha = captchaFormCount > 0 || Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
   const formatLabels = (labels) => Array.isArray(labels) && labels.length > 0
@@ -791,6 +936,7 @@ async function amazonCaptureDiagnostics(page) {
     'diagnostics_available=' + diagnosticsAvailable,
     diagnosticsError ? 'diagnostics_error=' + diagnosticsError : '',
     signalsAvailable ? 'title_ready=' + Boolean(signals.titleReady) : '',
+    signalsAvailable ? 'metadata_title_ready=' + Boolean(signals.metadataTitleReady) : '',
     diagnosticsAvailable ? 'captcha=' + captcha : '',
     diagnosticsAvailable ? 'captcha_form_count=' + captchaFormCount : '',
     diagnosticsAvailable ? 'captcha_challenge_count=' + Number(signals.captchaChallengeCount || 0) : '',
@@ -818,10 +964,13 @@ async function clickFirstWorkingContinuation(locator, count, deadline) {
 }
 
 async function handleAmazonContinuationGate(page, deadline) {
-  if (await safeProductTitleReady(page)) return false;
+  if (await safeProductDomTitleReady(page)) return false;
+  const signals = await collectAmazonPageSignals(page).catch(() => null);
+  if (!signals) return false;
+  if (signals.titleReady && !signals.continuationGateText) return false;
   if (await hasAmazonInterstitial(page)) return false;
   let clicked = false;
-  if (await markNormalizedAmazonContinuationCandidate(page)) {
+  if (signals.continuationCandidates > 0) {
     const continueButton = page.locator('[data-product-capture-continuation-candidate="true"]');
     const count = await continueButton.count().catch(() => 0);
     if (count > 0) clicked = await clickFirstWorkingContinuation(continueButton, count, deadline);
@@ -842,11 +991,75 @@ async function waitForProductTitle(page, deadline) {
   const timeout = remainingTimeout(deadline);
   if (timeout <= 0) return await safeProductTitleReady(page);
   return await page.waitForFunction(() => {
+    const hasText = (value) => Boolean(value && String(value).trim());
+    const text = (selector) => {
+      const node = document.querySelector(selector);
+      return node && node.textContent && node.textContent.trim();
+    };
+    const attr = (selector, name) => {
+      const node = document.querySelector(selector);
+      return node && node.getAttribute(name);
+    };
+    const asinFromURL = (value) => {
+      if (!String(value || '').trim()) return '';
+      try {
+        const base = typeof location !== 'undefined' ? location.href : 'https://www.amazon.com/';
+        const parsed = new URL(String(value || ''), base);
+        const parts = parsed.pathname.split('/');
+        for (let index = 0; index < parts.length; index++) {
+          if (parts[index] === 'dp' && parts[index + 1]) return normalizedASIN(parts[index + 1]);
+          if (parts[index] === 'gp' && parts[index + 1] === 'product' && parts[index + 2]) return normalizedASIN(parts[index + 2]);
+          if (parts[index] === 'gp' && parts[index + 1] === 'aw' && parts[index + 2] === 'd' && parts[index + 3]) return normalizedASIN(parts[index + 3]);
+        }
+      } catch {}
+      return '';
+    };
+    const normalizedASIN = (value) => {
+      const normalized = String(value || '').trim().toUpperCase();
+      return /^[A-Z0-9]{10}$/.test(normalized) ? normalized : '';
+    };
+    const hasMetadataProductEvidence = () => {
+      const canonical = attr('link[rel="canonical"]', 'href') || '';
+      const requestedURL = typeof globalThis !== 'undefined' ? globalThis.__productCaptureRequestedURL : '';
+      const canonicalASIN = asinFromURL(canonical);
+      const requestedASIN = asinFromURL(requestedURL);
+      if (requestedASIN && canonicalASIN && requestedASIN !== canonicalASIN) return false;
+      if (!requestedASIN && !canonicalASIN) return false;
+      return Boolean(
+        attr('#landingImage', 'src') ||
+        attr('#landingImage', 'data-a-dynamic-image') ||
+        attr('#imgTagWrapperId img', 'src') ||
+        attr('#imgTagWrapperId img', 'data-old-hires') ||
+        attr('#main-image-container img', 'src') ||
+        attr('#main-image-container img', 'data-old-hires') ||
+        text('#corePrice_feature_div .a-offscreen') ||
+        text('#apex_desktop .a-offscreen') ||
+        text('.apexPriceToPay .a-offscreen') ||
+        text('.priceToPay .a-offscreen') ||
+        text('#availability') ||
+        text('#outOfStock')
+      );
+    };
+    const usableMetadataTitle = (value) => {
+      const title = String(value || '').replace(/\s+/g, ' ').trim();
+      if (!title) return false;
+      const lower = title.toLowerCase();
+      return ![
+        'amazon.com. spend less. smile more.',
+        'robot check',
+        'captcha',
+        'sign in',
+        'unusual activity',
+        'security challenge',
+      ].some((blocked) => lower.includes(blocked));
+    };
     const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
-    return titleNodes.some((node) => {
-      if (node.textContent && node.textContent.trim()) return true;
-      return Boolean(node.value && node.value.trim());
-    });
+    if (titleNodes.some((node) => hasText(node.textContent) || hasText(node.value))) return true;
+    for (const selector of ['meta[property="og:title"]', 'meta[name="title"]']) {
+      const node = document.querySelector(selector);
+      if (node && usableMetadataTitle(node.getAttribute('content')) && hasMetadataProductEvidence()) return true;
+    }
+    return false;
   }, { timeout }).then(() => true).catch((err) => {
     if (!isTimeoutError(err)) throw err;
     return safeProductTitleReady(page);
@@ -891,9 +1104,10 @@ async function main() {
   const page = await browser.newPage({
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
   });
-  await page.addInitScript(() => {
+  await page.addInitScript((requestedURL) => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
+    globalThis.__productCaptureRequestedURL = requestedURL;
+  }, url);
   try {
     await gotoWithTransientRetry(page, url, deadline);
     if (await hasAmazonInterstitial(page)) {
@@ -921,6 +1135,10 @@ async function main() {
         return Boolean(
           attr('#landingImage', 'src') ||
           attr('#landingImage', 'data-a-dynamic-image') ||
+          attr('#imgTagWrapperId img', 'src') ||
+          attr('#imgTagWrapperId img', 'data-old-hires') ||
+          attr('#main-image-container img', 'src') ||
+          attr('#main-image-container img', 'data-old-hires') ||
           text('#corePrice_feature_div .a-offscreen') ||
           text('#apex_desktop .a-offscreen') ||
           text('.apexPriceToPay .a-offscreen') ||

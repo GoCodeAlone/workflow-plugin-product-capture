@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -766,10 +767,240 @@ func TestPlaywrightScriptUsesExtractorCompatibleProductTitleEvidence(t *testing.
 	}
 }
 
+func TestPlaywrightScriptRejectsGenericGPPathMetadataEvidence(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
+  const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/gp/anything' : '' };
+  const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/gp/anything') {
+    throw new Error('requested URL was not injected');
+  }
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === 'meta[property="og:title"]') return metaNode;
+      if (selector === 'link[rel="canonical"]') return canonicalNode;
+      if (selector === '#landingImage') return imageNode;
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/gp/anything',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (withDocument(fn)) throw new Error('generic /gp metadata was accepted by title wait predicate');
+        throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/gp/anything"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/gp/anything")
+	if err == nil {
+		t.Fatalf("expected generic /gp metadata to fail closed")
+	}
+	if !strings.Contains(stderr.String(), "amazon product page did not expose product title") {
+		t.Fatalf("stderr missing product title failure: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptRejectsMalformedASINMetadataEvidence(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
+  const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/dp/not-a-real-product' : '' };
+  const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/dp/not-a-real-product') {
+    throw new Error('requested URL was not injected');
+  }
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === 'meta[property="og:title"]') return metaNode;
+      if (selector === 'link[rel="canonical"]') return canonicalNode;
+      if (selector === '#landingImage') return imageNode;
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/dp/not-a-real-product',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (withDocument(fn)) throw new Error('malformed ASIN metadata was accepted by title wait predicate');
+        throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/not-a-real-product"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/not-a-real-product")
+	if err == nil {
+		t.Fatalf("expected malformed ASIN metadata to fail closed")
+	}
+	if !strings.Contains(stderr.String(), "amazon product page did not expose product title") {
+		t.Fatalf("stderr missing product title failure: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptAcceptsGPProductMetadataEvidence(t *testing.T) {
+	runPlaywrightMetadataEvidenceURLCase(t,
+		"https://www.amazon.com/gp/product/B09B8V1LZ3",
+		"https://www.amazon.com/gp/product/B09B8V1LZ3",
+	)
+}
+
+func TestPlaywrightScriptAcceptsGPAWDMetadataEvidence(t *testing.T) {
+	runPlaywrightMetadataEvidenceURLCase(t,
+		"https://www.amazon.com/gp/aw/d/B09B8V1LZ3",
+		"https://www.amazon.com/gp/aw/d/B09B8V1LZ3",
+	)
+}
+
+func runPlaywrightMetadataEvidenceURLCase(t *testing.T, targetURL, canonicalURL string) {
+	t.Helper()
+	fakePlaywright := fmt.Sprintf(`
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
+  const canonicalNode = { getAttribute: (name) => name === 'href' ? %q : '' };
+  const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+  if (global.__productCaptureRequestedURL !== %q) {
+    throw new Error('requested URL was not injected');
+  }
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === 'meta[property="og:title"]') return metaNode;
+      if (selector === 'link[rel="canonical"]') return canonicalNode;
+      if (selector === '#landingImage') return imageNode;
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => %q,
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="%s"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`, canonicalURL, targetURL, targetURL, canonicalURL)
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, targetURL)
+	if err != nil {
+		t.Fatalf("capture script failed with metadata evidence for %s: %v\nstderr=%s", targetURL, err, stderr.String())
+	}
+	snap, err := snapshot.ExtractAmazon(stdout.String(), snapshot.ExtractOptions{URL: targetURL})
+	if err != nil {
+		t.Fatalf("captured html should remain extractable for %s: %v", targetURL, err)
+	}
+	if snap.ExternalID != "B09B8V1LZ3" {
+		t.Fatalf("asin: %q", snap.ExternalID)
+	}
+}
+
 func TestPlaywrightScriptWaitsForCaptureRelevantNodes(t *testing.T) {
 	for _, required := range []string{
 		"optionalWait",
 		"#landingImage",
+		"#imgTagWrapperId img",
+		"#main-image-container img",
 		"#corePrice_feature_div .a-offscreen",
 		".priceToPay .a-offscreen",
 		"#deliveryBlockMessage",
@@ -779,6 +1010,64 @@ func TestPlaywrightScriptWaitsForCaptureRelevantNodes(t *testing.T) {
 		if !strings.Contains(playwrightCaptureScript, required) {
 			t.Fatalf("playwright script missing optional capture wait for %q", required)
 		}
+	}
+}
+
+func TestPlaywrightScriptOptionalWaitAcceptsMainImageContainer(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: '', textContent: ' Echo Dot ' }] : [],
+    querySelector: (selector) => {
+      if (selector === '#main-image-container img') return { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/dp/B09B8V1LZ3',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (!withDocument(fn)) throw new Error('optional/title predicate did not accept main image container');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span><div id="main-image-container"><img src="https://m.media-amazon.com/images/I/echo.jpg"></div></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script failed with main image optional wait evidence: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `main-image-container`) {
+		t.Fatalf("capture script did not emit main image container html: %s", stdout.String())
 	}
 }
 
@@ -827,7 +1116,7 @@ exports.chromium = {
 };
 exports.errors = { TimeoutError };
 `
-	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/B08H75RTZ8")
 	if err != nil {
 		t.Fatalf("capture script failed after title wait timeout: %v\nstderr=%s", err, stderr.String())
 	}
@@ -840,6 +1129,546 @@ exports.errors = { TimeoutError };
 	}
 	if snap.Title != "Xbox Series X" {
 		t.Fatalf("title: %q", snap.Title)
+	}
+}
+
+func TestPlaywrightScriptAcceptsMetadataProductTitleEvidence(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
+  const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3' : '' };
+  const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
+    throw new Error('requested URL was not injected');
+  }
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === 'meta[property="og:title"]') return metaNode;
+      if (selector === 'link[rel="canonical"]') return canonicalNode;
+      if (selector === '#landingImage') return imageNode;
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script failed with metadata title evidence: %v\nstderr=%s", err, stderr.String())
+	}
+	snap, err := snapshot.ExtractAmazon(stdout.String(), snapshot.ExtractOptions{URL: "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"})
+	if err != nil {
+		t.Fatalf("captured html should remain extractable: %v", err)
+	}
+	if snap.Title != "Amazon Echo Dot (newest model) - Vibrant sounding speaker" {
+		t.Fatalf("title: %q", snap.Title)
+	}
+}
+
+func TestPlaywrightScriptAcceptsMainImageContainerMetadataEvidence(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
+  const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3' : '' };
+  const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
+    throw new Error('requested URL was not injected');
+  }
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === 'meta[property="og:title"]') return metaNode;
+      if (selector === 'link[rel="canonical"]') return canonicalNode;
+      if (selector === '#main-image-container img') return imageNode;
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><div id="main-image-container"><img src="https://m.media-amazon.com/images/I/echo.jpg"></div></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script failed with main image container metadata evidence: %v\nstderr=%s", err, stderr.String())
+	}
+	snap, err := snapshot.ExtractAmazon(stdout.String(), snapshot.ExtractOptions{URL: "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"})
+	if err != nil {
+		t.Fatalf("captured html should remain extractable: %v", err)
+	}
+	if snap.Title != "Amazon Echo Dot (newest model) - Vibrant sounding speaker" {
+		t.Fatalf("title: %q", snap.Title)
+	}
+}
+
+func TestPlaywrightScriptAcceptsPriceContainerMetadataEvidence(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
+  const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/dp/B09B8V1LZ3' : '' };
+  const priceNode = { textContent: '$34.99', getAttribute: () => '' };
+  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/dp/B09B8V1LZ3') {
+    throw new Error('requested URL was not injected');
+  }
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === 'meta[property="og:title"]') return metaNode;
+      if (selector === 'link[rel="canonical"]') return canonicalNode;
+      if (selector === '.priceToPay .a-offscreen') return priceNode;
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/dp/B09B8V1LZ3',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><div class="priceToPay"><span class="a-offscreen">$34.99</span></div></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script failed with price container metadata evidence: %v\nstderr=%s", err, stderr.String())
+	}
+	snap, err := snapshot.ExtractAmazon(stdout.String(), snapshot.ExtractOptions{URL: "https://www.amazon.com/dp/B09B8V1LZ3"})
+	if err != nil {
+		t.Fatalf("captured html should remain extractable: %v", err)
+	}
+	if snap.Title != "Amazon Echo Dot (newest model) - Vibrant sounding speaker" {
+		t.Fatalf("title: %q", snap.Title)
+	}
+}
+
+func TestPlaywrightScriptClicksContinuationEvenWhenMetadataTitleExists(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+const attrs = {};
+const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
+const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3' : '' };
+const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+const continuationNode = {
+  value: 'Continue Shopping',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
+    throw new Error('requested URL was not injected');
+  }
+  global.document = {
+    body: { textContent: clicked ? 'Echo Dot' : '\n  Continue Shopping  \n' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleNodes;
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return clicked ? [] : [continuationNode];
+      if (selector === 'form[action*="/errors/validateCaptcha"]') return [];
+      if (selector === 'img[src*="captcha" i],img[alt*="captcha" i],input[name*="captcha" i],input[id*="captcha" i],iframe[src*="captcha" i],iframe[src*="challenge" i]') return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (!clicked && selector === 'meta[property="og:title"]') return metaNode;
+      if (!clicked && selector === 'link[rel="canonical"]') return canonicalNode;
+      if (!clicked && selector === '#landingImage') return imageNode;
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs['data-product-capture-continuation-candidate'] ? 1 : 0,
+            first: () => ({ click: async () => { clicked = true; } }),
+            nth: () => ({ click: async () => { clicked = true; } }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => clicked
+        ? '<html><head><link rel="canonical" href="https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>'
+        : '<html><head><link rel="canonical" href="https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><input value="Continue Shopping"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script failed after metadata-bearing continuation click: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after metadata-bearing continuation: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptRejectsGenericMetadataProductTitleEvidence(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon.com. Spend less. Smile more.' : '' };
+  const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/dp/B09B8V1LZ3' : '' };
+  const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/dp/B09B8V1LZ3') {
+    throw new Error('requested URL was not injected');
+  }
+  global.document = {
+    body: { textContent: 'shopping page without product details' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === 'meta[property="og:title"]') return metaNode;
+      if (selector === 'link[rel="canonical"]') return canonicalNode;
+      if (selector === '#landingImage') return imageNode;
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/dp/B09B8V1LZ3',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (withDocument(fn)) throw new Error('generic metadata was accepted by title wait predicate');
+        throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><meta property="og:title" content="Amazon.com. Spend less. Smile more."></head><body>shopping page without product details</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3")
+	if err == nil {
+		t.Fatalf("expected generic metadata title to fail closed")
+	}
+	if !strings.Contains(stderr.String(), "amazon product page did not expose product title") {
+		t.Fatalf("stderr missing product title failure: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptRejectsMetadataTitleWhenCanonicalASINDiffers(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
+  const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/dp/B08WRONG11' : '' };
+  const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
+    throw new Error('requested URL was not injected');
+  }
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === 'meta[property="og:title"]') return metaNode;
+      if (selector === 'link[rel="canonical"]') return canonicalNode;
+      if (selector === '#landingImage') return imageNode;
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (withDocument(fn)) throw new Error('mismatched canonical metadata was accepted by title wait predicate');
+        throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B08WRONG11"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3")
+	if err == nil {
+		t.Fatalf("expected mismatched canonical ASIN metadata to fail closed")
+	}
+	if !strings.Contains(stderr.String(), "amazon product page did not expose product title") {
+		t.Fatalf("stderr missing product title failure: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptDoesNotClickContinuationOnMetadataReadyProductPage(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+const attrs = {};
+const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
+const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3' : '' };
+const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+const continuationNode = {
+  value: 'Continue Shopping',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
+function withDocument(fn) {
+  const previousDocument = global.document;
+  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
+    throw new Error('requested URL was not injected');
+  }
+  global.document = {
+    body: { textContent: 'product page with Continue Shopping accessory link' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      if (selector === 'form[action*="/errors/validateCaptcha"]') return [];
+      if (selector === 'img[src*="captcha" i],img[alt*="captcha" i],input[name*="captcha" i],input[id*="captcha" i],iframe[src*="captcha" i],iframe[src*="challenge" i]') return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === 'meta[property="og:title"]') return metaNode;
+      if (selector === 'link[rel="canonical"]') return canonicalNode;
+      if (selector === '#landingImage') return imageNode;
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs['data-product-capture-continuation-candidate'] ? 1 : 0,
+            first: () => ({ click: async () => { throw new Error('clicked unrelated continuation'); } }),
+            nth: () => ({ click: async () => { throw new Error('clicked unrelated continuation'); } }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn) => {
+        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><input value="Continue Shopping"><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script failed on metadata-ready product page: %v\nstderr=%s", err, stderr.String())
+	}
+	if strings.Contains(stdout.String(), `data-product-capture-continuation-candidate`) {
+		t.Fatalf("capture script marked unrelated continuation on product page: html=%s", stdout.String())
 	}
 }
 
@@ -1020,7 +1849,7 @@ exports.errors = { TimeoutError };
 	}
 }
 
-func TestPlaywrightScriptClicksBenignValidateCaptchaContinueShoppingForm(t *testing.T) {
+func TestPlaywrightScriptDoesNotClickValidateCaptchaContinuationForm(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {
   constructor(message) {
@@ -1072,10 +1901,10 @@ exports.chromium = {
           return {
             count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' && !clicked ? 1 : 0,
             first: () => ({
-              click: async () => { clicked = true; },
+              click: async () => { throw new Error('clicked validateCaptcha continuation'); },
             }),
             nth: () => ({
-              click: async () => { clicked = true; },
+              click: async () => { throw new Error('clicked validateCaptcha continuation'); },
             }),
           };
         }
@@ -1091,12 +1920,12 @@ exports.chromium = {
 };
 exports.errors = { TimeoutError };
 `
-	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
-	if err != nil {
-		t.Fatalf("capture script failed after benign validateCaptcha continuation form click: %v\nstderr=%s", err, stderr.String())
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected validateCaptcha continuation form to fail closed")
 	}
-	if !strings.Contains(stdout.String(), `id="productTitle"`) {
-		t.Fatalf("capture script did not emit product html after validateCaptcha continuation: %s", stdout.String())
+	if strings.Contains(stderr.String(), "clicked validateCaptcha continuation") || !strings.Contains(stderr.String(), "amazon interstitial requires manual review") {
+		t.Fatalf("stderr missing manual review failure or clicked validateCaptcha gate: %s", stderr.String())
 	}
 }
 
@@ -2755,10 +3584,18 @@ process.on('exit', () => {
 }
 
 func runPlaywrightScriptWithFake(t *testing.T, fakePlaywright string) (bytes.Buffer, bytes.Buffer, error) {
-	return runPlaywrightScriptWithFakeTimeout(t, fakePlaywright, "30000")
+	return runPlaywrightScriptWithFakeURLTimeout(t, fakePlaywright, "https://www.amazon.com/dp/B08H75RTZ8", "30000")
+}
+
+func runPlaywrightScriptWithFakeURL(t *testing.T, fakePlaywright, targetURL string) (bytes.Buffer, bytes.Buffer, error) {
+	return runPlaywrightScriptWithFakeURLTimeout(t, fakePlaywright, targetURL, "30000")
 }
 
 func runPlaywrightScriptWithFakeTimeout(t *testing.T, fakePlaywright string, timeout string) (bytes.Buffer, bytes.Buffer, error) {
+	return runPlaywrightScriptWithFakeURLTimeout(t, fakePlaywright, "https://www.amazon.com/dp/B08H75RTZ8", timeout)
+}
+
+func runPlaywrightScriptWithFakeURLTimeout(t *testing.T, fakePlaywright string, targetURL string, timeout string) (bytes.Buffer, bytes.Buffer, error) {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skipf("node not installed; CI provisions Node for generated Playwright script regressions: %v", err)
@@ -2775,7 +3612,7 @@ func runPlaywrightScriptWithFakeTimeout(t *testing.T, fakePlaywright string, tim
 	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(fakePlaywright), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("node", script, "https://www.amazon.com/dp/B08H75RTZ8", timeout)
+	cmd := exec.Command("node", script, targetURL, timeout)
 	cmd.Env = withoutNodeOverrides(os.Environ())
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
