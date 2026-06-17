@@ -653,7 +653,7 @@ async function gotoWithTransientRetry(page, url, deadline) {
     if (budget <= 0) break;
     const timeout = Math.min(budget, attempt === 0 ? Math.max(15000, Math.floor(budget * 0.65)) : budget);
     try {
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout });
+      await page.goto(url, { waitUntil: 'commit', timeout });
       return;
     } catch (err) {
       lastErr = err;
