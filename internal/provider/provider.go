@@ -628,7 +628,7 @@ async function hasAmazonInterstitial(page) {
 }
 
 async function handleAmazonContinuationGate(page, deadline) {
-  if (await productTitleReady(page)) return false;
+  if (await productTitleReady(page).catch(() => false)) return false;
   if (await hasAmazonInterstitial(page)) return false;
   const continueButton = page.locator(
     'button:has-text("Continue Shopping"), input[type="submit"][value="Continue Shopping"], a:has-text("Continue Shopping"), text=/^\\s*continue shopping\\s*$/i'
@@ -637,7 +637,11 @@ async function handleAmazonContinuationGate(page, deadline) {
   if (count <= 0) return false;
   const clickTimeout = Math.min(5000, remainingTimeout(deadline));
   if (clickTimeout <= 0) return false;
-  await continueButton.first().click({ timeout: clickTimeout });
+  try {
+    await continueButton.first().click({ timeout: clickTimeout });
+  } catch {
+    return false;
+  }
   const loadTimeout = Math.min(10000, remainingTimeout(deadline));
   if (loadTimeout > 0) {
     await page.waitForLoadState('domcontentloaded', { timeout: loadTimeout }).catch(() => {});

@@ -959,6 +959,121 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptTreatsContinuationPrecheckErrorAsOptional(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let evaluateCalls = 0;
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: '', textContent: ' Echo Dot ' }] : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return { count: async () => 0, first: () => ({ click: async () => {} }) };
+        }
+        throw new Error('unexpected selector ' + selector);
+      },
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => {
+        evaluateCalls++;
+        if (evaluateCalls === 1) throw new Error('Execution context was destroyed');
+        return withDocument(fn);
+      },
+      content: async () => '<html><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script should treat continuation precheck errors as optional: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not continue to title wait: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptTreatsContinuationClickTimeoutAsOptional(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: '', textContent: ' Echo Dot ' }] : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return {
+            count: async () => 1,
+            first: () => ({
+              click: async () => { throw new TimeoutError('Timeout 5000ms exceeded'); },
+            }),
+          };
+        }
+        throw new Error('unexpected selector ' + selector);
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script should treat continuation click timeouts as optional: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not continue to title wait: %s", stdout.String())
+	}
+}
+
 func runPlaywrightScriptWithFake(t *testing.T, fakePlaywright string) (bytes.Buffer, bytes.Buffer, error) {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
