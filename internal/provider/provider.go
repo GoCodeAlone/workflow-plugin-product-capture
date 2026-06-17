@@ -504,11 +504,17 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if stdout.err != nil {
+			return "", fmt.Errorf("playwright capture failed: %w", stdout.err)
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
 		return "", fmt.Errorf("playwright capture failed: %s", msg)
+	}
+	if stdout.err != nil {
+		return "", fmt.Errorf("playwright capture failed: %w", stdout.err)
 	}
 	return stdout.String(), nil
 }
@@ -555,11 +561,13 @@ func writeSnapshot(path string, snap snapshot.Snapshot) error {
 type limitedBuffer struct {
 	buf bytes.Buffer
 	max int64
+	err error
 }
 
 func (b *limitedBuffer) Write(p []byte) (int, error) {
 	if int64(b.buf.Len()+len(p)) > b.max {
-		return 0, fmt.Errorf("capture output exceeds max_html_bytes %d", b.max)
+		b.err = fmt.Errorf("capture output exceeds max_html_bytes %d", b.max)
+		return 0, b.err
 	}
 	return b.buf.Write(p)
 }
@@ -623,46 +631,178 @@ async function productTitleReady(page) {
   });
 }
 
-async function hasAmazonInterstitial(page) {
-  const captchaFormCount = await page.locator('form[action*="/errors/validateCaptcha"]').count().catch(() => 0);
-  const captchaForm = captchaFormCount > 0;
-  if (captchaForm) return true;
+async function safeProductTitleReady(page) {
+  return await productTitleReady(page).catch(() => false);
+}
+
+function errorMessage(err) {
+  return err && (err.message || err.stack) ? String(err.message || err.stack) : String(err);
+}
+
+async function requireProductTitleReady(page) {
+  try {
+    return await productTitleReady(page);
+  } catch (err) {
+    throw new Error('amazon product title readiness check failed: ' + errorMessage(err));
+  }
+}
+
+async function collectAmazonPageSignals(page) {
   return await page.evaluate(() => {
+    const marker = 'data-product-capture-continuation-candidate';
+    const captchaSelector = 'img[src*="captcha" i],img[alt*="captcha" i],input[name*="captcha" i],input[id*="captcha" i],iframe[src*="captcha" i],iframe[src*="challenge" i]';
+    const controlSelector = 'button,input[type="submit"],input[type="button"],a,[role="button"]';
+    const continuationLabels = [
+      'continue shopping',
+      'continue browsing',
+      'continue to shopping',
+      'continue to amazon',
+      'continue to amazon shopping',
+      'continue to product',
+      'continue to product page',
+      'continue to details',
+    ];
+    const blockedLabelTerms = ['captcha', 'challenge', 'robot', 'characters', 'verify', 'verification'];
+    const blockedBodyTerms = [
+      'unusual activity',
+      'automated access',
+      'sign in to continue',
+      'continue to sign in',
+      'verify it is you',
+      'security challenge',
+    ];
+    const normalize = (value) => String(value || '').replace(/\s+/g, ' ').trim().replace(/[.!]+$/g, '').toLowerCase();
+    const isContinuation = (value) => {
+      const normalized = normalize(value);
+      if (!normalized) return false;
+      if (blockedLabelTerms.some((term) => normalized.includes(term))) return false;
+      return continuationLabels.includes(normalized);
+    };
+    const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
+    const titleReady = titleNodes.some((node) => {
+      if (node.textContent && node.textContent.trim()) return true;
+      return Boolean(node.value && node.value.trim());
+    });
     const bodyText = ((document.body && document.body.textContent) || '').replace(/\s+/g, ' ').toLowerCase();
-    return (
+    const captchaChallengeCount = document.querySelectorAll(captchaSelector).length;
+    const captchaText = (
       bodyText.includes('enter the characters you see below') ||
       bodyText.includes('make sure you are not a robot') ||
       bodyText.includes('not a robot') ||
       bodyText.includes('type the characters you see') ||
       bodyText.includes('validate captcha')
     );
-  }).catch(() => false);
+    const blockedPageText = blockedBodyTerms.some((term) => bodyText.includes(term));
+    for (const marked of Array.from(document.querySelectorAll('[' + marker + ']'))) {
+      if (typeof marked.removeAttribute === 'function') marked.removeAttribute(marker);
+    }
+    const controls = Array.from(document.querySelectorAll(controlSelector));
+    let continuationCandidates = 0;
+    if (!blockedPageText) {
+      for (const control of controls) {
+        const labels = [
+          control.textContent,
+          control.value,
+          control.getAttribute && control.getAttribute('aria-label'),
+          control.getAttribute && control.getAttribute('title'),
+        ];
+        if (labels.some(isContinuation)) {
+          control.setAttribute(marker, 'true');
+          continuationCandidates++;
+        }
+      }
+    }
+    return { titleReady, captchaText, captchaChallengeCount, continuationCandidates };
+  });
+}
+
+async function hasAmazonInterstitial(page) {
+  let captchaFormCount = 0;
+  try {
+    captchaFormCount = await page.locator('form[action*="/errors/validateCaptcha"]').count();
+  } catch {
+    return true;
+  }
+  const captchaForm = captchaFormCount > 0;
+  if (captchaForm) return true;
+  const signals = await collectAmazonPageSignals(page).catch(() => null);
+  if (!signals) return true;
+  return Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
+}
+
+async function markNormalizedAmazonContinuationCandidate(page) {
+  const signals = await collectAmazonPageSignals(page).catch(() => null);
+  return Boolean(signals && signals.continuationCandidates > 0);
+}
+
+async function clearAmazonContinuationMarkers(page) {
+  try {
+    await page.evaluate(() => {
+      const marker = 'data-product-capture-continuation-candidate';
+      for (const marked of Array.from(document.querySelectorAll('[' + marker + ']'))) {
+        if (typeof marked.removeAttribute === 'function') marked.removeAttribute(marker);
+      }
+    });
+  } catch (err) {
+    throw new Error('amazon continuation marker cleanup failed: ' + errorMessage(err));
+  }
+}
+
+async function amazonCaptureDiagnostics(page) {
+  let captchaFormCount = 0;
+  let signals;
+  let diagnosticsAvailable = true;
+  let signalsAvailable = true;
+  let diagnosticsError = '';
+  try {
+    captchaFormCount = await page.locator('form[action*="/errors/validateCaptcha"]').count();
+  } catch {
+    diagnosticsAvailable = false;
+    diagnosticsError = 'captcha_form_count_failed';
+  }
+  try {
+    signals = await collectAmazonPageSignals(page);
+  } catch {
+    diagnosticsAvailable = false;
+    signalsAvailable = false;
+    if (!diagnosticsError) diagnosticsError = 'evaluate_failed';
+    signals = { titleReady: false, captchaText: false, captchaChallengeCount: 0, continuationCandidates: 0 };
+  }
+  const captcha = captchaFormCount > 0 || Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
+  return [
+    'diagnostics_available=' + diagnosticsAvailable,
+    diagnosticsError ? 'diagnostics_error=' + diagnosticsError : '',
+    signalsAvailable ? 'title_ready=' + Boolean(signals.titleReady) : '',
+    diagnosticsAvailable ? 'captcha=' + captcha : '',
+    diagnosticsAvailable ? 'captcha_form_count=' + captchaFormCount : '',
+    diagnosticsAvailable ? 'captcha_challenge_count=' + Number(signals.captchaChallengeCount || 0) : '',
+    diagnosticsAvailable ? 'continuation_candidates=' + Number(signals.continuationCandidates || 0) : '',
+  ].filter(Boolean).join(' ');
+}
+
+async function clickFirstWorkingContinuation(locator, count, deadline) {
+  for (let index = 0; index < count; index++) {
+    const timeout = Math.min(remainingTimeout(deadline), 5000);
+    if (timeout <= 0) return false;
+    const candidate = index === 0 && typeof locator.first === 'function' ? locator.first() : locator.nth(index);
+    try {
+      await candidate.click({ timeout });
+      return true;
+    } catch {}
+  }
+  return false;
 }
 
 async function handleAmazonContinuationGate(page, deadline) {
-  if (await productTitleReady(page).catch(() => false)) return false;
+  if (await safeProductTitleReady(page)) return false;
   if (await hasAmazonInterstitial(page)) return false;
-  const continueButton = page.locator(
-    [
-      'button:has-text("Continue Shopping")',
-      'input[type="submit" i][value="Continue Shopping" i]',
-      'input[type="button" i][value="Continue Shopping" i]',
-      'input[type="submit" i][aria-label*="Continue Shopping" i]',
-      'input[type="button" i][aria-label*="Continue Shopping" i]',
-      '[role="button"][aria-label*="Continue Shopping" i]',
-      'a:has-text("Continue Shopping")',
-      'text=/^\\s*continue shopping\\s*$/i',
-    ].join(', ')
-  );
-  const count = await continueButton.count().catch(() => 0);
-  if (count <= 0) return false;
-  const clickTimeout = Math.min(5000, remainingTimeout(deadline));
-  if (clickTimeout <= 0) return false;
-  try {
-    await continueButton.first().click({ timeout: clickTimeout });
-  } catch {
-    return false;
+  let clicked = false;
+  if (await markNormalizedAmazonContinuationCandidate(page)) {
+    const continueButton = page.locator('[data-product-capture-continuation-candidate="true"]');
+    const count = await continueButton.count().catch(() => 0);
+    if (count > 0) clicked = await clickFirstWorkingContinuation(continueButton, count, deadline);
   }
+  if (!clicked) return false;
   const loadTimeout = Math.min(10000, remainingTimeout(deadline));
   if (loadTimeout > 0) {
     await page.waitForLoadState('domcontentloaded', { timeout: loadTimeout }).catch(() => {});
@@ -676,7 +816,7 @@ function remainingTimeout(deadline) {
 
 async function waitForProductTitle(page, deadline) {
   const timeout = remainingTimeout(deadline);
-  if (timeout <= 0) return await productTitleReady(page);
+  if (timeout <= 0) return await safeProductTitleReady(page);
   return await page.waitForFunction(() => {
     const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
     return titleNodes.some((node) => {
@@ -685,7 +825,7 @@ async function waitForProductTitle(page, deadline) {
     });
   }, { timeout }).then(() => true).catch((err) => {
     if (!isTimeoutError(err)) throw err;
-    return productTitleReady(page);
+    return safeProductTitleReady(page);
   });
 }
 
@@ -703,7 +843,7 @@ async function gotoWithTransientRetry(page, url, deadline) {
       if (!isTransientNavigationError(err)) {
         throw err;
       }
-      if (await productTitleReady(page).catch(() => false)) return;
+      if (await safeProductTitleReady(page)) return;
       if (page.url() && page.url() !== 'about:blank') {
         const loadTimeout = Math.min(5000, remainingTimeout(deadline));
         if (loadTimeout > 0) await page.waitForLoadState('domcontentloaded', { timeout: loadTimeout }).catch(() => {});
@@ -771,9 +911,10 @@ async function main() {
     if (await hasAmazonInterstitial(page)) {
       throw new Error('amazon interstitial requires manual review');
     }
-    if (!await productTitleReady(page)) {
-      throw new Error('amazon product page did not expose product title');
+    if (!await requireProductTitleReady(page)) {
+      throw new Error('amazon product page did not expose product title; ' + await amazonCaptureDiagnostics(page));
     }
+    await clearAmazonContinuationMarkers(page);
     process.stdout.write(await page.content());
   } finally {
     await browser.close();

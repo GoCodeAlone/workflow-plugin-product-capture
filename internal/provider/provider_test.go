@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -452,6 +453,34 @@ func TestMainRejectsInvalidWorkflowComputeProviderConfig(t *testing.T) {
 	}
 }
 
+func TestCaptureHTMLWithPlaywrightReportsOutputLimitBeforeNodePipeNoise(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\nprintf '0123456789abcdef'\nprintf 'write EPIPE\\n' >&2\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   8,
+	})
+	if err == nil {
+		t.Fatalf("expected output limit error")
+	}
+	if !strings.Contains(err.Error(), "capture output exceeds max_html_bytes 8") {
+		t.Fatalf("expected output limit error before pipe noise, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "EPIPE") {
+		t.Fatalf("error leaked node pipe noise: %v", err)
+	}
+}
+
 func TestIsZeroMetadataHandlesNil(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -661,6 +690,7 @@ func TestPlaywrightScriptHandlesOnlyBenignAmazonContinuationGates(t *testing.T) 
 	for _, disallowed := range []string{
 		"stealth",
 		"HeadlessChrome",
+		"'continue',",
 	} {
 		if strings.Contains(playwrightCaptureScript, disallowed) {
 			t.Fatalf("playwright script contains disallowed automation marker %q", disallowed)
@@ -688,9 +718,10 @@ func TestPlaywrightScriptHandlesOnlyBenignAmazonContinuationGates(t *testing.T) 
 	}
 	for _, required := range []string{
 		"handleAmazonContinuationGate",
-		"Continue Shopping",
 		"continue shopping",
-		"continueButton.first().click",
+		"data-product-capture-continuation-candidate",
+		"clickFirstWorkingContinuation",
+		"locator.nth(index)",
 	} {
 		if !strings.Contains(playwrightCaptureScript, required) {
 			t.Fatalf("playwright script must handle benign Amazon continuation gate; missing %q", required)
@@ -921,11 +952,25 @@ class TimeoutError extends Error {
   }
 }
 let clicked = false;
+const attrs = {};
+const continuationNode = {
+  value: 'Continue Shopping',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
 function withDocument(fn) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
-    querySelectorAll: (selector) => selector === '#productTitle' ? titleNodes : [],
+    body: { textContent: ' Continue Shopping ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleNodes;
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      return [];
+    },
     querySelector: () => null,
   };
   try {
@@ -943,15 +988,18 @@ exports.chromium = {
         if (selector === 'form[action*="/errors/validateCaptcha"]') {
           return { count: async () => 0 };
         }
-        if (selector.includes('Continue Shopping')) {
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
           return {
-            count: async () => clicked ? 0 : 1,
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' && !clicked ? 1 : 0,
             first: () => ({
+              click: async () => { clicked = true; },
+            }),
+            nth: () => ({
               click: async () => { clicked = true; },
             }),
           };
         }
-        throw new Error('unexpected selector ' + selector);
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
       waitForFunction: async (fn) => withDocument(fn),
@@ -981,11 +1029,25 @@ class TimeoutError extends Error {
   }
 }
 let clicked = false;
+const attrs = {};
+const continuationNode = {
+  value: 'continue shopping',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
 function withDocument(fn) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
-    querySelectorAll: (selector) => selector === '#productTitle' ? titleNodes : [],
+    body: { textContent: ' continue shopping ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleNodes;
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      return [];
+    },
     querySelector: () => null,
   };
   try {
@@ -1003,10 +1065,13 @@ exports.chromium = {
         if (selector === 'form[action*="/errors/validateCaptcha"]') {
           return { count: async () => 0 };
         }
-        if (selector.includes('[value="Continue Shopping" i]')) {
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
           return {
-            count: async () => clicked ? 0 : 1,
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' && !clicked ? 1 : 0,
             first: () => ({
+              click: async () => { clicked = true; },
+            }),
+            nth: () => ({
               click: async () => { clicked = true; },
             }),
           };
@@ -1029,6 +1094,589 @@ exports.errors = { TimeoutError };
 	}
 	if !strings.Contains(stdout.String(), `id="productTitle"`) {
 		t.Fatalf("capture script did not emit product html after continuation submit: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptClicksNormalizedContinuationControl(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+const attrs = {};
+const continuationNode = {
+  value: ' Continue   Shopping ',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+};
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+  global.document = {
+    body: { textContent: ' Continue Shopping ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleNodes;
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return { count: async () => 0, first: () => ({ click: async () => {} }) };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' && !clicked ? 1 : 0,
+            first: () => ({
+              click: async () => { clicked = true; },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after normalized continuation click: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after normalized continuation: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptClicksSimilarBenignContinuationLabel(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+const attrs = {};
+const continuationNode = {
+  value: ' Continue to product ',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+  global.document = {
+    body: { textContent: ' Continue to product ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleNodes;
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      if (selector === '[data-product-capture-continuation-candidate="true"]') return attrs['data-product-capture-continuation-candidate'] === 'true' ? [continuationNode] : [];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return { count: async () => 0, first: () => ({ click: async () => {} }) };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' && !clicked ? 1 : 0,
+            first: () => ({
+              click: async () => { clicked = true; },
+            }),
+            nth: () => ({
+              click: async () => { clicked = true; },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after similar continuation click: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after similar continuation: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptSkipsUnclickableNormalizedContinuationCandidate(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+const attrs = [{}, {}];
+const continuationNodes = [
+  {
+    value: ' Continue   Shopping ',
+    textContent: '',
+    getAttribute: (name) => attrs[0][name] || '',
+    setAttribute: (name, value) => { attrs[0][name] = value; },
+    removeAttribute: (name) => { delete attrs[0][name]; },
+  },
+  {
+    value: ' Continue   Shopping ',
+    textContent: '',
+    getAttribute: (name) => attrs[1][name] || '',
+    setAttribute: (name, value) => { attrs[1][name] = value; },
+    removeAttribute: (name) => { delete attrs[1][name]; },
+  },
+];
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+  global.document = {
+    body: { textContent: ' Continue Shopping ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleNodes;
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return continuationNodes;
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+function continuationLocator() {
+  const candidates = continuationNodes
+    .map((node, index) => ({ node, index }))
+    .filter(({ index }) => attrs[index]['data-product-capture-continuation-candidate'] === 'true');
+  return {
+    count: async () => clicked ? 0 : candidates.length,
+    first: () => ({
+      click: async () => { throw new TimeoutError('first candidate is hidden'); },
+    }),
+    nth: (index) => ({
+      click: async () => {
+        if (index === 0) throw new TimeoutError('first candidate is hidden');
+        clicked = true;
+      },
+    }),
+  };
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return { count: async () => 0, first: () => ({ click: async () => {} }) };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return continuationLocator();
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after second normalized continuation click: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after second normalized continuation: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptFallsBackToNormalizedContinuationAfterExactClickFails(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+const attrs = {};
+const continuationNode = {
+  value: ' Continue   Shopping ',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+  global.document = {
+    body: { textContent: ' Continue Shopping ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleNodes;
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return {
+            count: async () => 1,
+            first: () => ({
+              click: async () => { throw new TimeoutError('exact candidate is hidden'); },
+            }),
+            nth: () => ({
+              click: async () => { throw new TimeoutError('exact candidate is hidden'); },
+            }),
+          };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' && !clicked ? 1 : 0,
+            first: () => ({
+              click: async () => { clicked = true; },
+            }),
+            nth: () => ({
+              click: async () => { clicked = true; },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after exact-to-normalized continuation fallback: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after exact-to-normalized fallback: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptRemovesContinuationMarkersBeforeCapture(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+const attrs = {};
+const continuationNode = {
+  value: ' Continue   Shopping ',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+  global.document = {
+    body: { textContent: ' Continue Shopping ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleNodes;
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return { count: async () => 0, first: () => ({ click: async () => {} }) };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' && !clicked ? 1 : 0,
+            first: () => ({
+              click: async () => { clicked = true; },
+            }),
+            nth: () => ({
+              click: async () => { clicked = true; },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body><span id="productTitle">Echo Dot</span><input value="Continue Shopping" ' + (attrs['data-product-capture-continuation-candidate'] ? 'data-product-capture-continuation-candidate="true"' : '') + '></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after marker cleanup: %v\nstderr=%s", err, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "data-product-capture-continuation-candidate") {
+		t.Fatalf("capture output leaked continuation marker: %s", stdout.String())
+	}
+}
+
+func TestPlaywrightScriptFailsWhenContinuationMarkerCleanupFails(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let clicked = false;
+let cleanupSweep = false;
+const attrs = {};
+const continuationNode = {
+  value: ' Continue   Shopping ',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => {
+    if (cleanupSweep) throw new Error('marker cleanup failed');
+    delete attrs[name];
+  },
+};
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+  global.document = {
+    body: { textContent: ' Continue Shopping ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleNodes;
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('Continue Shopping')) {
+          return { count: async () => 0, first: () => ({ click: async () => {} }) };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' && !clicked ? 1 : 0,
+            first: () => ({
+              click: async () => { clicked = true; },
+            }),
+            nth: () => ({
+              click: async () => { clicked = true; },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => {
+        cleanupSweep = String(fn).includes("querySelectorAll('[' + marker + ']'") && !String(fn).includes('return { titleReady');
+        try {
+          return withDocument(fn);
+        } finally {
+          cleanupSweep = false;
+        }
+      },
+      content: async () => '<html><body><span id="productTitle">Echo Dot</span><input value="Continue Shopping" data-product-capture-continuation-candidate="true"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected marker cleanup failure")
+	}
+	if !strings.Contains(stderr.String(), "amazon continuation marker cleanup failed") {
+		t.Fatalf("stderr missing marker cleanup failure: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptRemovesMutatedContinuationMarkersBeforeCapture(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let cleanupSweep = false;
+const attrs = { 'data-product-capture-continuation-candidate': 'true' };
+const mutatedNode = {
+  value: '',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: ' product page ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [{ value: '', textContent: ' Echo Dot ' }];
+      if (selector === '[data-product-capture-continuation-candidate]') return cleanupSweep && attrs['data-product-capture-continuation-candidate'] ? [mutatedNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => {
+        cleanupSweep = String(fn).includes("querySelectorAll('[' + marker + ']'") && !String(fn).includes('return { titleReady');
+        try {
+          return withDocument(fn);
+        } finally {
+          cleanupSweep = false;
+        }
+      },
+      content: async () => '<html><body><span id="productTitle">Echo Dot</span><div ' + (attrs['data-product-capture-continuation-candidate'] ? 'data-product-capture-continuation-candidate="true"' : '') + '></div></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after mutated marker cleanup: %v\nstderr=%s", err, stderr.String())
+	}
+	if strings.Contains(stdout.String(), "data-product-capture-continuation-candidate") {
+		t.Fatalf("capture output leaked mutated continuation marker: %s", stdout.String())
 	}
 }
 
@@ -1091,6 +1739,549 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptDoesNotClickChallengeLabeledExactContinuation(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const attrs = {};
+  const continuationNode = {
+    value: 'Continue Shopping verification required',
+    textContent: '',
+    getAttribute: (name) => attrs[name] || '',
+    setAttribute: (name, value) => { attrs[name] = value; },
+    removeAttribute: (name) => { delete attrs[name]; },
+  };
+  global.document = {
+    body: { textContent: 'Continue Shopping verification required' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('[value="Continue Shopping" i]') || selector.includes('Continue Shopping')) {
+          return {
+            count: async () => 1,
+            first: () => ({
+              click: async () => { throw new Error('clicked challenge-labeled exact continuation'); },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body>challenge</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected challenge-labeled exact continuation to fail closed")
+	}
+	if strings.Contains(stderr.String(), "clicked challenge-labeled exact continuation") || !strings.Contains(stderr.String(), "amazon product page did not expose product title") {
+		t.Fatalf("stderr missing closed no-title failure or clicked challenge-labeled gate: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptDoesNotClickGenericContinueOnBlockedAmazonPage(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+const attrs = {};
+const continuationNode = {
+  value: 'Continue',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'We detected unusual activity. Continue to sign in.' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' ? 1 : 0,
+            first: () => ({
+              click: async () => { throw new Error('clicked generic blocked continuation'); },
+            }),
+            nth: () => ({
+              click: async () => { throw new Error('clicked generic blocked continuation'); },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async () => { throw new TimeoutError('timeout'); },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body>blocked continue</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected generic blocked continuation to fail closed")
+	}
+	if strings.Contains(stderr.String(), "clicked generic blocked continuation") || !strings.Contains(stderr.String(), "amazon product page did not expose product title") {
+		t.Fatalf("stderr missing closed no-title failure or clicked generic blocked gate: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptDoesNotClickImageOnlyCaptchaContinuation(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'Continue Shopping' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      if (selector === 'img[src*="captcha" i],img[alt*="captcha" i],input[name*="captcha" i],input[id*="captcha" i],iframe[src*="captcha" i],iframe[src*="challenge" i]') return [{}];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('[value="Continue Shopping" i]') || selector.includes('Continue Shopping')) {
+          return {
+            count: async () => 1,
+            first: () => ({
+              click: async () => { throw new Error('clicked image-only CAPTCHA continuation'); },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body>captcha image</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected image-only CAPTCHA page to fail closed")
+	}
+	if strings.Contains(stderr.String(), "clicked image-only CAPTCHA continuation") || !strings.Contains(stderr.String(), "amazon interstitial requires manual review") {
+		t.Fatalf("stderr missing manual review failure or clicked CAPTCHA-like gate: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptDoesNotClickWhenInterstitialCheckIsUnknown(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector.includes('[value="Continue Shopping" i]') || selector.includes('Continue Shopping')) {
+          return {
+            count: async () => 1,
+            first: () => ({
+              click: async () => { throw new Error('clicked unknown interstitial continuation'); },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async () => { throw new TimeoutError('timeout'); },
+      evaluate: async () => { throw new Error('execution context destroyed'); },
+      content: async () => '<html><body>unknown</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected unknown interstitial state to fail closed")
+	}
+	if strings.Contains(stderr.String(), "clicked unknown interstitial continuation") || !strings.Contains(stderr.String(), "amazon interstitial requires manual review") {
+		t.Fatalf("stderr missing manual review failure or clicked unknown gate: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptReportsSanitizedNoTitleDiagnostics(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'shopping page without product details' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/dp/B09B8V1LZ3',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async () => { throw new TimeoutError('timeout'); },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body>shopping page without product details</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected missing title to fail")
+	}
+	for _, want := range []string{
+		"amazon product page did not expose product title",
+		"title_ready=false",
+		"captcha=false",
+		"continuation_candidates=0",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing sanitized diagnostic %q: %s", want, stderr.String())
+		}
+	}
+	for _, leak := range []string{
+		"https://www.amazon.com/dp/B09B8V1LZ3",
+		"shopping page without product details",
+		"<html><body>",
+	} {
+		if strings.Contains(stderr.String(), leak) {
+			t.Fatalf("stderr leaked page detail %q: %s", leak, stderr.String())
+		}
+	}
+}
+
+func TestPlaywrightScriptPreservesFinalTitleReadFailures(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let titleReadyCalls = 0;
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'plain page' },
+    querySelectorAll: (selector) => selector === '#productTitle' ? [] : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async () => { throw new TimeoutError('timeout'); },
+      evaluate: async (fn) => {
+        if (String(fn).includes('return { titleReady')) return withDocument(fn);
+        if (String(fn).includes("querySelectorAll('#productTitle')")) {
+          titleReadyCalls++;
+          if (titleReadyCalls >= 3) throw new Error('execution context destroyed during final title check');
+        }
+        return withDocument(fn);
+      },
+      content: async () => '<html><body>plain page</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected final title check failure")
+	}
+	if !strings.Contains(stderr.String(), "amazon product title readiness check failed") {
+		t.Fatalf("stderr missing final title readiness failure: %s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "amazon product page did not expose product title") {
+		t.Fatalf("final title readiness failure was reported as missing title: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptReportsUnavailableDiagnosticsWhenCaptchaFormCountFails(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'shopping page without product details' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [];
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+let titleReadyCalls = 0;
+let diagnosticsMayFail = false;
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return {
+            count: async () => {
+              if (diagnosticsMayFail) throw new Error('locator context destroyed');
+              return 0;
+            },
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async () => { throw new TimeoutError('timeout'); },
+      evaluate: async (fn) => {
+        if (String(fn).includes('return { titleReady')) return withDocument(fn);
+        if (String(fn).includes("querySelectorAll('#productTitle')")) {
+          titleReadyCalls++;
+          if (titleReadyCalls >= 3) diagnosticsMayFail = true;
+        }
+        return withDocument(fn);
+      },
+      content: async () => '<html><body>shopping page without product details</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected missing title to fail")
+	}
+	for _, want := range []string{
+		"amazon product page did not expose product title",
+		"diagnostics_available=false",
+		"diagnostics_error=captcha_form_count_failed",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing unavailable diagnostic %q: %s", want, stderr.String())
+		}
+	}
+	for _, unavailable := range []string{
+		"captcha_form_count=0",
+		"captcha_challenge_count=0",
+		"continuation_candidates=0",
+	} {
+		if strings.Contains(stderr.String(), unavailable) {
+			t.Fatalf("stderr reported unavailable diagnostic count %q: %s", unavailable, stderr.String())
+		}
+	}
+}
+
+func TestPlaywrightScriptReportsUnavailableDiagnosticsWhenEvaluationFails(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+	let titleReadyCalls = 0;
+	let diagnosticsMayFail = false;
+	exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async () => { throw new TimeoutError('timeout'); },
+      evaluate: async (fn) => {
+        if (String(fn).includes('return { titleReady')) {
+          if (diagnosticsMayFail) throw new Error('execution context destroyed');
+          return { titleReady: false, captchaText: false, captchaChallengeCount: 0, continuationCandidates: 0 };
+        }
+        if (String(fn).includes("querySelectorAll('#productTitle')")) {
+          titleReadyCalls++;
+          if (titleReadyCalls >= 3) diagnosticsMayFail = true;
+        }
+        return false;
+      },
+      content: async () => '<html><body>unknown</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected missing title to fail")
+	}
+	for _, want := range []string{
+		"amazon product page did not expose product title",
+		"diagnostics_available=false",
+		"diagnostics_error=evaluate_failed",
+	} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing unavailable diagnostic %q: %s", want, stderr.String())
+		}
+	}
+	for _, unavailable := range []string{
+		"captcha_challenge_count=0",
+		"continuation_candidates=0",
+		"title_ready=false",
+	} {
+		if strings.Contains(stderr.String(), unavailable) {
+			t.Fatalf("stderr reported unavailable diagnostic count %q: %s", unavailable, stderr.String())
+		}
+	}
+}
+
 func TestPlaywrightScriptTreatsContinuationPrecheckErrorAsOptional(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {
@@ -1099,7 +2290,7 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-let evaluateCalls = 0;
+let threwProductTitleReady = false;
 function withDocument(fn) {
   const previousDocument = global.document;
   global.document = {
@@ -1128,8 +2319,11 @@ exports.chromium = {
       },
       waitForFunction: async (fn) => withDocument(fn),
       evaluate: async (fn) => {
-        evaluateCalls++;
-        if (evaluateCalls === 1) throw new Error('Execution context was destroyed');
+        if (String(fn).includes('return { titleReady')) return withDocument(fn);
+        if (!threwProductTitleReady && String(fn).includes("querySelectorAll('#productTitle')")) {
+          threwProductTitleReady = true;
+          throw new Error('Execution context was destroyed');
+        }
         return withDocument(fn);
       },
       content: async () => '<html><body><span id="productTitle">Echo Dot</span></body></html>',
@@ -1156,10 +2350,25 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
+let titleReady = false;
+const attrs = {};
+const continuationNode = {
+  value: 'Continue Shopping',
+  textContent: '',
+  getAttribute: (name) => attrs[name] || '',
+  setAttribute: (name, value) => { attrs[name] = value; },
+  removeAttribute: (name) => { delete attrs[name]; },
+};
 function withDocument(fn) {
   const previousDocument = global.document;
   global.document = {
-    querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: '', textContent: ' Echo Dot ' }] : [],
+    body: { textContent: ' Continue Shopping ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleReady ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+      if (selector === '[data-product-capture-continuation-candidate]') return attrs['data-product-capture-continuation-candidate'] ? [continuationNode] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [continuationNode];
+      return [];
+    },
     querySelector: () => null,
   };
   try {
@@ -1177,15 +2386,24 @@ exports.chromium = {
         if (selector === 'form[action*="/errors/validateCaptcha"]') {
           return { count: async () => 0 };
         }
-        if (selector.includes('Continue Shopping')) {
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
           return {
-            count: async () => 1,
+            count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' ? 1 : 0,
             first: () => ({
-              click: async () => { throw new TimeoutError('Timeout 5000ms exceeded'); },
+              click: async () => {
+                titleReady = true;
+                throw new TimeoutError('Timeout 5000ms exceeded');
+              },
+            }),
+            nth: () => ({
+              click: async () => {
+                titleReady = true;
+                throw new TimeoutError('Timeout 5000ms exceeded');
+              },
             }),
           };
         }
-        throw new Error('unexpected selector ' + selector);
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
       waitForFunction: async (fn) => withDocument(fn),
@@ -1206,7 +2424,104 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptStopsContinuationCandidateClicksAtDeadline(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let now = 0;
+Date.now = () => now;
+let secondClicked = false;
+let titleReady = false;
+const attrs = [{}, {}];
+const continuationNodes = attrs.map((nodeAttrs) => ({
+  value: 'Continue Shopping',
+  textContent: '',
+  getAttribute: (name) => nodeAttrs[name] || '',
+  setAttribute: (name, value) => { nodeAttrs[name] = value; },
+  removeAttribute: (name) => { delete nodeAttrs[name]; },
+}));
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: ' Continue Shopping ' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return titleReady ? [{ value: '', textContent: ' Echo Dot ' }] : [];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return continuationNodes;
+      return [];
+    },
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        if (selector === '[data-product-capture-continuation-candidate="true"]') {
+          return {
+            count: async () => attrs.filter((nodeAttrs) => nodeAttrs['data-product-capture-continuation-candidate'] === 'true').length,
+            first: () => ({
+              click: async () => {
+                titleReady = true;
+                now = 30000;
+                throw new TimeoutError('first candidate consumed deadline');
+              },
+            }),
+            nth: (index) => ({
+              click: async () => {
+                if (index === 1) {
+                  secondClicked = true;
+                  titleReady = true;
+                }
+              },
+            }),
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => titleReady ? '<html><body><span id="productTitle">Echo Dot</span></body></html>' : '<html><body>No title yet</body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+process.on('exit', () => {
+  if (secondClicked) {
+    console.error('second continuation candidate clicked after deadline');
+    process.exitCode = 42;
+  }
+});
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeTimeout(t, fakePlaywright, "30000")
+	if err != nil {
+		t.Fatalf("capture script should stop continuation clicks at deadline without failing capture: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not continue to title wait after deadline-bound click attempts: %s", stdout.String())
+	}
+}
+
 func runPlaywrightScriptWithFake(t *testing.T, fakePlaywright string) (bytes.Buffer, bytes.Buffer, error) {
+	return runPlaywrightScriptWithFakeTimeout(t, fakePlaywright, "30000")
+}
+
+func runPlaywrightScriptWithFakeTimeout(t *testing.T, fakePlaywright string, timeout string) (bytes.Buffer, bytes.Buffer, error) {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skipf("node not installed; CI provisions Node for generated Playwright script regressions: %v", err)
@@ -1223,7 +2538,7 @@ func runPlaywrightScriptWithFake(t *testing.T, fakePlaywright string) (bytes.Buf
 	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(fakePlaywright), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("node", script, "https://www.amazon.com/dp/B08H75RTZ8", "30000")
+	cmd := exec.Command("node", script, "https://www.amazon.com/dp/B08H75RTZ8", timeout)
 	cmd.Env = withoutNodeOverrides(os.Environ())
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -1280,6 +2595,7 @@ func TestPlaywrightScriptRetriesPlainNavigationTimeoutWithinBudget(t *testing.T)
 		"'Timeout',",
 		"productTitleReady(page)",
 		"waitForProductTitle(page, deadline)",
+		"if (timeout <= 0) return await safeProductTitleReady(page)",
 		"const titleWait = Math.min(remainingTimeout(deadline), 15000)",
 		"await waitForProductTitle(page, Date.now() + titleWait)",
 		"remainingTimeout(deadline",
