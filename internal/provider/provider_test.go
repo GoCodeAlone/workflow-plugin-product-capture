@@ -6,12 +6,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	coreprotocol "github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
+	"github.com/GoCodeAlone/workflow-plugin-product-capture/internal/snapshot"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -708,12 +710,20 @@ func TestPlaywrightScriptPrefersStandardChromeChannel(t *testing.T) {
 	}
 }
 
-func TestPlaywrightScriptWaitsForVisibleProductTitleSpan(t *testing.T) {
+func TestPlaywrightScriptUsesExtractorCompatibleProductTitleEvidence(t *testing.T) {
 	if strings.Contains(playwrightCaptureScript, "locator('#productTitle').waitFor") {
 		t.Fatalf("playwright script uses strict #productTitle locator; Amazon may render a visible span and hidden input with that id")
 	}
-	if !strings.Contains(playwrightCaptureScript, "waitForFunction") || !strings.Contains(playwrightCaptureScript, "input#productTitle") {
-		t.Fatalf("playwright script should wait for either visible product title text or hidden title input value")
+	for _, required := range []string{
+		"waitForFunction",
+		"document.querySelectorAll('#productTitle')",
+		"titleNodes.some",
+		"node.textContent",
+		"node.value",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("playwright script should wait for product title evidence; missing %q", required)
+		}
 	}
 }
 
@@ -733,6 +743,191 @@ func TestPlaywrightScriptWaitsForCaptureRelevantNodes(t *testing.T) {
 	}
 }
 
+func TestPlaywrightScriptEmitsHTMLWhenTitleWaitTimesOut(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = [
+    { value: '', textContent: '' },
+    { value: '', textContent: ' Xbox Series X ' },
+  ];
+  global.document = {
+    querySelectorAll: (selector) => selector === '#productTitle' ? titleNodes : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector !== 'form[action*="/errors/validateCaptcha"]') throw new Error('unexpected selector ' + selector);
+        return { count: async () => 0 };
+      },
+      waitForFunction: async (fn) => {
+        withDocument(fn);
+        throw new TimeoutError('Timeout 15000ms exceeded');
+      },
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B08H75RTZ8"></head><body><input id="productTitle" value="Xbox Series X"><img id="landingImage" src="https://m.media-amazon.com/images/I/xbox.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after title wait timeout: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit current page html: %s", stdout.String())
+	}
+	snap, err := snapshot.ExtractAmazon(stdout.String(), snapshot.ExtractOptions{URL: "https://www.amazon.com/dp/B08H75RTZ8"})
+	if err != nil {
+		t.Fatalf("captured html should remain extractable: %v", err)
+	}
+	if snap.Title != "Xbox Series X" {
+		t.Fatalf("title: %q", snap.Title)
+	}
+}
+
+func TestPlaywrightScriptPropagatesNonTimeoutTitleWaitErrors(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector !== 'form[action*="/errors/validateCaptcha"]') throw new Error('unexpected selector ' + selector);
+        return { count: async () => 0 };
+      },
+      waitForFunction: async () => { throw new Error('Target page, context or browser has been closed'); },
+      evaluate: async () => true,
+      content: async () => '<html><body><input id="productTitle" value="Xbox Series X"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected non-timeout title wait error to propagate")
+	}
+	if !strings.Contains(stderr.String(), "Target page, context or browser has been closed") {
+		t.Fatalf("stderr missing propagated browser error: %s", stderr.String())
+	}
+}
+
+func TestPlaywrightScriptFailsClosedWhenInterstitialAppearsAfterTitleWait(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let locatorChecks = 0;
+function withDocument(fn) {
+  const previousDocument = global.document;
+  const titleNodes = [
+    { value: '', textContent: '' },
+    { value: 'Xbox Series X', textContent: '' },
+  ];
+  global.document = {
+    querySelectorAll: (selector) => selector === '#productTitle' ? titleNodes : [],
+    querySelector: () => null,
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector !== 'form[action*="/errors/validateCaptcha"]') throw new Error('unexpected selector ' + selector);
+        return { count: async () => locatorChecks++ === 0 ? 0 : 1 };
+      },
+      waitForFunction: async (fn) => withDocument(fn),
+      evaluate: async (fn) => withDocument(fn),
+      content: async () => '<html><body><input id="productTitle" value="Xbox Series X"><form action="/errors/validateCaptcha"></form></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatalf("expected late interstitial to fail closed")
+	}
+	if !strings.Contains(stderr.String(), "amazon interstitial requires manual review") {
+		t.Fatalf("stderr missing interstitial failure: %s", stderr.String())
+	}
+}
+
+func runPlaywrightScriptWithFake(t *testing.T, fakePlaywright string) (bytes.Buffer, bytes.Buffer, error) {
+	t.Helper()
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skipf("node not installed; CI provisions Node for generated Playwright script regressions: %v", err)
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "capture.js")
+	if err := os.WriteFile(script, []byte(playwrightCaptureScript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	moduleDir := filepath.Join(dir, "node_modules", "playwright")
+	if err := os.MkdirAll(moduleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(fakePlaywright), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("node", script, "https://www.amazon.com/dp/B08H75RTZ8", "30000")
+	cmd.Env = withoutNodeOverrides(os.Environ())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout, stderr, err
+}
+
+func withoutNodeOverrides(env []string) []string {
+	out := env[:0]
+	for _, item := range env {
+		if strings.HasPrefix(item, "NODE_OPTIONS=") || strings.HasPrefix(item, "NODE_PATH=") {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
 func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 	for _, required := range []string{
 		"isTransientNavigationError",
@@ -750,7 +945,7 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 		}
 	}
 	retryIndex := strings.Index(playwrightCaptureScript, "await gotoWithTransientRetry(page, url, deadline);")
-	captchaIndex := strings.Index(playwrightCaptureScript, `form[action*="/errors/validateCaptcha"]`)
+	captchaIndex := strings.Index(playwrightCaptureScript, "if (await hasAmazonInterstitial(page))")
 	if retryIndex < 0 || captchaIndex < 0 || captchaIndex < retryIndex {
 		t.Fatal("playwright script must check CAPTCHA/interstitials after retryable navigation only")
 	}
@@ -761,7 +956,8 @@ func TestPlaywrightScriptRetriesPlainNavigationTimeoutWithinBudget(t *testing.T)
 		"'Timeout',",
 		"productTitleReady(page)",
 		"waitForProductTitle(page, deadline)",
-		"requireTimeout(deadline, 'product title wait', 15000)",
+		"const titleWait = Math.min(remainingTimeout(deadline), 15000)",
+		"await waitForProductTitle(page, Date.now() + titleWait)",
 		"remainingTimeout(deadline",
 		"Math.floor(budget * 0.65)",
 		"if (loadTimeout > 0) await page.waitForLoadState('domcontentloaded'",
