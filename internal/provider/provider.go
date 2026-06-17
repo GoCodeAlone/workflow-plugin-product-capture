@@ -632,6 +632,7 @@ async function hasAmazonInterstitial(page) {
     return (
       bodyText.includes('enter the characters you see below') ||
       bodyText.includes('make sure you are not a robot') ||
+      bodyText.includes('not a robot') ||
       bodyText.includes('type the characters you see') ||
       bodyText.includes('validate captcha')
     );

@@ -1043,7 +1043,7 @@ class TimeoutError extends Error {
 function withDocument(fn) {
   const previousDocument = global.document;
   global.document = {
-    body: { textContent: 'Sorry, we just need to make sure you are not a robot. Enter the characters you see below.' },
+    body: { textContent: "Sorry, we need to make sure you're not a robot." },
     querySelectorAll: (selector) => selector === '#productTitle' ? [] : [],
     querySelector: () => null,
   };
