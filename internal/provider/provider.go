@@ -31,6 +31,7 @@ const (
 	CaptureModeBrowser     = "browser"
 	CaptureModeMeta        = "metadata"
 	ComputeProtocolVersion = "compute.v1alpha1"
+	productArtifactMode    = 0o644
 )
 
 var Version = "0.1.0"
@@ -552,8 +553,11 @@ func writeSnapshot(path string, snap snapshot.Snapshot) error {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
 	data = append(data, '\n')
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	if err := os.WriteFile(path, data, productArtifactMode); err != nil {
 		return fmt.Errorf("write snapshot: %w", err)
+	}
+	if err := os.Chmod(path, productArtifactMode); err != nil {
+		return fmt.Errorf("chmod snapshot: %w", err)
 	}
 	return nil
 }

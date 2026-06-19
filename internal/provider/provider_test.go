@@ -305,6 +305,7 @@ func TestMainRunsWorkflowComputeDynamicProviderEnvelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read product artifact: %v", err)
 	}
+	assertFileMode(t, ProductJSONArtifact, 0o644)
 	var got struct {
 		Title  string   `json:"title"`
 		Images []string `json:"images,omitempty"`
@@ -3696,4 +3697,15 @@ func containsString(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func assertFileMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("%s mode = %v, want %v", path, got, want)
+	}
 }
