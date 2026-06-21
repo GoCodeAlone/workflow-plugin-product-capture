@@ -229,11 +229,17 @@ func TestMainCapturesAmazonFixture(t *testing.T) {
 		t.Fatalf("read output: %v", err)
 	}
 	var got struct {
-		Provider string   `json:"provider"`
-		Title    string   `json:"title"`
-		Price    string   `json:"price"`
-		Images   []string `json:"images,omitempty"`
-		RawHTML  string   `json:"raw_html,omitempty"`
+		Provider                 string   `json:"provider"`
+		RequestedURL             string   `json:"requested_url"`
+		ExternalID               string   `json:"external_id"`
+		CanonicalURL             string   `json:"canonical_url"`
+		Title                    string   `json:"title"`
+		Price                    string   `json:"price"`
+		ImageURL                 string   `json:"image_url"`
+		Images                   []string `json:"images,omitempty"`
+		VariantKey               string   `json:"variant_key"`
+		RequiresUserConfirmation bool     `json:"requires_user_confirmation"`
+		RawHTML                  string   `json:"raw_html,omitempty"`
 	}
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("decode snapshot: %v", err)
@@ -246,6 +252,12 @@ func TestMainCapturesAmazonFixture(t *testing.T) {
 	}
 	if got.Price != "637.00" {
 		t.Fatalf("price: %q", got.Price)
+	}
+	if got.RequestedURL == "" || got.ExternalID != "B08H75RTZ8" || got.CanonicalURL == "" {
+		t.Fatalf("product identity fields missing: %+v", got)
+	}
+	if got.ImageURL == "" || got.VariantKey == "" || !got.RequiresUserConfirmation {
+		t.Fatalf("variant/image fields missing: %+v", got)
 	}
 	if len(got.Images) > 4 {
 		t.Fatalf("max_image_count ignored: %d", len(got.Images))
@@ -307,14 +319,20 @@ func TestMainRunsWorkflowComputeDynamicProviderEnvelope(t *testing.T) {
 	}
 	assertFileMode(t, ProductJSONArtifact, 0o644)
 	var got struct {
-		Title  string   `json:"title"`
-		Images []string `json:"images,omitempty"`
+		Title                    string   `json:"title"`
+		RequestedURL             string   `json:"requested_url"`
+		VariantKey               string   `json:"variant_key"`
+		RequiresUserConfirmation bool     `json:"requires_user_confirmation"`
+		Images                   []string `json:"images,omitempty"`
 	}
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatalf("decode product artifact: %v", err)
 	}
 	if !strings.Contains(got.Title, "Xbox Series X") {
 		t.Fatalf("title: %q", got.Title)
+	}
+	if got.RequestedURL == "" || got.VariantKey == "" || !got.RequiresUserConfirmation {
+		t.Fatalf("variant fields missing from product artifact: %+v", got)
 	}
 	if len(got.Images) > 2 {
 		t.Fatalf("max_image_count ignored: %d", len(got.Images))

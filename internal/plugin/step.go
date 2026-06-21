@@ -414,7 +414,9 @@ func flattenedPreviewField(key string) bool {
 		"source",
 		"title",
 		"url",
-		"variant":
+		"variant",
+		"variant_dimensions",
+		"variant_key":
 		return true
 	default:
 		return false

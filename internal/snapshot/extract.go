@@ -1,11 +1,14 @@
 package snapshot
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -41,6 +44,7 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 		ProviderVersion:          "amazon-dom-v1",
 		Merchant:                 "amazon",
 		URL:                      opts.URL,
+		RequestedURL:             opts.URL,
 		ExternalID:               firstNonEmpty(requestedASIN, canonicalASIN),
 		CapturedAt:               now,
 		RequiresUserConfirmation: true,
@@ -85,6 +89,15 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 	out.Rating = firstNonEmpty(firstTextByID(root, "acrPopover"), firstTextByClass(root, "a-icon-alt"))
 	out.ReviewCount = firstTextByID(root, "acrCustomerReviewText")
 	out.Description = strings.Join(textsByClassUnderID(root, "feature-bullets", "a-list-item", 8), "\n")
+	out.VariantDimensions = amazonVariantDimensions(root)
+	if len(out.VariantDimensions) > 0 {
+		out.Variant = formatVariantDimensions(out.VariantDimensions)
+		out.VariantKey = asinVariantKey(out.ExternalID, out.CanonicalURL, out.RequestedURL, out.VariantDimensions)
+		out.RequiresUserConfirmation = false
+	} else {
+		out.VariantKey = exactURLVariantKey(out.RequestedURL)
+		out.RequiresUserConfirmation = true
+	}
 	if amazonUnavailable(out.Availability) {
 		clearTransactionalFields(&out)
 	}
@@ -97,6 +110,84 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 		out.Confidence = "medium"
 	}
 	return out, nil
+}
+
+func amazonVariantDimensions(root *html.Node) map[string]string {
+	dims := map[string]string{}
+	walk(root, func(n *html.Node) bool {
+		id := attr(n, "id")
+		if !strings.HasPrefix(id, "variation_") {
+			return true
+		}
+		value := firstTextByClass(n, "selection")
+		if value == "" {
+			return true
+		}
+		key := amazonVariantDimensionKey(id, firstTextByClass(n, "a-form-label"))
+		if key == "" {
+			return true
+		}
+		dims[key] = value
+		return true
+	})
+	if len(dims) == 0 {
+		return nil
+	}
+	return dims
+}
+
+func amazonVariantDimensionKey(id, label string) string {
+	label = strings.TrimSuffix(clean(label), ":")
+	if label != "" {
+		return normalizedVariantKey(label)
+	}
+	key := strings.TrimPrefix(id, "variation_")
+	key = strings.TrimSuffix(key, "_name")
+	return normalizedVariantKey(strings.ReplaceAll(key, "_", " "))
+}
+
+func normalizedVariantKey(value string) string {
+	value = strings.ToLower(clean(value))
+	value = strings.ReplaceAll(value, " ", "_")
+	value = strings.Trim(value, "_")
+	return value
+}
+
+func formatVariantDimensions(dimensions map[string]string) string {
+	keys := sortedDimensionKeys(dimensions)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		parts = append(parts, key+"="+dimensions[key])
+	}
+	return strings.Join(parts, "; ")
+}
+
+func asinVariantKey(externalID, canonicalURL, requestedURL string, dimensions map[string]string) string {
+	material := strings.Builder{}
+	material.WriteString("amazon-variant\n")
+	material.WriteString(firstNonEmpty(externalID, canonicalURL, requestedURL))
+	for _, key := range sortedDimensionKeys(dimensions) {
+		material.WriteByte('\n')
+		material.WriteString(key)
+		material.WriteByte('=')
+		material.WriteString(dimensions[key])
+	}
+	sum := sha256.Sum256([]byte(material.String()))
+	return "asin-variant-sha256:" + hex.EncodeToString(sum[:])
+}
+
+func exactURLVariantKey(requestedURL string) string {
+	sum := sha256.Sum256([]byte(requestedURL))
+	return "exact-url-sha256:" + hex.EncodeToString(sum[:])
+}
+
+func sortedDimensionKeys(dimensions map[string]string) []string {
+	keys := make([]string, 0, len(dimensions))
+	for key := range dimensions {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func amazonUnavailable(availability string) bool {

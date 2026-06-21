@@ -40,6 +40,12 @@ func TestExtractAmazonObservedXboxShape(t *testing.T) {
 	if got.ExternalID != "B08H75RTZ8" {
 		t.Fatalf("asin: %q", got.ExternalID)
 	}
+	if got.RequestedURL != "https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8" {
+		t.Fatalf("requested_url: %q", got.RequestedURL)
+	}
+	if got.VariantKey == "" || !strings.HasPrefix(got.VariantKey, "exact-url-sha256:") {
+		t.Fatalf("ambiguous fixture should use exact-url variant key: %q", got.VariantKey)
+	}
 	if got.ImageURL == "" || len(got.Images) < 2 {
 		t.Fatalf("images: image=%q all=%+v", got.ImageURL, got.Images)
 	}
@@ -49,6 +55,80 @@ func TestExtractAmazonObservedXboxShape(t *testing.T) {
 	if got.Confidence != "high" || !got.RequiresUserConfirmation {
 		t.Fatalf("provenance: %+v", got)
 	}
+}
+
+func TestExtractAmazonVariantDimensionsCreateDeterministicKey(t *testing.T) {
+	htmlA := amazonVariantFixture(`
+  <div id="variation_color_name">
+    <span class="a-form-label">Color:</span><span class="selection">Carbon Black</span>
+  </div>
+  <div id="variation_style_name">
+    <span class="a-form-label">Style:</span><span class="selection">Console</span>
+  </div>`)
+	htmlB := amazonVariantFixture(`
+  <div id="variation_style_name">
+    <span class="a-form-label">Style:</span><span class="selection">Console</span>
+  </div>
+  <div id="variation_color_name">
+    <span class="a-form-label">Color:</span><span class="selection">Carbon Black</span>
+  </div>`)
+	opts := ExtractOptions{
+		URL:        "https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8?th=1",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	}
+	first, err := ExtractAmazon(htmlA, opts)
+	if err != nil {
+		t.Fatalf("extract first: %v", err)
+	}
+	second, err := ExtractAmazon(htmlB, opts)
+	if err != nil {
+		t.Fatalf("extract second: %v", err)
+	}
+	if first.RequiresUserConfirmation {
+		t.Fatalf("selected dimensions should not require confirmation: %+v", first)
+	}
+	if first.VariantDimensions["color"] != "Carbon Black" || first.VariantDimensions["style"] != "Console" {
+		t.Fatalf("variant dimensions: %+v", first.VariantDimensions)
+	}
+	if first.Variant != "color=Carbon Black; style=Console" {
+		t.Fatalf("variant: %q", first.Variant)
+	}
+	if first.VariantKey == "" || !strings.HasPrefix(first.VariantKey, "asin-variant-sha256:") {
+		t.Fatalf("variant key: %q", first.VariantKey)
+	}
+	if second.VariantKey != first.VariantKey {
+		t.Fatalf("variant key must be stable across DOM order: first=%q second=%q", first.VariantKey, second.VariantKey)
+	}
+}
+
+func TestExtractAmazonMissingVariantDimensionsUsesExactURLKey(t *testing.T) {
+	got, err := ExtractAmazon(amazonVariantFixture(""), ExtractOptions{
+		URL:        "https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8?th=1&psc=1",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if !got.RequiresUserConfirmation {
+		t.Fatal("missing dimensions should require user confirmation")
+	}
+	if got.VariantKey == "" || !strings.HasPrefix(got.VariantKey, "exact-url-sha256:") {
+		t.Fatalf("variant key: %q", got.VariantKey)
+	}
+	if got.Variant != "" || len(got.VariantDimensions) != 0 {
+		t.Fatalf("unexpected variant fields: variant=%q dimensions=%+v", got.Variant, got.VariantDimensions)
+	}
+}
+
+func amazonVariantFixture(variationHTML string) string {
+	return `<!doctype html>
+<html><head><link rel="canonical" href="https://www.amazon.com/dp/B08H75RTZ8"></head>
+<body>
+  <span id="productTitle">Xbox Series X</span>
+  <div id="corePrice_feature_div"><span class="a-offscreen">$637.00</span></div>
+  <img id="landingImage" src="https://m.media-amazon.com/images/I/xbox.jpg">
+` + variationHTML + `
+</body></html>`
 }
 
 func TestExtractAmazonUnavailableProductStillSnapshots(t *testing.T) {

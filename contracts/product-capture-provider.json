@@ -20,7 +20,7 @@
       "input_schema_ref": "schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/input/v1",
       "input_schema_digest": "sha256:062d99dde8f4f6c421a67abd1aecda862361e039817bd4d86aacffe2b8066c25",
       "output_schema_ref": "schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/output/v1",
-      "output_schema_digest": "sha256:cfcc9eaec5fa2d444235a1e7d4d2219d22bb0ae1b5a51ca735f8f723bf6cf389",
+      "output_schema_digest": "sha256:d2e9b8b1d9c8b8e48b1d3789f6f6325e2c54aada7ab23d25d8c857a7ab20ab84",
       "artifacts": ["product_json"]
     }
   ],

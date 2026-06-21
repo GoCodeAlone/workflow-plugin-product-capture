@@ -136,10 +136,17 @@ IDs.
 ## Application Handling
 
 BuyMyWishlist should treat the proof preview as user-confirmation data, not as a
-silent purchase instruction. Expected fields include `title`, `canonical_url`,
-`external_id`, `price`, `currency`, `seller`, `ships_from`,
+silent purchase instruction. Expected fields include `title`, `requested_url`,
+`canonical_url`, `external_id`, `variant`, `variant_dimensions`,
+`variant_key`, `price`, `currency`, `seller`, `ships_from`,
 `shipping_summary`, `image_url`, `images`, `availability`, and
-`requires_user_confirmation`.
+`requires_user_confirmation`. `image_url` and `images` are URL strings only, not
+binary image payloads.
+
+If `variant_key` starts with `exact-url-sha256:`, Amazon did not expose selected
+variant dimensions reliably. BuyMyWishlist should keep
+`requires_user_confirmation` true and must not reuse the snapshot as a
+cross-request cache entry for other submitted URLs or other wishlist tenants.
 
 The app should persist the wfcompute `task_id`, `proof_id`, artifact hash, and
 selected preview fields with the wishlist item. It should not store raw HTML,
