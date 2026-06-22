@@ -8,11 +8,18 @@ browser runtime supplied by the worker image, extracts a bounded product
 snapshot, and returns provenance-marked data for user confirmation.
 
 Amazon snapshots include title, ASIN, canonical URL, representative images,
-availability, price when present, seller, ships-from party, shipping summary,
-shipping price when Amazon exposes it, estimated product-plus-shipping total,
-and a nullable `prime_eligible` flag. Unavailable products are still valid
+requested URL, variant dimensions when Amazon exposes them, a variant-safe
+cache key, availability, price when present, seller, ships-from party, shipping
+summary, shipping price when Amazon exposes it, estimated product-plus-shipping
+total, and a nullable `prime_eligible` flag. `image_url` and `images` are URL
+strings only, not binary image payloads. Unavailable products are still valid
 snapshots; they normally omit price and Prime status while preserving
 `availability`.
+
+When selected variant dimensions are unavailable, the provider sets
+`variant_key` to an `exact-url-sha256:` value and leaves
+`requires_user_confirmation` true. Consumers must not promote that snapshot as a
+cross-request cache entry for the same ASIN.
 
 ## Commands
 

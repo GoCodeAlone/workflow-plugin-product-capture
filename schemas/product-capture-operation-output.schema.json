@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/output/v1",
   "title": "Product capture operation output",
+  "description": "Provider stdout lists produced artifacts. The product_json artifact contains the product snapshot described in $defs.product_json.",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -15,5 +16,55 @@
       "uniqueItems": true
     }
   },
-  "required": ["artifacts"]
+  "required": ["artifacts"],
+  "$defs": {
+    "product_json": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string" },
+        "provider_version": { "type": "string" },
+        "merchant": { "type": "string" },
+        "url": { "type": "string", "format": "uri" },
+        "requested_url": { "type": "string", "format": "uri" },
+        "canonical_url": { "type": "string", "format": "uri" },
+        "external_id": { "type": "string", "description": "Selected marketplace identifier, ASIN for Amazon." },
+        "title": { "type": "string" },
+        "variant": { "type": "string" },
+        "variant_dimensions": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Selected product dimensions, for example color or style."
+        },
+        "variant_key": {
+          "type": "string",
+          "description": "Cache key for the selected variant. exact-url-sha256 means dimensions were unavailable and the snapshot must not be promoted across different submitted URLs."
+        },
+        "price": { "type": "string" },
+        "currency": { "type": "string" },
+        "seller": { "type": "string" },
+        "ships_from": { "type": "string" },
+        "shipping_summary": { "type": "string" },
+        "shipping_price": { "type": "string" },
+        "shipping_currency": { "type": "string" },
+        "estimated_total": { "type": "string" },
+        "estimated_total_currency": { "type": "string" },
+        "prime_eligible": { "type": "boolean" },
+        "image_url": { "type": "string", "format": "uri", "description": "Primary image URL. This is not binary image data." },
+        "images": {
+          "type": "array",
+          "items": { "type": "string", "format": "uri" },
+          "description": "Bounded image URL list. Entries are URLs, not binary image payloads."
+        },
+        "description": { "type": "string" },
+        "rating": { "type": "string" },
+        "review_count": { "type": "string" },
+        "availability": { "type": "string" },
+        "captured_at": { "type": "string", "format": "date-time" },
+        "confidence": { "type": "string" },
+        "requires_user_confirmation": { "type": "boolean" }
+      },
+      "required": ["provider", "url", "requested_url", "title", "variant_key", "captured_at", "requires_user_confirmation"]
+    }
+  }
 }
