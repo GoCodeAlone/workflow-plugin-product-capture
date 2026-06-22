@@ -81,6 +81,7 @@ func TestProductCaptureStepDispatchesDynamicURLAndReturnsPreview(t *testing.T) {
 				"title":                      "Xbox Series X",
 				"seller":                     "Sole Providers",
 				"prime_eligible":             false,
+				"requested_url":              "https://www.amazon.com/dp/B0DL7CKRJ5?th=1",
 				"variant_key":                "asin-variant-sha256:test",
 				"variant_dimensions":         map[string]any{"color": "Carbon Black"},
 				"requires_user_confirmation": false,
@@ -146,6 +147,9 @@ func TestProductCaptureStepDispatchesDynamicURLAndReturnsPreview(t *testing.T) {
 	}
 	if result.Output["variant_key"] != "asin-variant-sha256:test" || result.Output["requires_user_confirmation"] != false {
 		t.Fatalf("variant preview output: %+v", result.Output)
+	}
+	if result.Output["requested_url"] != "https://www.amazon.com/dp/B0DL7CKRJ5?th=1" {
+		t.Fatalf("requested_url preview output: %+v", result.Output)
 	}
 	if dims, ok := result.Output["variant_dimensions"].(map[string]any); !ok || dims["color"] != "Carbon Black" {
 		t.Fatalf("variant dimensions output: %+v", result.Output)

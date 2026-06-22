@@ -406,6 +406,7 @@ func flattenedPreviewField(key string) bool {
 		"provider",
 		"provider_version",
 		"rating",
+		"requested_url",
 		"requires_user_confirmation",
 		"review_count",
 		"seller",
