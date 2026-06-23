@@ -443,11 +443,44 @@ func TestBrowserDiagnosticScriptSharesCaptureBrowserIdentity(t *testing.T) {
 		"channel: 'chrome'",
 		"headless: true",
 		"--disable-blink-features=AutomationControlled",
-		"userAgent:",
+		"chromeUserAgent",
+		"Network.setUserAgentOverride",
 		"navigator, 'webdriver'",
 	} {
 		if !strings.Contains(playwrightBrowserDiagnosticScript, required) {
 			t.Fatalf("diagnostic script missing capture browser identity behavior %q", required)
+		}
+	}
+}
+
+func TestPlaywrightBrowserIdentityAvoidsMixedChromeVersionSignals(t *testing.T) {
+	if strings.Contains(playwrightBrowserPrelude, "Chrome/124.0.0.0") {
+		t.Fatalf("browser identity must not pin a stale Chrome version")
+	}
+	for _, required := range []string{
+		"browser.version()",
+		"normalizeChromeVersion",
+		"Network.setUserAgentOverride",
+		"userAgentMetadata",
+		"fullVersionList",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Fatalf("browser identity must align user agent and client hints; missing %q", required)
+		}
+	}
+}
+
+func TestPlaywrightBrowserIdentityAvoidsMixedPlatformSignals(t *testing.T) {
+	for _, required := range []string{
+		"navigatorPlatform: 'MacIntel'",
+		"userAgentDataPlatform: 'macOS'",
+		"platform: productCaptureBrowserIdentity.navigatorPlatform",
+		"Object.defineProperty(navigator, 'platform'",
+		"Object.defineProperty(navigator, 'userAgentData'",
+		"getHighEntropyValues",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Fatalf("browser identity must align JS platform signals; missing %q", required)
 		}
 	}
 }
