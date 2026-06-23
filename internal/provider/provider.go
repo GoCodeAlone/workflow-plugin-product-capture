@@ -1254,11 +1254,13 @@ main().catch((err) => {
 const playwrightBrowserDiagnosticScript = playwrightBrowserPrelude + `
 async function main() {
   const url = process.argv[2];
+  const requestedOrigin = new URL(url).origin;
   const browser = await launchChromeBrowser();
   const page = await browser.newPage();
-  await page.addInitScript(() => {
+  await page.addInitScript((origin) => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-  });
+    globalThis.__productCaptureDiagnosticOrigin = origin;
+  }, requestedOrigin);
   try {
     await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
     const result = await page.evaluate(async () => {
@@ -1367,14 +1369,20 @@ async function main() {
       };
       let postedToOrigin = false;
       let post_error = '';
+      const requestedOrigin = String(globalThis.__productCaptureDiagnosticOrigin || '');
+      const finalOrigin = new URL(location.href).origin;
       try {
-        const response = await fetch(location.href, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify(payload),
-          credentials: 'same-origin',
-        });
-        postedToOrigin = Boolean(response && response.ok);
+        if (requestedOrigin && finalOrigin !== requestedOrigin) {
+          post_error = 'final origin ' + finalOrigin + ' differs from requested origin ' + requestedOrigin + '; skipped diagnostic post';
+        } else {
+          const response = await fetch(location.href, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload),
+            credentials: 'same-origin',
+          });
+          postedToOrigin = Boolean(response && response.ok);
+        }
       } catch (err) {
         post_error = diagnosticErrorMessage(err);
       }

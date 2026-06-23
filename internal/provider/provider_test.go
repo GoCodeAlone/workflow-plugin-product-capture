@@ -311,7 +311,7 @@ global.fetch = async () => ({ ok: true, status: 204 });
 exports.chromium = {
   launch: async () => ({
     newPage: async () => ({
-      addInitScript: async (fn) => { fn(); },
+      addInitScript: async (fn, arg) => { fn(arg); },
       goto: async (url) => { global.location.href = url; return { status: () => 200 }; },
       url: () => global.location.href,
       evaluate: async (fn) => await fn(),
@@ -363,6 +363,75 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	}
 	if !got.PostedToOrigin {
 		t.Fatalf("diagnostic should post browser signals back to the controlled origin: %+v", got)
+	}
+}
+
+func TestBrowserDiagnosticSkipsPostAfterCrossOriginRedirect(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skipf("node not installed; CI provisions Node for generated Playwright script regressions: %v", err)
+	}
+	dir := t.TempDir()
+	moduleDir := filepath.Join(dir, "node_modules", "playwright")
+	if err := os.MkdirAll(moduleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(`
+global.navigator = {};
+Object.defineProperty(global.navigator, 'webdriver', { configurable: true, get: () => true });
+Object.defineProperty(global.navigator, 'userAgent', { configurable: true, get: () => 'Fake Chrome' });
+global.window = { matchMedia: () => ({ matches: false }) };
+global.screen = {};
+global.document = {
+  visibilityState: 'visible',
+  hasFocus: () => true,
+  createElement: () => ({ getContext: () => null }),
+  get cookie() { return ''; },
+};
+global.location = { href: 'https://diag.example.test/capture' };
+global.Intl = {
+  DateTimeFormat: () => ({ resolvedOptions: () => ({ timeZone: 'UTC' }) }),
+};
+global.fetch = async () => { throw new Error('fetch should not run after a cross-origin redirect'); };
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, arg) => { fn(arg); },
+      goto: async () => { global.location.href = 'https://unexpected.example.test/capture'; return { status: () => 302 }; },
+      url: () => global.location.href,
+      evaluate: async (fn) => await fn(),
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NODE_PATH", filepath.Join(dir, "node_modules"))
+
+	var stdout, stderr bytes.Buffer
+	code := Main([]string{"--browser-diagnostic-url", "https://diag.example.test/capture"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("diagnostic failed with code %d stderr=%s", code, stderr.String())
+	}
+
+	var got struct {
+		TargetURL      string `json:"target_url"`
+		FinalURL       string `json:"final_url"`
+		PostedToOrigin bool   `json:"posted_to_origin"`
+		PostError      string `json:"post_error"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode diagnostic output: %v\nstdout=%s", err, stdout.String())
+	}
+	if got.FinalURL != "https://unexpected.example.test/capture" {
+		t.Fatalf("final_url = %q", got.FinalURL)
+	}
+	if got.PostedToOrigin {
+		t.Fatalf("diagnostic posted after cross-origin redirect: %+v", got)
+	}
+	if !strings.Contains(got.PostError, "final origin") {
+		t.Fatalf("post_error should explain skipped cross-origin post: %+v", got)
 	}
 }
 
