@@ -105,8 +105,20 @@ func Main(args []string, stdout, stderr io.Writer, stdin ...io.Reader) int {
 	requestPath := fs.String("request", "", "path to product capture request JSON")
 	outputPath := fs.String("output", "", "path to write product snapshot JSON")
 	probe := fs.Bool("probe", false, "print provider capability probe")
+	browserDiagnosticURL := fs.String("browser-diagnostic-url", "", "operator-only URL for browser fingerprint diagnostics")
 	if err := fs.Parse(args); err != nil {
 		return 2
+	}
+	if *browserDiagnosticURL != "" {
+		if *probe || *requestPath != "" || *outputPath != "" {
+			fmt.Fprintln(stderr, "--browser-diagnostic-url cannot be combined with --probe, --request, or --output")
+			return 2
+		}
+		if err := runBrowserDiagnostic(*browserDiagnosticURL, stdout); err != nil {
+			fmt.Fprintf(stderr, "browser diagnostic: %v\n", err)
+			return 1
+		}
+		return 0
 	}
 	if *probe {
 		if err := WriteProbe(stdout); err != nil {
@@ -533,6 +545,52 @@ func writePlaywrightScript() (string, error) {
 	return path, nil
 }
 
+func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse diagnostic url: %w", err)
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return fmt.Errorf("unsupported diagnostic url scheme %q", parsed.Scheme)
+	}
+	if parsed.Hostname() == "" {
+		return errors.New("diagnostic url host is required")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	scriptPath, err := writeBrowserDiagnosticScript()
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(filepath.Dir(scriptPath))
+	cmd := exec.CommandContext(ctx, "node", scriptPath, rawURL)
+	cmd.Env = os.Environ()
+	var stderr bytes.Buffer
+	cmd.Stdout = stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("playwright diagnostic failed: %s", msg)
+	}
+	return nil
+}
+
+func writeBrowserDiagnosticScript() (string, error) {
+	dir, err := os.MkdirTemp("", "product-capture-browser-diagnostic-*")
+	if err != nil {
+		return "", fmt.Errorf("create browser diagnostic temp dir: %w", err)
+	}
+	path := filepath.Join(dir, "diagnostic.js")
+	if err := os.WriteFile(path, []byte(playwrightBrowserDiagnosticScript), 0o600); err != nil {
+		os.RemoveAll(dir)
+		return "", fmt.Errorf("write browser diagnostic script: %w", err)
+	}
+	return path, nil
+}
+
 func timeoutSeconds(value int) int {
 	if value <= 0 {
 		return 45
@@ -589,7 +647,7 @@ func supportedHosts() []string {
 	return out
 }
 
-const playwrightCaptureScript = `
+const playwrightBrowserPrelude = `
 const { chromium, errors } = require('playwright');
 
 async function launchChromeBrowser() {
@@ -623,6 +681,9 @@ async function launchChromeBrowser() {
     close: () => browser.close(),
   };
 }
+`
+
+const playwrightCaptureScript = playwrightBrowserPrelude + `
 
 function isTransientNavigationError(err) {
   const message = err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
@@ -1179,6 +1240,166 @@ async function main() {
     }
     await clearAmazonContinuationMarkers(page);
     process.stdout.write(await page.content());
+  } finally {
+    await browser.close();
+  }
+}
+
+main().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`
+
+const playwrightBrowserDiagnosticScript = playwrightBrowserPrelude + `
+async function main() {
+  const url = process.argv[2];
+  const requestedOrigin = new URL(url).origin;
+  const browser = await launchChromeBrowser();
+  const page = await browser.newPage();
+  await page.addInitScript((origin) => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+    globalThis.__productCaptureDiagnosticOrigin = origin;
+  }, requestedOrigin);
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const result = await page.evaluate(async () => {
+      const diagnosticErrorMessage = (err) => err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
+      const safe = (fn, fallback = null) => {
+        try {
+          const value = fn();
+          return value === undefined ? null : value;
+        } catch {
+          return fallback;
+        }
+      };
+      const safeArray = (value) => {
+        try {
+          return Array.from(value || []).map((item) => String(item)).slice(0, 20);
+        } catch {
+          return [];
+        }
+      };
+      const pluginNames = safe(() => Array.from(navigator.plugins || []).map((plugin) => String(plugin.name || '')).filter(Boolean), []);
+      const mimeTypeNames = safe(() => Array.from(navigator.mimeTypes || []).map((mime) => String(mime.type || '')).filter(Boolean), []);
+      const userAgentData = safe(() => navigator.userAgentData ? {
+        brands: Array.from(navigator.userAgentData.brands || []),
+        mobile: Boolean(navigator.userAgentData.mobile),
+        platform: navigator.userAgentData.platform || '',
+      } : null, null);
+      let highEntropyValues = null;
+      if (navigator.userAgentData && typeof navigator.userAgentData.getHighEntropyValues === 'function') {
+        try {
+          highEntropyValues = await navigator.userAgentData.getHighEntropyValues([
+            'architecture',
+            'bitness',
+            'model',
+            'platform',
+            'platformVersion',
+            'uaFullVersion',
+            'fullVersionList',
+          ]);
+        } catch {}
+      }
+      const webgl = safe(() => {
+        const canvas = document.createElement('canvas');
+        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+        if (!gl) return { available: false };
+        const debugInfo = gl.getExtension('WEBGL_debug_renderer_info');
+        return {
+          available: true,
+          vendor: debugInfo ? gl.getParameter(debugInfo.UNMASKED_VENDOR_WEBGL) : gl.getParameter(gl.VENDOR),
+          renderer: debugInfo ? gl.getParameter(debugInfo.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER),
+        };
+      }, { available: false });
+      const cookieValue = safe(() => document.cookie || '', '');
+      const browserSignals = {
+        navigator: {
+          webdriver: safe(() => navigator.webdriver, null),
+          user_agent: safe(() => navigator.userAgent, ''),
+          user_agent_data: userAgentData,
+          user_agent_high_entropy: highEntropyValues,
+          language: safe(() => navigator.language, ''),
+          languages: safeArray(safe(() => navigator.languages, [])),
+          platform: safe(() => navigator.platform, ''),
+          hardware_concurrency: safe(() => navigator.hardwareConcurrency, null),
+          device_memory: safe(() => navigator.deviceMemory, null),
+          max_touch_points: safe(() => navigator.maxTouchPoints, null),
+          plugins: {
+            length: safe(() => navigator.plugins.length, 0),
+            names: pluginNames,
+          },
+          mime_types: {
+            length: safe(() => navigator.mimeTypes.length, 0),
+            names: mimeTypeNames,
+          },
+        },
+        window: {
+          outer_width: safe(() => window.outerWidth, null),
+          outer_height: safe(() => window.outerHeight, null),
+          inner_width: safe(() => window.innerWidth, null),
+          inner_height: safe(() => window.innerHeight, null),
+          device_pixel_ratio: safe(() => window.devicePixelRatio, null),
+          chrome_runtime_present: safe(() => Boolean(window.chrome && window.chrome.runtime), false),
+          prefers_color_scheme_dark: safe(() => window.matchMedia('(prefers-color-scheme: dark)').matches, null),
+        },
+        screen: {
+          width: safe(() => screen.width, null),
+          height: safe(() => screen.height, null),
+          avail_width: safe(() => screen.availWidth, null),
+          avail_height: safe(() => screen.availHeight, null),
+          color_depth: safe(() => screen.colorDepth, null),
+          pixel_depth: safe(() => screen.pixelDepth, null),
+        },
+        document: {
+          visibility_state: safe(() => document.visibilityState, ''),
+          has_focus: safe(() => document.hasFocus(), null),
+          cookie_present: Boolean(cookieValue),
+          cookie_length: String(cookieValue || '').length,
+        },
+        intl: {
+          timezone: safe(() => Intl.DateTimeFormat().resolvedOptions().timeZone, ''),
+        },
+        webgl,
+      };
+      const payload = {
+        source: 'product_capture_browser_diagnostic',
+        final_url: String(location.href),
+        browser_signals: browserSignals,
+      };
+      let postedToOrigin = false;
+      let post_error = '';
+      const requestedOrigin = String(globalThis.__productCaptureDiagnosticOrigin || '');
+      const finalOrigin = new URL(location.href).origin;
+      try {
+        if (requestedOrigin && finalOrigin !== requestedOrigin) {
+          post_error = 'final origin ' + finalOrigin + ' differs from requested origin ' + requestedOrigin + '; skipped diagnostic post';
+        } else {
+          const response = await fetch(location.href, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify(payload),
+            credentials: 'same-origin',
+          });
+          postedToOrigin = Boolean(response && response.ok);
+        }
+      } catch (err) {
+        post_error = diagnosticErrorMessage(err);
+      }
+      return {
+        final_url: String(location.href),
+        posted_to_origin: postedToOrigin,
+        post_error,
+        browser_signals: browserSignals,
+      };
+    });
+    process.stdout.write(JSON.stringify({
+      target_url: url,
+      final_url: result.final_url,
+      posted_to_origin: result.posted_to_origin,
+      post_error: result.post_error,
+      browser_signals: result.browser_signals,
+    }, null, 2) + '\n');
   } finally {
     await browser.close();
   }

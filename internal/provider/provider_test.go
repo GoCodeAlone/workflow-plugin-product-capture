@@ -267,6 +267,191 @@ func TestMainCapturesAmazonFixture(t *testing.T) {
 	}
 }
 
+func TestMainRunsBrowserDiagnosticWithFakePlaywright(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skipf("node not installed; CI provisions Node for generated Playwright script regressions: %v", err)
+	}
+	dir := t.TempDir()
+	moduleDir := filepath.Join(dir, "node_modules", "playwright")
+	if err := os.MkdirAll(moduleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(`
+global.navigator = {};
+Object.defineProperty(global.navigator, 'webdriver', { configurable: true, get: () => true });
+Object.defineProperty(global.navigator, 'userAgent', { configurable: true, get: () => 'Fake Chrome' });
+Object.defineProperty(global.navigator, 'language', { configurable: true, get: () => 'en-US' });
+Object.defineProperty(global.navigator, 'languages', { configurable: true, get: () => ['en-US', 'en'] });
+Object.defineProperty(global.navigator, 'platform', { configurable: true, get: () => 'Linux x86_64' });
+Object.defineProperty(global.navigator, 'hardwareConcurrency', { configurable: true, get: () => 8 });
+Object.defineProperty(global.navigator, 'deviceMemory', { configurable: true, get: () => 8 });
+Object.defineProperty(global.navigator, 'maxTouchPoints', { configurable: true, get: () => 0 });
+Object.defineProperty(global.navigator, 'plugins', { configurable: true, get: () => [{ name: 'PDF Viewer' }] });
+Object.defineProperty(global.navigator, 'mimeTypes', { configurable: true, get: () => [{ type: 'application/pdf' }] });
+global.screen = { width: 1440, height: 900, availWidth: 1440, availHeight: 855, colorDepth: 24, pixelDepth: 24 };
+global.window = {
+  outerWidth: 1440,
+  outerHeight: 900,
+  innerWidth: 1280,
+  innerHeight: 720,
+  devicePixelRatio: 1,
+  matchMedia: (query) => ({ matches: query.includes('prefers-color-scheme') }),
+  chrome: { runtime: {} },
+};
+global.document = {
+  visibilityState: 'visible',
+  hasFocus: () => true,
+  get cookie() { return 'redacted=value'; },
+};
+global.location = { href: 'https://diag.example.test/capture' };
+global.Intl = {
+  DateTimeFormat: () => ({ resolvedOptions: () => ({ timeZone: 'UTC' }) }),
+};
+global.fetch = async () => ({ ok: true, status: 204 });
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, arg) => { fn(arg); },
+      goto: async (url) => { global.location.href = url; return { status: () => 200 }; },
+      url: () => global.location.href,
+      evaluate: async (fn) => await fn(),
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NODE_PATH", filepath.Join(dir, "node_modules"))
+
+	var stdout, stderr bytes.Buffer
+	code := Main([]string{"--browser-diagnostic-url", "https://diag.example.test/capture"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("diagnostic failed with code %d stderr=%s", code, stderr.String())
+	}
+
+	var got struct {
+		TargetURL      string `json:"target_url"`
+		FinalURL       string `json:"final_url"`
+		PostedToOrigin bool   `json:"posted_to_origin"`
+		BrowserSignals struct {
+			Navigator struct {
+				Webdriver any    `json:"webdriver"`
+				UserAgent string `json:"user_agent"`
+			} `json:"navigator"`
+			Document struct {
+				CookiePresent bool `json:"cookie_present"`
+				CookieLength  int  `json:"cookie_length"`
+			} `json:"document"`
+		} `json:"browser_signals"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode diagnostic output: %v\nstdout=%s", err, stdout.String())
+	}
+	if got.TargetURL != "https://diag.example.test/capture" || got.FinalURL != got.TargetURL {
+		t.Fatalf("unexpected diagnostic URLs: %+v", got)
+	}
+	if got.BrowserSignals.Navigator.Webdriver != nil {
+		t.Fatalf("diagnostic did not apply webdriver guard: %#v", got.BrowserSignals.Navigator.Webdriver)
+	}
+	if got.BrowserSignals.Navigator.UserAgent != "Fake Chrome" {
+		t.Fatalf("user agent = %q", got.BrowserSignals.Navigator.UserAgent)
+	}
+	if !got.BrowserSignals.Document.CookiePresent || got.BrowserSignals.Document.CookieLength == 0 {
+		t.Fatalf("diagnostic should report cookie presence without values: %+v", got.BrowserSignals.Document)
+	}
+	if !got.PostedToOrigin {
+		t.Fatalf("diagnostic should post browser signals back to the controlled origin: %+v", got)
+	}
+}
+
+func TestBrowserDiagnosticSkipsPostAfterCrossOriginRedirect(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skipf("node not installed; CI provisions Node for generated Playwright script regressions: %v", err)
+	}
+	dir := t.TempDir()
+	moduleDir := filepath.Join(dir, "node_modules", "playwright")
+	if err := os.MkdirAll(moduleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(`
+global.navigator = {};
+Object.defineProperty(global.navigator, 'webdriver', { configurable: true, get: () => true });
+Object.defineProperty(global.navigator, 'userAgent', { configurable: true, get: () => 'Fake Chrome' });
+global.window = { matchMedia: () => ({ matches: false }) };
+global.screen = {};
+global.document = {
+  visibilityState: 'visible',
+  hasFocus: () => true,
+  createElement: () => ({ getContext: () => null }),
+  get cookie() { return ''; },
+};
+global.location = { href: 'https://diag.example.test/capture' };
+global.Intl = {
+  DateTimeFormat: () => ({ resolvedOptions: () => ({ timeZone: 'UTC' }) }),
+};
+global.fetch = async () => { throw new Error('fetch should not run after a cross-origin redirect'); };
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, arg) => { fn(arg); },
+      goto: async () => { global.location.href = 'https://unexpected.example.test/capture'; return { status: () => 302 }; },
+      url: () => global.location.href,
+      evaluate: async (fn) => await fn(),
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("NODE_PATH", filepath.Join(dir, "node_modules"))
+
+	var stdout, stderr bytes.Buffer
+	code := Main([]string{"--browser-diagnostic-url", "https://diag.example.test/capture"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("diagnostic failed with code %d stderr=%s", code, stderr.String())
+	}
+
+	var got struct {
+		TargetURL      string `json:"target_url"`
+		FinalURL       string `json:"final_url"`
+		PostedToOrigin bool   `json:"posted_to_origin"`
+		PostError      string `json:"post_error"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode diagnostic output: %v\nstdout=%s", err, stdout.String())
+	}
+	if got.FinalURL != "https://unexpected.example.test/capture" {
+		t.Fatalf("final_url = %q", got.FinalURL)
+	}
+	if got.PostedToOrigin {
+		t.Fatalf("diagnostic posted after cross-origin redirect: %+v", got)
+	}
+	if !strings.Contains(got.PostError, "final origin") {
+		t.Fatalf("post_error should explain skipped cross-origin post: %+v", got)
+	}
+}
+
+func TestBrowserDiagnosticScriptSharesCaptureBrowserIdentity(t *testing.T) {
+	if !strings.Contains(playwrightBrowserDiagnosticScript, "launchChromeBrowser") {
+		t.Fatalf("diagnostic script must use the shared browser launcher")
+	}
+	for _, required := range []string{
+		"channel: 'chrome'",
+		"headless: true",
+		"--disable-blink-features=AutomationControlled",
+		"userAgent:",
+		"navigator, 'webdriver'",
+	} {
+		if !strings.Contains(playwrightBrowserDiagnosticScript, required) {
+			t.Fatalf("diagnostic script missing capture browser identity behavior %q", required)
+		}
+	}
+}
+
 func TestMainRunsWorkflowComputeDynamicProviderEnvelope(t *testing.T) {
 	dir := t.TempDir()
 	wd, err := os.Getwd()

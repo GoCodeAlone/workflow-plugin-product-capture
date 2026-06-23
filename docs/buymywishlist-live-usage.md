@@ -31,6 +31,23 @@ continuation gates after a successful benign pass-through. It must not reference
 a logged-in Amazon or operator browser profile, and operators can reset the
 capture identity by deleting the directory.
 
+If Amazon starts returning interstitials or CAPTCHA pages, first run a browser
+diagnostic from the same staging worker/runtime before changing capture
+behavior:
+
+```sh
+product-capture-provider \
+  --browser-diagnostic-url https://<diagnostic-host>/product-capture-browser
+```
+
+The endpoint should log the first navigation request, the diagnostic POST
+request, request headers, TLS/client metadata, remote IP/ASN, and the posted
+browser-signal JSON. The provider output and POST body intentionally report only
+cookie presence and length, never cookie values. Compare the staging worker
+result against a normal Chrome visit and a local Playwright run so mismatched
+client hints, platform, headless/browser surfaces, locale/timezone, WebGL, and
+network-origin signals are visible before making further capture changes.
+
 The deployment is not live-ready until a BMW-shaped provider task returns an
 accepted proof from a `product-capture-browser` agent in the target wfcompute
 environment.

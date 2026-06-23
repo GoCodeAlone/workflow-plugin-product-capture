@@ -76,6 +76,26 @@ non-login Amazon friction cookies persist after benign continuation gates. Do
 not point it at a credentialed browser profile, and delete the directory to
 reset the capture identity.
 
+## Browser diagnostics
+
+Operators can run the provider binary against a controlled diagnostic endpoint
+to inspect the browser identity used by live capture without weakening the
+normal Amazon-only workload validation:
+
+```sh
+product-capture-provider \
+  --browser-diagnostic-url https://<diagnostic-host>/product-capture-browser
+```
+
+The diagnostic uses the same Chrome launch path as product capture, navigates to
+the supplied URL, collects bounded browser-side signals, posts those signals
+back to the same origin as JSON, and prints the same JSON to stdout. It reports
+cookie presence and length only; it does not emit cookie values.
+
+The diagnostic endpoint should log request headers, TLS/client metadata, remote
+IP/ASN, and the POST body. Compare that output with a normal Chrome visit before
+changing capture behavior. Do not run it from a credentialed shopping profile.
+
 ## Workflow step
 
 Use `step.product_capture` when a Workflow app needs to submit a product URL to
