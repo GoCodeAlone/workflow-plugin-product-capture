@@ -474,6 +474,7 @@ func TestPlaywrightBrowserIdentityAvoidsMixedPlatformSignals(t *testing.T) {
 	for _, required := range []string{
 		"navigatorPlatform: 'MacIntel'",
 		"userAgentDataPlatform: 'macOS'",
+		"platform: productCaptureBrowserIdentity.navigatorPlatform",
 		"Object.defineProperty(navigator, 'platform'",
 		"Object.defineProperty(navigator, 'userAgentData'",
 		"getHighEntropyValues",

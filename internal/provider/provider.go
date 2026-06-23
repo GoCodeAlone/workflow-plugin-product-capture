@@ -729,7 +729,7 @@ async function installCaptureBrowserIdentity(page, rawChromeVersion) {
       await session.send('Network.setUserAgentOverride', {
         userAgent,
         acceptLanguage: 'en-US,en;q=0.9',
-        platform: productCaptureBrowserIdentity.userAgentDataPlatform,
+        platform: productCaptureBrowserIdentity.navigatorPlatform,
         userAgentMetadata,
       });
     }
