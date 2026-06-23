@@ -650,6 +650,147 @@ func supportedHosts() []string {
 const playwrightBrowserPrelude = `
 const { chromium, errors } = require('playwright');
 
+const productCaptureBrowserIdentity = {
+  userAgentPlatform: 'Macintosh; Intel Mac OS X 10_15_7',
+  navigatorPlatform: 'MacIntel',
+  userAgentDataPlatform: 'macOS',
+  platformVersion: '10_15_7',
+};
+
+function normalizeChromeVersion(rawVersion) {
+  const fallback = '149.0.0.0';
+  const match = String(rawVersion || '').match(/(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?/);
+  if (!match) return fallback;
+  return [
+    match[1],
+    match[2] || '0',
+    match[3] || '0',
+    match[4] || '0',
+  ].join('.');
+}
+
+function chromeMajorVersion(chromeVersion) {
+  return String(chromeVersion || '').split('.')[0] || '149';
+}
+
+function chromeUserAgent(chromeVersion) {
+  return 'Mozilla/5.0 (' + productCaptureBrowserIdentity.userAgentPlatform + ') AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + chromeVersion + ' Safari/537.36';
+}
+
+function chromeBrandList(chromeMajor) {
+  return [
+    { brand: 'Google Chrome', version: chromeMajor },
+    { brand: 'Chromium', version: chromeMajor },
+    { brand: 'Not)A;Brand', version: '24' },
+  ];
+}
+
+function chromeFullVersionList(chromeVersion) {
+  return [
+    { brand: 'Google Chrome', version: chromeVersion },
+    { brand: 'Chromium', version: chromeVersion },
+    { brand: 'Not)A;Brand', version: '24.0.0.0' },
+  ];
+}
+
+function chromeUserAgentMetadata(chromeVersion) {
+  const chromeMajor = chromeMajorVersion(chromeVersion);
+  return {
+    brands: chromeBrandList(chromeMajor),
+    fullVersionList: chromeFullVersionList(chromeVersion),
+    fullVersion: chromeVersion,
+    platform: productCaptureBrowserIdentity.userAgentDataPlatform,
+    platformVersion: productCaptureBrowserIdentity.platformVersion,
+    architecture: 'x86',
+    model: '',
+    mobile: false,
+    bitness: '64',
+  };
+}
+
+function browserRuntimeVersion(browser) {
+  try {
+    if (browser && typeof browser.version === 'function') {
+      return browser.version();
+    }
+  } catch {}
+  return '';
+}
+
+async function installCaptureBrowserIdentity(page, rawChromeVersion) {
+  const chromeVersion = normalizeChromeVersion(rawChromeVersion);
+  const chromeMajor = chromeMajorVersion(chromeVersion);
+  const userAgent = chromeUserAgent(chromeVersion);
+  const userAgentMetadata = chromeUserAgentMetadata(chromeVersion);
+  try {
+    const context = page && typeof page.context === 'function' ? page.context() : null;
+    const session = context && typeof context.newCDPSession === 'function' ? await context.newCDPSession(page) : null;
+    if (session && typeof session.send === 'function') {
+      await session.send('Network.setUserAgentOverride', {
+        userAgent,
+        acceptLanguage: 'en-US,en;q=0.9',
+        platform: productCaptureBrowserIdentity.userAgentDataPlatform,
+        userAgentMetadata,
+      });
+    }
+  } catch {}
+  await page.addInitScript((identity) => {
+    if (typeof navigator === 'undefined') return;
+    try {
+      Object.defineProperty(navigator, 'webdriver', { configurable: true, get: () => undefined });
+    } catch {}
+    try {
+      Object.defineProperty(navigator, 'platform', { configurable: true, get: () => identity.navigatorPlatform });
+    } catch {}
+    const highEntropyValues = {
+      architecture: 'x86',
+      bitness: '64',
+      brands: identity.brands,
+      fullVersionList: identity.fullVersionList,
+      mobile: false,
+      model: '',
+      platform: identity.userAgentDataPlatform,
+      platformVersion: identity.platformVersion,
+      uaFullVersion: identity.chromeVersion,
+      wow64: false,
+    };
+    const userAgentData = {
+      brands: identity.brands,
+      mobile: false,
+      platform: identity.userAgentDataPlatform,
+      getHighEntropyValues: async (hints) => {
+        const result = {
+          brands: identity.brands,
+          mobile: false,
+          platform: identity.userAgentDataPlatform,
+        };
+        for (const hint of Array.from(hints || [])) {
+          if (Object.prototype.hasOwnProperty.call(highEntropyValues, hint)) {
+            result[hint] = highEntropyValues[hint];
+          }
+        }
+        return result;
+      },
+      toJSON: () => ({
+        brands: identity.brands,
+        mobile: false,
+        platform: identity.userAgentDataPlatform,
+      }),
+    };
+    try {
+      Object.defineProperty(navigator, 'userAgentData', { configurable: true, get: () => userAgentData });
+    } catch {}
+  }, {
+    chromeVersion,
+    chromeMajorVersion: chromeMajor,
+    navigatorPlatform: productCaptureBrowserIdentity.navigatorPlatform,
+    userAgentDataPlatform: productCaptureBrowserIdentity.userAgentDataPlatform,
+    platformVersion: productCaptureBrowserIdentity.platformVersion,
+    brands: chromeBrandList(chromeMajor),
+    fullVersionList: chromeFullVersionList(chromeVersion),
+  });
+}
+
 async function launchChromeBrowser() {
   const launchOptions = {
     channel: 'chrome',
@@ -661,25 +802,38 @@ async function launchChromeBrowser() {
       '--disable-dev-shm-usage',
     ],
   };
-  const pageOptions = {
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  const contextOptions = {
+    viewport: { width: 1280, height: 720 },
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+    extraHTTPHeaders: {
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
   };
   const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();
   if (profileDir) {
     const context = await chromium.launchPersistentContext(profileDir, {
       ...launchOptions,
-      ...pageOptions,
+      ...contextOptions,
     });
     return {
       newPage: () => context.newPage(),
+      version: () => browserRuntimeVersion(context && typeof context.browser === 'function' ? context.browser() : null),
       close: () => context.close(),
     };
   }
   const browser = await chromium.launch({ ...launchOptions });
   return {
-    newPage: () => browser.newPage(pageOptions),
+    newPage: () => browser.newPage(contextOptions),
+    version: () => browserRuntimeVersion(browser),
     close: () => browser.close(),
   };
+}
+
+async function newCapturePage(browser) {
+  const page = await browser.newPage();
+  await installCaptureBrowserIdentity(page, browser.version());
+  return page;
 }
 `
 
@@ -1185,9 +1339,8 @@ async function main() {
   const timeout = Number(process.argv[3] || 45000);
   const deadline = Date.now() + timeout;
   const browser = await launchChromeBrowser();
-  const page = await browser.newPage();
+  const page = await newCapturePage(browser);
   await page.addInitScript((requestedURL) => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     globalThis.__productCaptureRequestedURL = requestedURL;
   }, url);
   try {
@@ -1256,9 +1409,8 @@ async function main() {
   const url = process.argv[2];
   const requestedOrigin = new URL(url).origin;
   const browser = await launchChromeBrowser();
-  const page = await browser.newPage();
+  const page = await newCapturePage(browser);
   await page.addInitScript((origin) => {
-    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     globalThis.__productCaptureDiagnosticOrigin = origin;
   }, requestedOrigin);
   try {
