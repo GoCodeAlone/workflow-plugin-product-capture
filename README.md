@@ -70,6 +70,12 @@ The image contains Node, the Playwright package, and Google Chrome. It sets
 `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1` so Playwright uses the installed Chrome
 channel rather than downloading bundled Chromium.
 
+Set `PRODUCT_CAPTURE_BROWSER_PROFILE_DIR` on a retained provider worker only
+when anonymous Chrome state should survive between captures. This lets
+non-login Amazon friction cookies persist after benign continuation gates. Do
+not point it at a credentialed browser profile, and delete the directory to
+reset the capture identity.
+
 ## Workflow step
 
 Use `step.product_capture` when a Workflow app needs to submit a product URL to

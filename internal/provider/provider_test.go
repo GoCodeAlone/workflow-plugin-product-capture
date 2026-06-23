@@ -769,6 +769,69 @@ func TestPlaywrightScriptPrefersStandardChromeChannel(t *testing.T) {
 	}
 }
 
+func TestPlaywrightScriptUsesPersistentProfileWhenConfigured(t *testing.T) {
+	profileDir := filepath.Join(t.TempDir(), "chrome-profile")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
+	fakePlaywright := fmt.Sprintf(`
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: '', textContent: ' Echo Dot ' }] : [],
+    querySelector: (selector) => {
+      if (selector === '#landingImage') return { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+      return null;
+    },
+  };
+  try {
+    return fn();
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => { throw new Error('ephemeral browser launch used despite configured profile'); },
+  launchPersistentContext: async (userDataDir, options) => {
+    if (userDataDir !== %q) throw new Error('profile dir mismatch: ' + userDataDir);
+    if (!options || options.channel !== 'chrome') throw new Error('standard Chrome channel not preserved');
+    return {
+      newPage: async () => ({
+        addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+        goto: async () => {},
+        url: () => 'https://www.amazon.com/dp/B09B8V1LZ3',
+        locator: (selector) => {
+          if (selector === 'form[action*="/errors/validateCaptcha"]') return { count: async () => 0 };
+          return { count: async () => 0, first: () => ({ click: async () => {} }) };
+        },
+        waitForLoadState: async () => {},
+        waitForTimeout: async () => {},
+        waitForFunction: async (fn) => {
+          if (!withDocument(fn)) throw new TimeoutError('timeout');
+        },
+        evaluate: async (fn) => withDocument(fn),
+        content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+      }),
+      close: async () => {},
+    };
+  },
+};
+exports.errors = { TimeoutError };
+`, profileDir)
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script failed with configured persistent profile: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html: %s", stdout.String())
+	}
+}
+
 func TestPlaywrightScriptUsesExtractorCompatibleProductTitleEvidence(t *testing.T) {
 	if strings.Contains(playwrightCaptureScript, "locator('#productTitle').waitFor") {
 		t.Fatalf("playwright script uses strict #productTitle locator; Amazon may render a visible span and hidden input with that id")
