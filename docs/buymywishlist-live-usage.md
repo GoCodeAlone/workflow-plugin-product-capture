@@ -24,6 +24,13 @@ have:
 - a scoped task token for BuyMyWishlist. Do not use a dashboard admin,
   bootstrap, or operator token from the application.
 
+Retained `product-capture-browser` workers may set
+`PRODUCT_CAPTURE_BROWSER_PROFILE_DIR` to an agent-local directory when anonymous
+Chrome state should persist between captures. This can reduce repeated Amazon
+continuation gates after a successful benign pass-through. It must not reference
+a logged-in Amazon or operator browser profile, and operators can reset the
+capture identity by deleting the directory.
+
 The deployment is not live-ready until a BMW-shaped provider task returns an
 accepted proof from a `product-capture-browser` agent in the target wfcompute
 environment.

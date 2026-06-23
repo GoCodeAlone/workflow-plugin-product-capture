@@ -589,7 +589,7 @@ const playwrightCaptureScript = `
 const { chromium, errors } = require('playwright');
 
 async function launchChromeBrowser() {
-  return await chromium.launch({
+  const launchOptions = {
     channel: 'chrome',
     headless: true,
     args: [
@@ -598,7 +598,26 @@ async function launchChromeBrowser() {
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
     ],
-  });
+  };
+  const pageOptions = {
+    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  };
+  const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();
+  if (profileDir) {
+    const context = await chromium.launchPersistentContext(profileDir, {
+      ...launchOptions,
+      ...pageOptions,
+    });
+    return {
+      newPage: () => context.newPage(),
+      close: () => context.close(),
+    };
+  }
+  const browser = await chromium.launch({ ...launchOptions });
+  return {
+    newPage: () => browser.newPage(pageOptions),
+    close: () => browser.close(),
+  };
 }
 
 function isTransientNavigationError(err) {
@@ -1101,9 +1120,7 @@ async function main() {
   const timeout = Number(process.argv[3] || 45000);
   const deadline = Date.now() + timeout;
   const browser = await launchChromeBrowser();
-  const page = await browser.newPage({
-    userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-  });
+  const page = await browser.newPage();
   await page.addInitScript((requestedURL) => {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     globalThis.__productCaptureRequestedURL = requestedURL;
