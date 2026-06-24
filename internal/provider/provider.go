@@ -1353,19 +1353,20 @@ async function probeAmazonInterstitial(page, requestedURL) {
 async function hasAmazonInterstitial(page, requestedURL, deadline) {
   const maxAttempts = 5;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const budget = deadline ? remainingTimeout(deadline) : 1000;
+    if (deadline && budget <= 0) return !await productTitleReady(page, requestedURL).catch(() => false);
     try {
       return await probeAmazonInterstitial(page, requestedURL);
     } catch (err) {
       if (!isTransientNavigationError(err)) return true;
-      if (await productTitleReady(page, requestedURL).catch(() => false)) return false;
+      if ((!deadline || remainingTimeout(deadline) > 0) && await productTitleReady(page, requestedURL).catch(() => false)) return false;
       if (attempt >= maxAttempts - 1) break;
-      const waitBudget = deadline ? remainingTimeout(deadline) : 1000;
-      const backoff = Math.min(250 * (attempt + 1), waitBudget);
+      const backoff = Math.min(250 * (attempt + 1), budget);
       if (backoff <= 0) break;
       if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(backoff);
     }
   }
-  if (await productTitleReady(page, requestedURL).catch(() => false)) return false;
+  if ((!deadline || remainingTimeout(deadline) > 0) && await productTitleReady(page, requestedURL).catch(() => false)) return false;
   return true;
 }
 

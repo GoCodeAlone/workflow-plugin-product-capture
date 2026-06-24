@@ -4595,6 +4595,21 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 	}
 }
 
+func TestPlaywrightScriptChecksInterstitialProbeBudgetBeforeAttempt(t *testing.T) {
+	required := strings.Join([]string{
+		"async function hasAmazonInterstitial(page, requestedURL, deadline) {",
+		"  const maxAttempts = 5;",
+		"  for (let attempt = 0; attempt < maxAttempts; attempt++) {",
+		"    const budget = deadline ? remainingTimeout(deadline) : 1000;",
+		"    if (deadline && budget <= 0) return !await productTitleReady(page, requestedURL).catch(() => false);",
+		"    try {",
+		"      return await probeAmazonInterstitial(page, requestedURL);",
+	}, "\n")
+	if !strings.Contains(playwrightCaptureScript, required) {
+		t.Fatal("playwright script must check capture budget before starting each interstitial probe")
+	}
+}
+
 func TestPlaywrightScriptRetriesPlainNavigationTimeoutWithinBudget(t *testing.T) {
 	for _, required := range []string{
 		"'Timeout',",
