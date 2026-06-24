@@ -1617,17 +1617,16 @@ async function main() {
   const url = process.argv[2];
   const timeout = Number(process.argv[3] || 45000);
   const deadline = Date.now() + timeout;
-  let lastErr;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
       await captureMain(url, deadline);
       return;
     } catch (err) {
-      lastErr = err;
-      if (!isBrowserTargetCrashError(err) || attempt >= 1 || remainingTimeout(deadline) <= 0) throw err;
+      if (isBrowserTargetCrashError(err) && attempt < 1 && remainingTimeout(deadline) > 0) continue;
+      throw err;
     }
   }
-  throw lastErr || new Error('capture failed');
+  throw new Error('capture failed');
 }
 
 async function captureMain(url, deadline) {
