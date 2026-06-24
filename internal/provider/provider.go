@@ -1401,12 +1401,14 @@ async function amazonCaptureDiagnostics(page, requestedURL) {
   try {
     captchaFormCount = await countAmazonCaptchaForms(page);
   } catch (err) {
+    if (isBrowserTargetCrashError(err)) throw err;
     diagnosticsAvailable = false;
     diagnosticsError = 'captcha_form_count_failed:' + diagnosticErrorToken(err);
   }
   try {
     signals = await collectAmazonPageSignals(page, requestedURL);
   } catch (err) {
+    if (isBrowserTargetCrashError(err)) throw err;
     diagnosticsAvailable = false;
     signalsAvailable = false;
     if (!diagnosticsError) diagnosticsError = 'evaluate_failed:' + errorMessage(err);

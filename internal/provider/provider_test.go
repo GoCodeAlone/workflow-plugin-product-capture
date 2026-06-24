@@ -4219,6 +4219,81 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptRetriesFreshBrowserAfterTargetCrashDuringManualReviewDiagnostics(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let launchCount = 0;
+let firstAttemptCaptchaCountCalls = 0;
+function withDocument(fn, arg, attempt) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: attempt === 1 ? 'captcha page' : 'product page' },
+    querySelectorAll: (selector) => {
+      if (attempt === 1) return [];
+      return selector === '#productTitle' ? [{ value: '', textContent: 'Echo Dot' }] : [];
+    },
+    querySelector: (selector) => {
+      if (attempt === 2 && selector === '#landingImage') return { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+      return null;
+    },
+  };
+  try {
+    return fn(arg);
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => {
+    launchCount++;
+    const attempt = launchCount;
+    return {
+      newPage: async () => ({
+        addInitScript: async () => {},
+        goto: async () => {},
+        locator: (selector) => {
+          if (selector === 'form[action*="/errors/validateCaptcha"]') {
+            return {
+              count: async () => {
+                if (attempt === 1) {
+                  firstAttemptCaptchaCountCalls++;
+                  if (firstAttemptCaptchaCountCalls === 1) return 1;
+                  throw new Error('locator.count: Target crashed');
+                }
+                return 0;
+              },
+            };
+          }
+          return { count: async () => 0, first: () => ({ click: async () => {} }) };
+        },
+        waitForLoadState: async () => {},
+        waitForTimeout: async () => {},
+        waitForFunction: async (fn, arg) => {
+          if (!withDocument(fn, arg, attempt)) throw new TimeoutError('timeout');
+        },
+        evaluate: async (fn, arg) => withDocument(fn, arg, attempt),
+        content: async () => '<html><body data-launch-count="' + launchCount + '" data-first-attempt-captcha-count-calls="' + firstAttemptCaptchaCountCalls + '"><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+      }),
+      close: async () => {},
+    };
+  },
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script should retry with a fresh browser after target crash during manual-review diagnostics: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) || !strings.Contains(stdout.String(), `data-launch-count="2"`) {
+		t.Fatalf("capture script did not emit product html from retry browser: %s", stdout.String())
+	}
+}
+
 func TestPlaywrightScriptUsesCaptureTimeoutForAmazonTitleReadiness(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {
