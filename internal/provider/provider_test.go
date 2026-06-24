@@ -482,10 +482,15 @@ func TestBrowserScriptSupportsNaturalWarmupNavigation(t *testing.T) {
 		"navigateFromCurrentDocument",
 		"same origin",
 		"window.location.assign",
+		"const navigationTimeout = Math.min(10000, remainingTimeout(deadline));",
+		"page.waitForNavigation({ waitUntil: 'commit', timeout: navigationTimeout })",
 	} {
 		if !strings.Contains(playwrightCaptureScript, required) {
 			t.Fatalf("capture script missing natural warmup navigation behavior %q", required)
 		}
+	}
+	if strings.Contains(playwrightCaptureScript, "page.waitForNavigation({ waitUntil: 'domcontentloaded'") {
+		t.Fatal("warmup document navigation must not spend the full capture budget waiting for domcontentloaded")
 	}
 	if !strings.Contains(playwrightBrowserDiagnosticScript, "gotoTargetWithOptionalWarmup") {
 		t.Fatalf("diagnostic script should share warmup navigation path")
