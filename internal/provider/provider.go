@@ -748,7 +748,7 @@ async function installCaptureBrowserIdentity(page, rawChromeVersion) {
       Object.defineProperty(navigator, 'language', { configurable: true, get: () => identity.language });
     } catch {}
     try {
-      Object.defineProperty(navigator, 'languages', { configurable: true, get: () => identity.languages });
+      Object.defineProperty(navigator, 'languages', { configurable: true, get: () => Object.freeze([...identity.languages]) });
     } catch {}
     const highEntropyValues = {
       architecture: 'x86',
@@ -814,7 +814,7 @@ async function launchChromeBrowser() {
   };
   const contextOptions = {
     viewport: { width: 1280, height: 720 },
-    locale: 'en-US',
+    locale: productCaptureBrowserIdentity.language,
     timezoneId: 'America/New_York',
   };
   const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();

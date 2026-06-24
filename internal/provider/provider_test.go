@@ -500,7 +500,9 @@ func TestPlaywrightBrowserIdentityAvoidsMalformedLanguageSignals(t *testing.T) {
 		"acceptLanguage: productCaptureBrowserIdentity.languages.join(',')",
 		"Object.defineProperty(navigator, 'language'",
 		"Object.defineProperty(navigator, 'languages'",
+		"Object.freeze([...identity.languages])",
 		"languages: ['en-US', 'en']",
+		"locale: productCaptureBrowserIdentity.language",
 	} {
 		if !strings.Contains(playwrightBrowserPrelude, required) {
 			t.Fatalf("browser identity must align language signals; missing %q", required)
