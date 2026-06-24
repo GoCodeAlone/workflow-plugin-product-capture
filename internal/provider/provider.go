@@ -781,6 +781,10 @@ function isTransientNavigationError(err) {
   ].some((needle) => message.includes(needle));
 }
 
+function diagnosticErrorToken(err) {
+  return errorMessage(err).replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 80);
+}
+
 function parseBrowserViewport() {
   const fallback = { width: 1440, height: 900 };
   const raw = String(process.env.PRODUCT_CAPTURE_BROWSER_VIEWPORT || '').trim();
@@ -1334,22 +1338,36 @@ async function collectAmazonPageSignals(page, requestedURL) {
   }, requestedURL);
 }
 
-async function hasAmazonInterstitial(page, requestedURL) {
-  let captchaFormCount = 0;
-  try {
-    captchaFormCount = await countAmazonCaptchaForms(page);
-  } catch {
-    return true;
-  }
+async function probeAmazonInterstitial(page, requestedURL) {
+  const captchaFormCount = await countAmazonCaptchaForms(page);
   const captchaForm = captchaFormCount > 0;
-  const signals = await collectAmazonPageSignals(page, requestedURL).catch(() => null);
-  if (!signals) return true;
+  const signals = await collectAmazonPageSignals(page, requestedURL);
   const captchaChallenge = Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
   const benignContinuationForm = captchaForm &&
     !captchaChallenge &&
     Boolean(signals.continuationGateText) &&
     Number(signals.formContinuationCandidates || 0) > 0;
   return captchaChallenge || (captchaForm && !benignContinuationForm);
+}
+
+async function hasAmazonInterstitial(page, requestedURL, deadline) {
+  const maxAttempts = 5;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const budget = deadline ? remainingTimeout(deadline) : 1000;
+    if (deadline && budget <= 0) return !await productTitleReady(page, requestedURL).catch(() => false);
+    try {
+      return await probeAmazonInterstitial(page, requestedURL);
+    } catch (err) {
+      if (!isTransientNavigationError(err)) return true;
+      if ((!deadline || remainingTimeout(deadline) > 0) && await productTitleReady(page, requestedURL).catch(() => false)) return false;
+      if (attempt >= maxAttempts - 1) break;
+      const backoff = Math.min(250 * (attempt + 1), budget);
+      if (backoff <= 0) break;
+      if (typeof page.waitForTimeout === 'function') await page.waitForTimeout(backoff);
+    }
+  }
+  if ((!deadline || remainingTimeout(deadline) > 0) && await productTitleReady(page, requestedURL).catch(() => false)) return false;
+  return true;
 }
 
 async function clearAmazonContinuationMarkers(page) {
@@ -1373,9 +1391,9 @@ async function amazonCaptureDiagnostics(page, requestedURL) {
   let diagnosticsError = '';
   try {
     captchaFormCount = await countAmazonCaptchaForms(page);
-  } catch {
+  } catch (err) {
     diagnosticsAvailable = false;
-    diagnosticsError = 'captcha_form_count_failed';
+    diagnosticsError = 'captcha_form_count_failed:' + diagnosticErrorToken(err);
   }
   try {
     signals = await collectAmazonPageSignals(page, requestedURL);
@@ -1457,7 +1475,7 @@ async function handleAmazonContinuationGate(page, requestedURL, deadline) {
   const signals = await collectAmazonPageSignals(page, requestedURL).catch(() => null);
   if (!signals) return false;
   if (signals.titleReady && !signals.continuationGateText) return false;
-  if (await hasAmazonInterstitial(page, requestedURL)) return false;
+  if (await hasAmazonInterstitial(page, requestedURL, deadline)) return false;
   let clicked = false;
   if (signals.continuationCandidates > 0) {
     const continueButton = page.locator('[data-product-capture-continuation-candidate="true"]');
@@ -1594,11 +1612,11 @@ async function main() {
   const page = await newCapturePage(browser);
   try {
     await gotoTargetWithOptionalWarmup(page, url, deadline);
-    if (await hasAmazonInterstitial(page, url)) {
+    if (await hasAmazonInterstitial(page, url, deadline)) {
       throw await amazonManualReviewError(page, url);
     }
     await handleAmazonContinuationGate(page, url, deadline);
-    if (await hasAmazonInterstitial(page, url)) {
+    if (await hasAmazonInterstitial(page, url, deadline)) {
       throw await amazonManualReviewError(page, url);
     }
     if (remainingTimeout(deadline) > 0) {
@@ -1633,7 +1651,7 @@ async function main() {
         );
       }, { timeout: optionalWait }).catch(() => {});
     }
-    if (await hasAmazonInterstitial(page, url)) {
+    if (await hasAmazonInterstitial(page, url, deadline)) {
       throw await amazonManualReviewError(page, url);
     }
     if (!await requireProductTitleReady(page, url)) {

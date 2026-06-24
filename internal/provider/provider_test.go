@@ -4085,6 +4085,73 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptRetriesTransientAmazonInterstitialProbe(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let captchaFormCountCalls = 0;
+function withDocument(fn, arg) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: '', textContent: 'Echo Dot' }] : [],
+    querySelector: (selector) => {
+      if (selector === '#landingImage') return { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+      return null;
+    },
+  };
+  try {
+    return fn(arg);
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return {
+            count: async () => {
+              captchaFormCountCalls++;
+              if (captchaFormCountCalls <= 3) throw new Error('Execution context was destroyed');
+              return 0;
+            },
+          };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn, arg) => {
+        if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn, arg) => withDocument(fn, arg),
+      content: async () => '<html><body data-captcha-form-count-calls="' + captchaFormCountCalls + '"><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script should retry transient Amazon interstitial probe: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after transient interstitial probe: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), `data-captcha-form-count-calls="5"`) {
+		t.Fatalf("capture script did not retry whole interstitial probe before emitting html: %s", stdout.String())
+	}
+}
+
 func TestPlaywrightScriptUsesCaptureTimeoutForAmazonTitleReadiness(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {
@@ -4519,12 +4586,27 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 	captchaIndex := -1
 	if retryIndex >= 0 {
 		afterRetry := playwrightCaptureScript[retryIndex:]
-		if relative := strings.Index(afterRetry, "if (await hasAmazonInterstitial(page, url))"); relative >= 0 {
+		if relative := strings.Index(afterRetry, "if (await hasAmazonInterstitial(page, url, deadline))"); relative >= 0 {
 			captchaIndex = retryIndex + relative
 		}
 	}
 	if retryIndex < 0 || captchaIndex < 0 || captchaIndex < retryIndex {
 		t.Fatal("playwright script must check CAPTCHA/interstitials after retryable navigation only")
+	}
+}
+
+func TestPlaywrightScriptChecksInterstitialProbeBudgetBeforeAttempt(t *testing.T) {
+	required := strings.Join([]string{
+		"async function hasAmazonInterstitial(page, requestedURL, deadline) {",
+		"  const maxAttempts = 5;",
+		"  for (let attempt = 0; attempt < maxAttempts; attempt++) {",
+		"    const budget = deadline ? remainingTimeout(deadline) : 1000;",
+		"    if (deadline && budget <= 0) return !await productTitleReady(page, requestedURL).catch(() => false);",
+		"    try {",
+		"      return await probeAmazonInterstitial(page, requestedURL);",
+	}, "\n")
+	if !strings.Contains(playwrightCaptureScript, required) {
+		t.Fatal("playwright script must check capture budget before starting each interstitial probe")
 	}
 }
 
