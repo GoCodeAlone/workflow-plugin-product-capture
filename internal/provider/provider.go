@@ -655,6 +655,8 @@ const productCaptureBrowserIdentity = {
   navigatorPlatform: 'MacIntel',
   userAgentDataPlatform: 'macOS',
   platformVersion: '10_15_7',
+  language: 'en-US',
+  languages: ['en-US', 'en'],
 };
 
 function normalizeChromeVersion(rawVersion) {
@@ -728,7 +730,7 @@ async function installCaptureBrowserIdentity(page, rawChromeVersion) {
     if (session && typeof session.send === 'function') {
       await session.send('Network.setUserAgentOverride', {
         userAgent,
-        acceptLanguage: 'en-US,en;q=0.9',
+        acceptLanguage: productCaptureBrowserIdentity.languages.join(','),
         platform: productCaptureBrowserIdentity.navigatorPlatform,
         userAgentMetadata,
       });
@@ -741,6 +743,12 @@ async function installCaptureBrowserIdentity(page, rawChromeVersion) {
     } catch {}
     try {
       Object.defineProperty(navigator, 'platform', { configurable: true, get: () => identity.navigatorPlatform });
+    } catch {}
+    try {
+      Object.defineProperty(navigator, 'language', { configurable: true, get: () => identity.language });
+    } catch {}
+    try {
+      Object.defineProperty(navigator, 'languages', { configurable: true, get: () => Object.freeze([...identity.languages]) });
     } catch {}
     const highEntropyValues = {
       architecture: 'x86',
@@ -786,6 +794,8 @@ async function installCaptureBrowserIdentity(page, rawChromeVersion) {
     navigatorPlatform: productCaptureBrowserIdentity.navigatorPlatform,
     userAgentDataPlatform: productCaptureBrowserIdentity.userAgentDataPlatform,
     platformVersion: productCaptureBrowserIdentity.platformVersion,
+    language: productCaptureBrowserIdentity.language,
+    languages: productCaptureBrowserIdentity.languages,
     brands: chromeBrandList(chromeMajor),
     fullVersionList: chromeFullVersionList(chromeVersion),
   });
@@ -804,11 +814,8 @@ async function launchChromeBrowser() {
   };
   const contextOptions = {
     viewport: { width: 1280, height: 720 },
-    locale: 'en-US',
+    locale: productCaptureBrowserIdentity.language,
     timezoneId: 'America/New_York',
-    extraHTTPHeaders: {
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
   };
   const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();
   if (profileDir) {
