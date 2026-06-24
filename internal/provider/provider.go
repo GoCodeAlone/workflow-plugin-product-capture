@@ -63,6 +63,7 @@ type dynamicEnvelope struct {
 type Workload struct {
 	URL            string   `json:"url"`
 	AllowedHosts   []string `json:"allowed_hosts"`
+	WarmupURL      string   `json:"warmup_url,omitempty"`
 	CaptureMode    string   `json:"capture_mode,omitempty"`
 	TimeoutSeconds int      `json:"timeout_seconds,omitempty"`
 	MaxHTMLBytes   int64    `json:"max_html_bytes,omitempty"`
@@ -454,6 +455,15 @@ func validateWorkload(w Workload) error {
 	if _, ok := supportedAmazonHosts[host]; !ok {
 		return fmt.Errorf("unsupported host %q", host)
 	}
+	if warmupURL := strings.TrimSpace(w.WarmupURL); warmupURL != "" {
+		warmup, err := url.Parse(warmupURL)
+		if err != nil {
+			return fmt.Errorf("parse warmup_url: %w", err)
+		}
+		if !sameOriginURL(parsed, warmup) {
+			return errors.New("warmup_url must be same-origin with url")
+		}
+	}
 	if w.CaptureMode != "" && w.CaptureMode != CaptureModeBrowser && w.CaptureMode != CaptureModeMeta {
 		return fmt.Errorf("unsupported capture_mode %q", w.CaptureMode)
 	}
@@ -473,6 +483,32 @@ func canonicalHost(host string) string {
 	host = strings.TrimSpace(strings.ToLower(host))
 	host = strings.TrimSuffix(host, ".")
 	return host
+}
+
+func sameOriginURL(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		canonicalHost(a.Hostname()) == canonicalHost(b.Hostname()) &&
+		effectiveURLPort(a) == effectiveURLPort(b)
+}
+
+func effectiveURLPort(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func captureHTML(w Workload) (string, error) {
@@ -511,6 +547,9 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 
 	cmd := exec.CommandContext(ctx, "node", scriptPath, w.URL, fmt.Sprintf("%d", timeout.Milliseconds()))
 	cmd.Env = os.Environ()
+	if strings.TrimSpace(w.WarmupURL) != "" {
+		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_WARMUP_URL="+strings.TrimSpace(w.WarmupURL))
+	}
 	var stderr bytes.Buffer
 	var stdout limitedBuffer
 	stdout.max = maxHTMLBytes(w.MaxHTMLBytes)

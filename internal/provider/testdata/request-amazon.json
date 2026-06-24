@@ -2,6 +2,7 @@
   "workload": {
     "url": "https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8",
     "allowed_hosts": ["www.amazon.com"],
+    "warmup_url": "https://www.amazon.com/",
     "capture_mode": "browser",
     "timeout_seconds": 45,
     "max_html_bytes": 10485760,

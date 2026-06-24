@@ -847,6 +847,65 @@ func TestCaptureHTMLWithPlaywrightReportsOutputLimitBeforeNodePipeNoise(t *testi
 	}
 }
 
+func TestCaptureHTMLWithPlaywrightPassesWarmupURLToBrowserRuntime(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\n[ \"$PRODUCT_CAPTURE_BROWSER_WARMUP_URL\" = 'https://www.amazon.com/' ] || { echo \"warmup=$PRODUCT_CAPTURE_BROWSER_WARMUP_URL\" >&2; exit 23; }\nprintf '<html></html>'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	html, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		WarmupURL:      "https://www.amazon.com/",
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err != nil {
+		t.Fatalf("captureHTMLWithPlaywright returned error: %v", err)
+	}
+	if html != "<html></html>" {
+		t.Fatalf("unexpected html: %q", html)
+	}
+}
+
+func TestValidateWorkloadRequiresWarmupSameOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		warmup  string
+		wantErr bool
+	}{
+		{name: "trimmed same origin", warmup: " https://www.amazon.com/ ", wantErr: false},
+		{name: "explicit default port", warmup: "https://www.amazon.com:443/", wantErr: false},
+		{name: "different host", warmup: "https://amazon.com/", wantErr: true},
+		{name: "different scheme", warmup: "http://www.amazon.com/", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateWorkload(Workload{
+				URL:          "https://www.amazon.com/dp/B09B8V1LZ3",
+				AllowedHosts: []string{"www.amazon.com"},
+				WarmupURL:    tc.warmup,
+			})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected warmup_url origin mismatch")
+				}
+				if !strings.Contains(err.Error(), "warmup_url must be same-origin with url") {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("same-origin warmup rejected: %v", err)
+			}
+		})
+	}
+}
+
 func TestIsZeroMetadataHandlesNil(t *testing.T) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -873,6 +932,7 @@ func TestProviderSchemaAcceptsBuyMyWishlistLiveInputAndRejectsDemoFields(t *test
 	liveInput := map[string]any{
 		"url":             "https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8",
 		"allowed_hosts":   []any{"www.amazon.com", "amazon.com"},
+		"warmup_url":      "https://www.amazon.com/",
 		"capture_mode":    "browser",
 		"timeout_seconds": float64(60),
 		"max_html_bytes":  float64(1048576),
@@ -911,6 +971,7 @@ func validWorkflowComputeProviderEnvelope(t *testing.T) dynamicEnvelope {
 	input := json.RawMessage(`{
 	  "url":"https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8",
 	  "allowed_hosts":["www.amazon.com"],
+	  "warmup_url":"https://www.amazon.com/",
 	  "capture_mode":"browser",
 	  "timeout_seconds":30,
 	  "max_html_bytes":1048576,

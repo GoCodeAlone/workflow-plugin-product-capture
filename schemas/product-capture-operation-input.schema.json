@@ -20,6 +20,11 @@
       "uniqueItems": true,
       "description": "Exact host allow-list for the submitted URL."
     },
+    "warmup_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "Optional same-origin page to load before naturally navigating to the product URL."
+    },
     "capture_mode": {
       "type": "string",
       "enum": ["browser", "metadata"]
