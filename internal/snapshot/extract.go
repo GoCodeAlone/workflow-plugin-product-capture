@@ -214,7 +214,7 @@ func amazonBroadProductTitle(root *html.Node, requestedURL, canonicalURL string)
 	}
 	for _, title := range []string{
 		firstTextByAttr(root, "data-testid", "product-title"),
-		firstTextByID(root, "title"),
+		firstTextByTagAndID(root, "h1", "title"),
 		firstTextByTag(root, "h1"),
 	} {
 		if cleaned := cleanAmazonMetadataTitle(title); cleaned != "" {
@@ -486,7 +486,19 @@ func firstTextByAttr(root *html.Node, attrName, attrValue string) string {
 func firstTextByTag(root *html.Node, tag string) string {
 	var found string
 	walk(root, func(n *html.Node) bool {
-		if strings.EqualFold(n.Data, tag) {
+		if n.Type == html.ElementNode && strings.EqualFold(n.Data, tag) {
+			found = nodeText(n)
+			return false
+		}
+		return true
+	})
+	return clean(found)
+}
+
+func firstTextByTagAndID(root *html.Node, tag, id string) string {
+	var found string
+	walk(root, func(n *html.Node) bool {
+		if n.Type == html.ElementNode && strings.EqualFold(n.Data, tag) && attr(n, "id") == id {
 			found = nodeText(n)
 			return false
 		}

@@ -355,6 +355,44 @@ func TestExtractAmazonBroadTitleAcceptsASINPageWithPriceEvidence(t *testing.T) {
 	}
 }
 
+func TestExtractAmazonBroadTitlePrefersH1TitleOverContainerID(t *testing.T) {
+	html := `<!doctype html>
+<html><body>
+  <div id="title">Store wrapper text</div>
+  <h1 id="title">Amazon Echo Dot (newest model) - Vibrant sounding speaker</h1>
+  <div class="priceToPay"><span class="a-offscreen">$34.99</span></div>
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.Title != "Amazon Echo Dot (newest model) - Vibrant sounding speaker" {
+		t.Fatalf("title: %q", got.Title)
+	}
+}
+
+func TestExtractAmazonBroadTitleIgnoresCommentBeforeH1(t *testing.T) {
+	html := `<!doctype html>
+<html><body>
+  <!--h1-->
+  <h1>Amazon Echo Dot (newest model) - Vibrant sounding speaker</h1>
+  <div class="priceToPay"><span class="a-offscreen">$34.99</span></div>
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.Title != "Amazon Echo Dot (newest model) - Vibrant sounding speaker" {
+		t.Fatalf("title: %q", got.Title)
+	}
+}
+
 func TestExtractAmazonMetadataTitleAcceptsSecondPriceContainerEvidence(t *testing.T) {
 	html := `<!doctype html>
 <html><head>

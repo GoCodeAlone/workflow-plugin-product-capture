@@ -1300,8 +1300,8 @@ async function amazonCaptureDiagnostics(page, requestedURL) {
     diagnosticsAvailable ? 'continuation_candidates=' + Number(signals.continuationCandidates || 0) : '',
     diagnosticsAvailable ? 'form_continuation_candidates=' + Number(signals.formContinuationCandidates || 0) : '',
     diagnosticsAvailable && formatLabels(signals.continuationLabelSamples) ? 'continuation_labels=' + formatLabels(signals.continuationLabelSamples) : '',
-    diagnosticsAvailable ? 'broad_title_ready=' + Boolean(signals.broadTitleReady) : '',
-    diagnosticsAvailable && formatLabels(signals.titleSamples) ? 'title_samples=' + formatLabels(signals.titleSamples) : '',
+    signalsAvailable ? 'broad_title_ready=' + Boolean(signals.broadTitleReady) : '',
+    signalsAvailable && formatLabels(signals.titleSamples) ? 'title_samples=' + formatLabels(signals.titleSamples) : '',
   ].filter(Boolean).join(' ');
 }
 

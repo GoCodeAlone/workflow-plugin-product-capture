@@ -3846,6 +3846,8 @@ exports.errors = { TimeoutError };
 		"amazon product page did not expose product title",
 		"diagnostics_available=false",
 		"diagnostics_error=captcha_form_count_failed",
+		"title_ready=false",
+		"broad_title_ready=false",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing unavailable diagnostic %q: %s", want, stderr.String())
