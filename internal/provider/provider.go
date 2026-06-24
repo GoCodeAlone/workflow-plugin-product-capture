@@ -1249,7 +1249,11 @@ async function hasAmazonInterstitial(page, requestedURL) {
   const signals = await collectAmazonPageSignals(page, requestedURL).catch(() => null);
   if (!signals) return true;
   const captchaChallenge = Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
-  return captchaChallenge || captchaForm;
+  const benignContinuationForm = captchaForm &&
+    !captchaChallenge &&
+    Boolean(signals.continuationGateText) &&
+    Number(signals.formContinuationCandidates || 0) > 0;
+  return captchaChallenge || (captchaForm && !benignContinuationForm);
 }
 
 async function clearAmazonContinuationMarkers(page) {

@@ -2429,7 +2429,7 @@ exports.errors = { TimeoutError };
 	}
 }
 
-func TestPlaywrightScriptDoesNotClickValidateCaptchaContinuationForm(t *testing.T) {
+func TestPlaywrightScriptClicksBenignValidateCaptchaContinuationForm(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {
   constructor(message) {
@@ -2481,10 +2481,10 @@ exports.chromium = {
           return {
             count: async () => attrs['data-product-capture-continuation-candidate'] === 'true' && !clicked ? 1 : 0,
             first: () => ({
-              click: async () => { throw new Error('clicked validateCaptcha continuation'); },
+              click: async () => { clicked = true; },
             }),
             nth: () => ({
-              click: async () => { throw new Error('clicked validateCaptcha continuation'); },
+              click: async () => { clicked = true; },
             }),
           };
         }
@@ -2500,12 +2500,12 @@ exports.chromium = {
 };
 exports.errors = { TimeoutError };
 `
-	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
-	if err == nil {
-		t.Fatalf("expected validateCaptcha continuation form to fail closed")
+	stdout, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err != nil {
+		t.Fatalf("capture script failed after benign validateCaptcha continuation form: %v\nstderr=%s", err, stderr.String())
 	}
-	if strings.Contains(stderr.String(), "clicked validateCaptcha continuation") || !strings.Contains(stderr.String(), "amazon interstitial requires manual review") {
-		t.Fatalf("stderr missing manual review failure or clicked validateCaptcha gate: %s", stderr.String())
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after benign validateCaptcha continuation: %s", stdout.String())
 	}
 }
 
