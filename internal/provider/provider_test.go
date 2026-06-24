@@ -485,6 +485,9 @@ func TestBrowserScriptSupportsNaturalWarmupNavigation(t *testing.T) {
 		"const navigationTimeout = Math.min(10000, remainingTimeout(deadline));",
 		"navigationTimeout > 0",
 		"page.waitForNavigation({ waitUntil: 'commit', timeout: navigationTimeout })",
+		"Execution context was destroyed",
+		"await page.evaluate((target) => {",
+		"}).catch((err) => {",
 	} {
 		if !strings.Contains(playwrightCaptureScript, required) {
 			t.Fatalf("capture script missing natural warmup navigation behavior %q", required)
