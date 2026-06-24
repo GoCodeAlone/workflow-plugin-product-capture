@@ -503,7 +503,7 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
 	defer cancel()
 
-	scriptPath, err := writePlaywrightScript()
+	scriptPath, err := writeBrowserCaptureScript()
 	if err != nil {
 		return "", err
 	}
@@ -532,7 +532,7 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	return stdout.String(), nil
 }
 
-func writePlaywrightScript() (string, error) {
+func writeBrowserCaptureScript() (string, error) {
 	dir, err := os.MkdirTemp("", "product-capture-browser-*")
 	if err != nil {
 		return "", fmt.Errorf("create browser temp dir: %w", err)
