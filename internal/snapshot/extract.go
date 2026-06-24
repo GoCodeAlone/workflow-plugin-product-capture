@@ -55,7 +55,8 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 		firstAttrByID(root, "productTitle", "value"),
 	)
 	metadataTitle := amazonMetadataTitle(root, opts.URL, out.CanonicalURL)
-	out.Title = firstNonEmpty(domTitle, metadataTitle)
+	broadTitle := amazonBroadProductTitle(root, opts.URL, out.CanonicalURL)
+	out.Title = firstNonEmpty(domTitle, metadataTitle, broadTitle)
 	trustedImageURL := firstNonEmpty(
 		firstAttrByID(root, "landingImage", "src"),
 		firstProductContainerImageAttr(root, "data-old-hires"),
@@ -205,6 +206,22 @@ func amazonMetadataTitle(root *html.Node, requestedURL, canonicalURL string) str
 		cleanAmazonMetadataTitle(firstAttr(root, "meta", "property", "og:title", "content")),
 		cleanAmazonMetadataTitle(firstAttr(root, "meta", "name", "title", "content")),
 	)
+}
+
+func amazonBroadProductTitle(root *html.Node, requestedURL, canonicalURL string) string {
+	if !amazonMetadataProductEvidence(root, requestedURL, canonicalURL) {
+		return ""
+	}
+	for _, title := range []string{
+		firstTextByAttr(root, "data-testid", "product-title"),
+		firstTextByID(root, "title"),
+		firstTextByTag(root, "h1"),
+	} {
+		if cleaned := cleanAmazonMetadataTitle(title); cleaned != "" {
+			return cleaned
+		}
+	}
+	return ""
 }
 
 func amazonMetadataProductEvidence(root *html.Node, requestedURL, canonicalURL string) bool {
@@ -446,6 +463,30 @@ func firstTextByClass(root *html.Node, className string) string {
 	var found string
 	walk(root, func(n *html.Node) bool {
 		if hasClass(n, className) {
+			found = nodeText(n)
+			return false
+		}
+		return true
+	})
+	return clean(found)
+}
+
+func firstTextByAttr(root *html.Node, attrName, attrValue string) string {
+	var found string
+	walk(root, func(n *html.Node) bool {
+		if attr(n, attrName) == attrValue {
+			found = nodeText(n)
+			return false
+		}
+		return true
+	})
+	return clean(found)
+}
+
+func firstTextByTag(root *html.Node, tag string) string {
+	var found string
+	walk(root, func(n *html.Node) bool {
+		if strings.EqualFold(n.Data, tag) {
 			found = nodeText(n)
 			return false
 		}

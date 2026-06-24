@@ -1855,6 +1855,78 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptAcceptsAmazonBroadTitleWithPriceContainerEvidence(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn, arg) {
+  const previousDocument = global.document;
+  const previousLocation = global.location;
+  const titleNode = { textContent: 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' };
+  const priceNode = { textContent: '$34.99', getAttribute: () => '' };
+  arg = arg || 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3';
+  global.location = { href: 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3' };
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle') return [];
+      if (selector === 'h1') return [titleNode];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === '.priceToPay .a-offscreen') return priceNode;
+      return null;
+    },
+  };
+  try {
+    return fn(arg);
+  } finally {
+    global.document = previousDocument;
+    global.location = previousLocation;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+      goto: async () => {},
+      url: () => 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3',
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn, arg) => {
+        if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn, arg) => withDocument(fn, arg),
+      content: async () => '<html><body><h1>Amazon Echo Dot (newest model) - Vibrant sounding speaker</h1><div class="priceToPay"><span class="a-offscreen">$34.99</span></div></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script failed with h1 title and price evidence: %v\nstderr=%s", err, stderr.String())
+	}
+	snap, err := snapshot.ExtractAmazon(stdout.String(), snapshot.ExtractOptions{URL: "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"})
+	if err != nil {
+		t.Fatalf("captured html should remain extractable: %v", err)
+	}
+	if snap.Title != "Amazon Echo Dot (newest model) - Vibrant sounding speaker" || snap.Price != "34.99" {
+		t.Fatalf("snapshot title/price: %q/%q", snap.Title, snap.Price)
+	}
+}
+
 func TestPlaywrightScriptClicksContinuationEvenWhenMetadataTitleExists(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {

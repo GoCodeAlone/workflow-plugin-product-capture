@@ -997,8 +997,9 @@ async function productTitleReady(page, requestedURL) {
       const canonical = attr('link[rel="canonical"]', 'href') || '';
       const canonicalASIN = asinFromURL(canonical);
       const requestedASIN = asinFromURL(requestedURL);
+      const currentASIN = typeof location !== 'undefined' ? asinFromURL(location.href) : '';
       if (requestedASIN && canonicalASIN && requestedASIN !== canonicalASIN) return false;
-      if (!requestedASIN || !canonicalASIN) return false;
+      if (!requestedASIN || (!canonicalASIN && currentASIN !== requestedASIN)) return false;
       return Boolean(
         attr('#landingImage', 'src') ||
         attr('#landingImage', 'data-a-dynamic-image') ||
@@ -1027,8 +1028,13 @@ async function productTitleReady(page, requestedURL) {
         'security challenge',
       ].some((blocked) => lower.includes(blocked));
     };
+    const titleCandidateSelectors = ['[data-testid="product-title"]', 'h1#title', 'h1'];
+    const broadTitleReady = hasMetadataProductEvidence() && titleCandidateSelectors.some((selector) => {
+      return Array.from(document.querySelectorAll(selector)).some((node) => usableMetadataTitle(node.textContent || node.value || ''));
+    });
     const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
     if (titleNodes.some((node) => hasText(node.textContent) || hasText(node.value))) return true;
+    if (broadTitleReady) return true;
     for (const selector of ['meta[property="og:title"]', 'meta[name="title"]']) {
       const node = document.querySelector(selector);
       if (node && usableMetadataTitle(node.getAttribute('content')) && hasMetadataProductEvidence()) return true;
@@ -1129,8 +1135,9 @@ async function collectAmazonPageSignals(page, requestedURL) {
       const canonical = attr('link[rel="canonical"]', 'href') || '';
       const canonicalASIN = asinFromURL(canonical);
       const requestedASIN = asinFromURL(requestedURL);
+      const currentASIN = typeof location !== 'undefined' ? asinFromURL(location.href) : '';
       if (requestedASIN && canonicalASIN && requestedASIN !== canonicalASIN) return false;
-      if (!requestedASIN || !canonicalASIN) return false;
+      if (!requestedASIN || (!canonicalASIN && currentASIN !== requestedASIN)) return false;
       return Boolean(
         attr('#landingImage', 'src') ||
         attr('#landingImage', 'data-a-dynamic-image') ||
@@ -1161,6 +1168,15 @@ async function collectAmazonPageSignals(page, requestedURL) {
     };
     const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
     const domTitleReady = titleNodes.some((node) => hasText(node.textContent) || hasText(node.value));
+    const titleCandidateSelectors = ['[data-testid="product-title"]', 'h1#title', 'h1'];
+    const titleSamples = [];
+    const broadTitleReady = hasMetadataProductEvidence() && titleCandidateSelectors.some((selector) => {
+      return Array.from(document.querySelectorAll(selector)).some((node) => {
+        const title = String(node.textContent || node.value || '').replace(/\s+/g, ' ').trim();
+        if (title && titleSamples.length < 5 && !titleSamples.includes(title)) titleSamples.push(title);
+        return usableMetadataTitle(title);
+      });
+    });
     let metadataTitleReady = false;
     for (const selector of ['meta[property="og:title"]', 'meta[name="title"]']) {
       const node = document.querySelector(selector);
@@ -1169,7 +1185,7 @@ async function collectAmazonPageSignals(page, requestedURL) {
         break;
       }
     }
-    const titleReady = domTitleReady || metadataTitleReady;
+    const titleReady = domTitleReady || metadataTitleReady || broadTitleReady;
     const captchaForms = Array.from(document.querySelectorAll('form[action*="/errors/validateCaptcha"]'));
     const bodyText = ((document.body && document.body.textContent) || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const captchaChallengeCount = document.querySelectorAll(captchaSelector).length;
@@ -1218,7 +1234,7 @@ async function collectAmazonPageSignals(page, requestedURL) {
         }
       }
     }
-    return { titleReady, metadataTitleReady, continuationGateText, captchaText, captchaChallengeCount, continuationCandidates, formContinuationCandidates, continuationLabelSamples };
+    return { titleReady, metadataTitleReady, broadTitleReady, titleSamples, continuationGateText, captchaText, captchaChallengeCount, continuationCandidates, formContinuationCandidates, continuationLabelSamples };
   });
 }
 
@@ -1284,6 +1300,8 @@ async function amazonCaptureDiagnostics(page, requestedURL) {
     diagnosticsAvailable ? 'continuation_candidates=' + Number(signals.continuationCandidates || 0) : '',
     diagnosticsAvailable ? 'form_continuation_candidates=' + Number(signals.formContinuationCandidates || 0) : '',
     diagnosticsAvailable && formatLabels(signals.continuationLabelSamples) ? 'continuation_labels=' + formatLabels(signals.continuationLabelSamples) : '',
+    diagnosticsAvailable ? 'broad_title_ready=' + Boolean(signals.broadTitleReady) : '',
+    diagnosticsAvailable && formatLabels(signals.titleSamples) ? 'title_samples=' + formatLabels(signals.titleSamples) : '',
   ].filter(Boolean).join(' ');
 }
 
@@ -1359,8 +1377,9 @@ async function waitForProductTitle(page, requestedURL, deadline) {
       const canonical = attr('link[rel="canonical"]', 'href') || '';
       const canonicalASIN = asinFromURL(canonical);
       const requestedASIN = asinFromURL(requestedURL);
+      const currentASIN = typeof location !== 'undefined' ? asinFromURL(location.href) : '';
       if (requestedASIN && canonicalASIN && requestedASIN !== canonicalASIN) return false;
-      if (!requestedASIN || !canonicalASIN) return false;
+      if (!requestedASIN || (!canonicalASIN && currentASIN !== requestedASIN)) return false;
       return Boolean(
         attr('#landingImage', 'src') ||
         attr('#landingImage', 'data-a-dynamic-image') ||
@@ -1391,6 +1410,11 @@ async function waitForProductTitle(page, requestedURL, deadline) {
     };
     const titleNodes = Array.from(document.querySelectorAll('#productTitle'));
     if (titleNodes.some((node) => hasText(node.textContent) || hasText(node.value))) return true;
+    if (hasMetadataProductEvidence()) {
+      for (const selector of ['[data-testid="product-title"]', 'h1#title', 'h1']) {
+        if (Array.from(document.querySelectorAll(selector)).some((node) => usableMetadataTitle(node.textContent || node.value || ''))) return true;
+      }
+    }
     for (const selector of ['meta[property="og:title"]', 'meta[name="title"]']) {
       const node = document.querySelector(selector);
       if (node && usableMetadataTitle(node.getAttribute('content')) && hasMetadataProductEvidence()) return true;
