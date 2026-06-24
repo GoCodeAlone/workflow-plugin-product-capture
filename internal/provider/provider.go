@@ -651,10 +651,10 @@ const playwrightBrowserPrelude = `
 const { chromium, errors } = require('playwright');
 
 const productCaptureBrowserIdentity = {
-  userAgentPlatform: 'Macintosh; Intel Mac OS X 10_15_7',
-  navigatorPlatform: 'MacIntel',
-  userAgentDataPlatform: 'macOS',
-  platformVersion: '10_15_7',
+  userAgentPlatform: 'X11; Linux x86_64',
+  navigatorPlatform: 'Linux x86_64',
+  userAgentDataPlatform: 'Linux',
+  platformVersion: '',
   language: 'en-US',
   languages: ['en-US', 'en'],
 };

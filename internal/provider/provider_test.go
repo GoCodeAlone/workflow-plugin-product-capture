@@ -531,10 +531,12 @@ func TestPlaywrightBrowserIdentityAvoidsMixedChromeVersionSignals(t *testing.T) 
 	}
 }
 
-func TestPlaywrightBrowserIdentityAvoidsMixedPlatformSignals(t *testing.T) {
+func TestPlaywrightBrowserIdentityAvoidsHostPlatformContradiction(t *testing.T) {
 	for _, required := range []string{
-		"navigatorPlatform: 'MacIntel'",
-		"userAgentDataPlatform: 'macOS'",
+		"userAgentPlatform: 'X11; Linux x86_64'",
+		"navigatorPlatform: 'Linux x86_64'",
+		"userAgentDataPlatform: 'Linux'",
+		"platformVersion: ''",
 		"platform: productCaptureBrowserIdentity.navigatorPlatform",
 		"Object.defineProperty(navigator, 'platform'",
 		"Object.defineProperty(navigator, 'userAgentData'",
@@ -542,6 +544,16 @@ func TestPlaywrightBrowserIdentityAvoidsMixedPlatformSignals(t *testing.T) {
 	} {
 		if !strings.Contains(playwrightBrowserPrelude, required) {
 			t.Fatalf("browser identity must align JS platform signals; missing %q", required)
+		}
+	}
+	for _, disallowed := range []string{
+		"Macintosh; Intel Mac OS X",
+		"navigatorPlatform: 'MacIntel'",
+		"userAgentDataPlatform: 'macOS'",
+		"platformVersion: '10_15_7'",
+	} {
+		if strings.Contains(playwrightBrowserPrelude, disallowed) {
+			t.Fatalf("browser identity must not claim macOS from Linux container runtime; found %q", disallowed)
 		}
 	}
 }
