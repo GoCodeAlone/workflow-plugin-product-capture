@@ -719,6 +719,33 @@ function browserRuntimeVersion(browser) {
   return '';
 }
 
+function remainingTimeout(deadline) {
+  return Math.max(0, deadline - Date.now());
+}
+
+function isTransientNavigationError(err) {
+  const message = err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
+  return [
+    'Timeout',
+    'net::ERR_NETWORK_CHANGED',
+    'net::ERR_NETWORK_RESET',
+    'net::ERR_TIMED_OUT',
+  ].some((needle) => message.includes(needle));
+}
+
+function parseBrowserViewport() {
+  const fallback = { width: 1440, height: 900 };
+  const raw = String(process.env.PRODUCT_CAPTURE_BROWSER_VIEWPORT || '').trim();
+  if (!raw) return fallback;
+  const match = raw.match(/^(\d{3,5})x(\d{3,5})$/i);
+  if (!match) return fallback;
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (!Number.isFinite(width) || !Number.isFinite(height)) return fallback;
+  if (width < 800 || width > 3840 || height < 600 || height > 2160) return fallback;
+  return { width, height };
+}
+
 async function installCaptureBrowserIdentity(page, rawChromeVersion) {
   const chromeVersion = normalizeChromeVersion(rawChromeVersion);
   const chromeMajor = chromeMajorVersion(chromeVersion);
@@ -813,7 +840,7 @@ async function launchChromeBrowser() {
     ],
   };
   const contextOptions = {
-    viewport: { width: 1280, height: 720 },
+    viewport: parseBrowserViewport(),
     locale: productCaptureBrowserIdentity.language,
     timezoneId: 'America/New_York',
   };
@@ -842,19 +869,47 @@ async function newCapturePage(browser) {
   await installCaptureBrowserIdentity(page, browser.version());
   return page;
 }
+
+function configuredWarmupURL(targetURL) {
+  const raw = String(process.env.PRODUCT_CAPTURE_BROWSER_WARMUP_URL || '').trim();
+  if (!raw) return '';
+  const target = new URL(targetURL);
+  const warmup = new URL(raw, target.origin);
+  if (warmup.origin !== target.origin) {
+    throw new Error('browser warmup URL must have same origin as target URL');
+  }
+  return warmup.href;
+}
+
+async function navigateFromCurrentDocument(page, targetURL, deadline) {
+  const timeout = remainingTimeout(deadline, 5000);
+  const waitForNavigation = typeof page.waitForNavigation === 'function'
+    ? page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout }).catch((err) => {
+        if (!isTransientNavigationError(err)) throw err;
+      })
+    : Promise.resolve();
+  await page.evaluate((target) => {
+    window.location.assign(target);
+  }, targetURL);
+  await waitForNavigation;
+  if (typeof page.waitForLoadState === 'function') {
+    await page.waitForLoadState('domcontentloaded', { timeout: remainingTimeout(deadline, 5000) }).catch((err) => {
+      if (!isTransientNavigationError(err)) throw err;
+    });
+  }
+}
+
+async function gotoTargetWithOptionalWarmup(page, targetURL, deadline) {
+  const warmupURL = configuredWarmupURL(targetURL);
+  if (!warmupURL) {
+    return await gotoWithTransientRetry(page, targetURL, deadline);
+  }
+  await gotoWithTransientRetry(page, warmupURL, deadline);
+  await navigateFromCurrentDocument(page, targetURL, deadline);
+}
 `
 
 const playwrightCaptureScript = playwrightBrowserPrelude + `
-
-function isTransientNavigationError(err) {
-  const message = err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
-  return [
-    'Timeout',
-    'net::ERR_NETWORK_CHANGED',
-    'net::ERR_NETWORK_RESET',
-    'net::ERR_TIMED_OUT',
-  ].some((needle) => message.includes(needle));
-}
 
 function isTimeoutError(err) {
   return Boolean(
@@ -866,8 +921,8 @@ function isTimeoutError(err) {
   );
 }
 
-async function productTitleReady(page) {
-  return await page.evaluate(() => {
+async function productTitleReady(page, requestedURL) {
+  return await page.evaluate((requestedURL) => {
     const hasText = (value) => Boolean(value && String(value).trim());
     const text = (selector) => {
       const node = document.querySelector(selector);
@@ -897,11 +952,10 @@ async function productTitleReady(page) {
     };
     const hasMetadataProductEvidence = () => {
       const canonical = attr('link[rel="canonical"]', 'href') || '';
-      const requestedURL = typeof globalThis !== 'undefined' ? globalThis.__productCaptureRequestedURL : '';
       const canonicalASIN = asinFromURL(canonical);
       const requestedASIN = asinFromURL(requestedURL);
       if (requestedASIN && canonicalASIN && requestedASIN !== canonicalASIN) return false;
-      if (!requestedASIN && !canonicalASIN) return false;
+      if (!requestedASIN || !canonicalASIN) return false;
       return Boolean(
         attr('#landingImage', 'src') ||
         attr('#landingImage', 'data-a-dynamic-image') ||
@@ -951,7 +1005,7 @@ async function productDomTitleReady(page) {
 }
 
 async function safeProductTitleReady(page) {
-  return await productTitleReady(page).catch(() => false);
+  return await productTitleReady(page, '').catch(() => false);
 }
 
 async function safeProductDomTitleReady(page) {
@@ -962,16 +1016,16 @@ function errorMessage(err) {
   return err && (err.message || err.stack) ? String(err.message || err.stack) : String(err);
 }
 
-async function requireProductTitleReady(page) {
+async function requireProductTitleReady(page, requestedURL) {
   try {
-    return await productTitleReady(page);
+    return await productTitleReady(page, requestedURL);
   } catch (err) {
     throw new Error('amazon product title readiness check failed: ' + errorMessage(err));
   }
 }
 
-async function collectAmazonPageSignals(page) {
-  return await page.evaluate(() => {
+async function collectAmazonPageSignals(page, requestedURL) {
+  return await page.evaluate((requestedURL) => {
     const marker = 'data-product-capture-continuation-candidate';
     const captchaSelector = 'img[src*="captcha" i],img[alt*="captcha" i],input[name*="captcha" i],input[id*="captcha" i],iframe[src*="captcha" i],iframe[src*="challenge" i]';
     const controlSelector = 'button,input[type="submit"],input[type="button"],a,[role="button"]';
@@ -1030,11 +1084,10 @@ async function collectAmazonPageSignals(page) {
     };
     const hasMetadataProductEvidence = () => {
       const canonical = attr('link[rel="canonical"]', 'href') || '';
-      const requestedURL = typeof globalThis !== 'undefined' ? globalThis.__productCaptureRequestedURL : '';
       const canonicalASIN = asinFromURL(canonical);
       const requestedASIN = asinFromURL(requestedURL);
       if (requestedASIN && canonicalASIN && requestedASIN !== canonicalASIN) return false;
-      if (!requestedASIN && !canonicalASIN) return false;
+      if (!requestedASIN || !canonicalASIN) return false;
       return Boolean(
         attr('#landingImage', 'src') ||
         attr('#landingImage', 'data-a-dynamic-image') ||
@@ -1126,7 +1179,7 @@ async function collectAmazonPageSignals(page) {
   });
 }
 
-async function hasAmazonInterstitial(page) {
+async function hasAmazonInterstitial(page, requestedURL) {
   let captchaFormCount = 0;
   try {
     captchaFormCount = await page.locator('form[action*="/errors/validateCaptcha"]').count();
@@ -1134,7 +1187,7 @@ async function hasAmazonInterstitial(page) {
     return true;
   }
   const captchaForm = captchaFormCount > 0;
-  const signals = await collectAmazonPageSignals(page).catch(() => null);
+  const signals = await collectAmazonPageSignals(page, requestedURL).catch(() => null);
   if (!signals) return true;
   const captchaChallenge = Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
   return captchaChallenge || captchaForm;
@@ -1153,7 +1206,7 @@ async function clearAmazonContinuationMarkers(page) {
   }
 }
 
-async function amazonCaptureDiagnostics(page) {
+async function amazonCaptureDiagnostics(page, requestedURL) {
   let captchaFormCount = 0;
   let signals;
   let diagnosticsAvailable = true;
@@ -1166,11 +1219,11 @@ async function amazonCaptureDiagnostics(page) {
     diagnosticsError = 'captcha_form_count_failed';
   }
   try {
-    signals = await collectAmazonPageSignals(page);
-  } catch {
+    signals = await collectAmazonPageSignals(page, requestedURL);
+  } catch (err) {
     diagnosticsAvailable = false;
     signalsAvailable = false;
-    if (!diagnosticsError) diagnosticsError = 'evaluate_failed';
+    if (!diagnosticsError) diagnosticsError = 'evaluate_failed:' + errorMessage(err);
     signals = { titleReady: false, metadataTitleReady: false, continuationGateText: false, captchaText: false, captchaChallengeCount: 0, continuationCandidates: 0, formContinuationCandidates: 0, continuationLabelSamples: [] };
   }
   const captcha = captchaFormCount > 0 || Boolean(signals.captchaText) || Number(signals.captchaChallengeCount || 0) > 0;
@@ -1191,8 +1244,8 @@ async function amazonCaptureDiagnostics(page) {
   ].filter(Boolean).join(' ');
 }
 
-async function amazonManualReviewError(page) {
-  return new Error('amazon interstitial requires manual review; ' + await amazonCaptureDiagnostics(page));
+async function amazonManualReviewError(page, requestedURL) {
+  return new Error('amazon interstitial requires manual review; ' + await amazonCaptureDiagnostics(page, requestedURL));
 }
 
 async function clickFirstWorkingContinuation(locator, count, deadline) {
@@ -1208,12 +1261,12 @@ async function clickFirstWorkingContinuation(locator, count, deadline) {
   return false;
 }
 
-async function handleAmazonContinuationGate(page, deadline) {
+async function handleAmazonContinuationGate(page, requestedURL, deadline) {
   if (await safeProductDomTitleReady(page)) return false;
-  const signals = await collectAmazonPageSignals(page).catch(() => null);
+  const signals = await collectAmazonPageSignals(page, requestedURL).catch(() => null);
   if (!signals) return false;
   if (signals.titleReady && !signals.continuationGateText) return false;
-  if (await hasAmazonInterstitial(page)) return false;
+  if (await hasAmazonInterstitial(page, requestedURL)) return false;
   let clicked = false;
   if (signals.continuationCandidates > 0) {
     const continueButton = page.locator('[data-product-capture-continuation-candidate="true"]');
@@ -1228,14 +1281,10 @@ async function handleAmazonContinuationGate(page, deadline) {
   return true;
 }
 
-function remainingTimeout(deadline) {
-  return Math.max(0, deadline - Date.now());
-}
-
-async function waitForProductTitle(page, deadline) {
+async function waitForProductTitle(page, requestedURL, deadline) {
   const timeout = remainingTimeout(deadline);
-  if (timeout <= 0) return await safeProductTitleReady(page);
-  return await page.waitForFunction(() => {
+  if (timeout <= 0) return await productTitleReady(page, requestedURL).catch(() => false);
+  return await page.waitForFunction((requestedURL) => {
     const hasText = (value) => Boolean(value && String(value).trim());
     const text = (selector) => {
       const node = document.querySelector(selector);
@@ -1265,11 +1314,10 @@ async function waitForProductTitle(page, deadline) {
     };
     const hasMetadataProductEvidence = () => {
       const canonical = attr('link[rel="canonical"]', 'href') || '';
-      const requestedURL = typeof globalThis !== 'undefined' ? globalThis.__productCaptureRequestedURL : '';
       const canonicalASIN = asinFromURL(canonical);
       const requestedASIN = asinFromURL(requestedURL);
       if (requestedASIN && canonicalASIN && requestedASIN !== canonicalASIN) return false;
-      if (!requestedASIN && !canonicalASIN) return false;
+      if (!requestedASIN || !canonicalASIN) return false;
       return Boolean(
         attr('#landingImage', 'src') ||
         attr('#landingImage', 'data-a-dynamic-image') ||
@@ -1305,9 +1353,9 @@ async function waitForProductTitle(page, deadline) {
       if (node && usableMetadataTitle(node.getAttribute('content')) && hasMetadataProductEvidence()) return true;
     }
     return false;
-  }, { timeout }).then(() => true).catch((err) => {
+  }, requestedURL, { timeout }).then(() => true).catch((err) => {
     if (!isTimeoutError(err)) throw err;
-    return safeProductTitleReady(page);
+    return productTitleReady(page, requestedURL).catch(() => false);
   });
 }
 
@@ -1325,11 +1373,11 @@ async function gotoWithTransientRetry(page, url, deadline) {
       if (!isTransientNavigationError(err)) {
         throw err;
       }
-      if (await safeProductTitleReady(page)) return;
+      if (await productTitleReady(page, url).catch(() => false)) return;
       if (page.url() && page.url() !== 'about:blank') {
         const loadTimeout = Math.min(5000, remainingTimeout(deadline));
         if (loadTimeout > 0) await page.waitForLoadState('domcontentloaded', { timeout: loadTimeout }).catch(() => {});
-        if (await waitForProductTitle(page, deadline)) return;
+        if (await waitForProductTitle(page, url, deadline)) return;
       }
       if (attempt < 2) {
         const backoff = Math.min(500 * (attempt + 1), remainingTimeout(deadline));
@@ -1347,21 +1395,18 @@ async function main() {
   const deadline = Date.now() + timeout;
   const browser = await launchChromeBrowser();
   const page = await newCapturePage(browser);
-  await page.addInitScript((requestedURL) => {
-    globalThis.__productCaptureRequestedURL = requestedURL;
-  }, url);
   try {
-    await gotoWithTransientRetry(page, url, deadline);
-    if (await hasAmazonInterstitial(page)) {
-      throw await amazonManualReviewError(page);
+    await gotoTargetWithOptionalWarmup(page, url, deadline);
+    if (await hasAmazonInterstitial(page, url)) {
+      throw await amazonManualReviewError(page, url);
     }
-    await handleAmazonContinuationGate(page, deadline);
-    if (await hasAmazonInterstitial(page)) {
-      throw await amazonManualReviewError(page);
+    await handleAmazonContinuationGate(page, url, deadline);
+    if (await hasAmazonInterstitial(page, url)) {
+      throw await amazonManualReviewError(page, url);
     }
     const titleWait = Math.min(remainingTimeout(deadline), 15000);
     if (titleWait > 0) {
-      await waitForProductTitle(page, Date.now() + titleWait);
+      await waitForProductTitle(page, url, Date.now() + titleWait);
     }
     const optionalWait = Math.min(remainingTimeout(deadline), 5000);
     if (optionalWait > 0) {
@@ -1392,11 +1437,11 @@ async function main() {
         );
       }, { timeout: optionalWait }).catch(() => {});
     }
-    if (await hasAmazonInterstitial(page)) {
-      throw await amazonManualReviewError(page);
+    if (await hasAmazonInterstitial(page, url)) {
+      throw await amazonManualReviewError(page, url);
     }
-    if (!await requireProductTitleReady(page)) {
-      throw new Error('amazon product page did not expose product title; ' + await amazonCaptureDiagnostics(page));
+    if (!await requireProductTitleReady(page, url)) {
+      throw new Error('amazon product page did not expose product title; ' + await amazonCaptureDiagnostics(page, url));
     }
     await clearAmazonContinuationMarkers(page);
     process.stdout.write(await page.content());
@@ -1412,17 +1457,40 @@ main().catch((err) => {
 `
 
 const playwrightBrowserDiagnosticScript = playwrightBrowserPrelude + `
+async function gotoWithTransientRetry(page, url, deadline) {
+  let lastErr;
+  for (let attempt = 0; attempt < 3 && remainingTimeout(deadline) > 0; attempt++) {
+    const budget = remainingTimeout(deadline);
+    if (budget <= 0) break;
+    const timeout = Math.min(budget, attempt === 0 ? Math.max(15000, Math.floor(budget * 0.65)) : budget);
+    try {
+      await page.goto(url, { waitUntil: 'commit', timeout });
+      const loadTimeout = Math.min(5000, remainingTimeout(deadline));
+      if (loadTimeout > 0 && typeof page.waitForLoadState === 'function') {
+        await page.waitForLoadState('domcontentloaded', { timeout: loadTimeout }).catch(() => {});
+      }
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientNavigationError(err)) throw err;
+      if (attempt < 2 && typeof page.waitForTimeout === 'function') {
+        const backoff = Math.min(500 * (attempt + 1), remainingTimeout(deadline));
+        if (backoff > 0) await page.waitForTimeout(backoff);
+      }
+    }
+  }
+  if (!lastErr) throw new Error('navigation timed out before diagnostic started');
+  throw lastErr;
+}
+
 async function main() {
   const url = process.argv[2];
   const requestedOrigin = new URL(url).origin;
   const browser = await launchChromeBrowser();
   const page = await newCapturePage(browser);
-  await page.addInitScript((origin) => {
-    globalThis.__productCaptureDiagnosticOrigin = origin;
-  }, requestedOrigin);
   try {
-    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    const result = await page.evaluate(async () => {
+    await gotoTargetWithOptionalWarmup(page, url, Date.now() + 30000);
+    const result = await page.evaluate(async (diagnosticOptions) => {
       const diagnosticErrorMessage = (err) => err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
       const safe = (fn, fallback = null) => {
         try {
@@ -1528,7 +1596,7 @@ async function main() {
       };
       let postedToOrigin = false;
       let post_error = '';
-      const requestedOrigin = String(globalThis.__productCaptureDiagnosticOrigin || '');
+      const requestedOrigin = String((diagnosticOptions && diagnosticOptions.requestedOrigin) || '');
       const finalOrigin = new URL(location.href).origin;
       try {
         if (requestedOrigin && finalOrigin !== requestedOrigin) {
@@ -1551,7 +1619,7 @@ async function main() {
         post_error,
         browser_signals: browserSignals,
       };
-    });
+    }, { requestedOrigin });
     process.stdout.write(JSON.stringify({
       target_url: url,
       final_url: result.final_url,
