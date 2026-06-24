@@ -485,6 +485,29 @@ func TestPlaywrightBrowserIdentityAvoidsMixedPlatformSignals(t *testing.T) {
 	}
 }
 
+func TestPlaywrightBrowserIdentityAvoidsMalformedLanguageSignals(t *testing.T) {
+	for _, disallowed := range []string{
+		"acceptLanguage: 'en-US,en;q=0.9'",
+		"'Accept-Language': 'en-US,en;q=0.9'",
+		"extraHTTPHeaders",
+		"en;q=0.9']",
+	} {
+		if strings.Contains(playwrightBrowserPrelude, disallowed) {
+			t.Fatalf("browser identity must not create malformed language signals; found %q", disallowed)
+		}
+	}
+	for _, required := range []string{
+		"acceptLanguage: productCaptureBrowserIdentity.languages.join(',')",
+		"Object.defineProperty(navigator, 'language'",
+		"Object.defineProperty(navigator, 'languages'",
+		"languages: ['en-US', 'en']",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Fatalf("browser identity must align language signals; missing %q", required)
+		}
+	}
+}
+
 func TestMainRunsWorkflowComputeDynamicProviderEnvelope(t *testing.T) {
 	dir := t.TempDir()
 	wd, err := os.Getwd()
