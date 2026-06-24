@@ -510,6 +510,36 @@ func TestPlaywrightBrowserIdentityAvoidsMalformedLanguageSignals(t *testing.T) {
 	}
 }
 
+func TestBrowserCaptureErrorsDoNotSurfacePlaywrightImplementationLabels(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatalf("read provider package dir: %v", err)
+	}
+	disallowed := []string{
+		"playwright capture failed",
+		"product-capture-playwright-",
+		"create playwright temp dir",
+		"write playwright script",
+		"playwright diagnostic failed",
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		text := string(data)
+		for _, value := range disallowed {
+			if strings.Contains(text, value) {
+				t.Fatalf("provider wrapper must not surface Playwright implementation label %q in %s", value, name)
+			}
+		}
+	}
+}
+
 func TestMainRunsWorkflowComputeDynamicProviderEnvelope(t *testing.T) {
 	dir := t.TempDir()
 	wd, err := os.Getwd()

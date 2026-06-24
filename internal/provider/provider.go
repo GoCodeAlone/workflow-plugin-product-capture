@@ -503,7 +503,7 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
 	defer cancel()
 
-	scriptPath, err := writePlaywrightScript()
+	scriptPath, err := writeBrowserCaptureScript()
 	if err != nil {
 		return "", err
 	}
@@ -518,29 +518,29 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		if stdout.err != nil {
-			return "", fmt.Errorf("playwright capture failed: %w", stdout.err)
+			return "", fmt.Errorf("browser capture failed: %w", stdout.err)
 		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", fmt.Errorf("playwright capture failed: %s", msg)
+		return "", fmt.Errorf("browser capture failed: %s", msg)
 	}
 	if stdout.err != nil {
-		return "", fmt.Errorf("playwright capture failed: %w", stdout.err)
+		return "", fmt.Errorf("browser capture failed: %w", stdout.err)
 	}
 	return stdout.String(), nil
 }
 
-func writePlaywrightScript() (string, error) {
-	dir, err := os.MkdirTemp("", "product-capture-playwright-*")
+func writeBrowserCaptureScript() (string, error) {
+	dir, err := os.MkdirTemp("", "product-capture-browser-*")
 	if err != nil {
-		return "", fmt.Errorf("create playwright temp dir: %w", err)
+		return "", fmt.Errorf("create browser temp dir: %w", err)
 	}
 	path := filepath.Join(dir, "capture.js")
 	if err := os.WriteFile(path, []byte(playwrightCaptureScript), 0o600); err != nil {
 		os.RemoveAll(dir)
-		return "", fmt.Errorf("write playwright script: %w", err)
+		return "", fmt.Errorf("write browser capture script: %w", err)
 	}
 	return path, nil
 }
@@ -573,7 +573,7 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 		if msg == "" {
 			msg = err.Error()
 		}
-		return fmt.Errorf("playwright diagnostic failed: %s", msg)
+		return fmt.Errorf("browser diagnostic failed: %s", msg)
 	}
 	return nil
 }
