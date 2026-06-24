@@ -874,16 +874,35 @@ func TestCaptureHTMLWithPlaywrightPassesWarmupURLToBrowserRuntime(t *testing.T) 
 }
 
 func TestValidateWorkloadRequiresWarmupSameOrigin(t *testing.T) {
-	err := validateWorkload(Workload{
-		URL:          "https://www.amazon.com/dp/B09B8V1LZ3",
-		AllowedHosts: []string{"www.amazon.com"},
-		WarmupURL:    "https://amazon.com/",
-	})
-	if err == nil {
-		t.Fatal("expected warmup_url origin mismatch")
-	}
-	if !strings.Contains(err.Error(), "warmup_url must be same-origin with url") {
-		t.Fatalf("unexpected error: %v", err)
+	for _, tc := range []struct {
+		name    string
+		warmup  string
+		wantErr bool
+	}{
+		{name: "trimmed same origin", warmup: " https://www.amazon.com/ ", wantErr: false},
+		{name: "explicit default port", warmup: "https://www.amazon.com:443/", wantErr: false},
+		{name: "different host", warmup: "https://amazon.com/", wantErr: true},
+		{name: "different scheme", warmup: "http://www.amazon.com/", wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateWorkload(Workload{
+				URL:          "https://www.amazon.com/dp/B09B8V1LZ3",
+				AllowedHosts: []string{"www.amazon.com"},
+				WarmupURL:    tc.warmup,
+			})
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected warmup_url origin mismatch")
+				}
+				if !strings.Contains(err.Error(), "warmup_url must be same-origin with url") {
+					t.Fatalf("unexpected error: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("same-origin warmup rejected: %v", err)
+			}
+		})
 	}
 }
 

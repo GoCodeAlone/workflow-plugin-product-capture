@@ -455,12 +455,12 @@ func validateWorkload(w Workload) error {
 	if _, ok := supportedAmazonHosts[host]; !ok {
 		return fmt.Errorf("unsupported host %q", host)
 	}
-	if strings.TrimSpace(w.WarmupURL) != "" {
-		warmup, err := url.Parse(w.WarmupURL)
+	if warmupURL := strings.TrimSpace(w.WarmupURL); warmupURL != "" {
+		warmup, err := url.Parse(warmupURL)
 		if err != nil {
 			return fmt.Errorf("parse warmup_url: %w", err)
 		}
-		if warmup.Scheme != parsed.Scheme || !strings.EqualFold(warmup.Host, parsed.Host) {
+		if !sameOriginURL(parsed, warmup) {
 			return errors.New("warmup_url must be same-origin with url")
 		}
 	}
@@ -483,6 +483,32 @@ func canonicalHost(host string) string {
 	host = strings.TrimSpace(strings.ToLower(host))
 	host = strings.TrimSuffix(host, ".")
 	return host
+}
+
+func sameOriginURL(a, b *url.URL) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		canonicalHost(a.Hostname()) == canonicalHost(b.Hostname()) &&
+		effectiveURLPort(a) == effectiveURLPort(b)
+}
+
+func effectiveURLPort(u *url.URL) string {
+	if u == nil {
+		return ""
+	}
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }
 
 func captureHTML(w Workload) (string, error) {
