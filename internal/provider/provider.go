@@ -766,9 +766,10 @@ function isTransientNavigationError(err) {
   const message = err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
   return [
     'Timeout',
-    'net::ERR_NETWORK_CHANGED',
-    'net::ERR_NETWORK_RESET',
-    'net::ERR_TIMED_OUT',
+      'net::ERR_NETWORK_CHANGED',
+      'net::ERR_NETWORK_RESET',
+      'net::ERR_TIMED_OUT',
+      'Execution context was destroyed',
   ].some((needle) => message.includes(needle));
 }
 
@@ -929,7 +930,9 @@ async function navigateFromCurrentDocument(page, targetURL, deadline) {
     : Promise.resolve();
   await page.evaluate((target) => {
     window.location.assign(target);
-  }, targetURL);
+  }, targetURL).catch((err) => {
+    if (!isTransientNavigationError(err)) throw err;
+  });
   await waitForNavigation;
   if (typeof page.waitForLoadState === 'function') {
     const loadTimeout = Math.min(5000, remainingTimeout(deadline));
