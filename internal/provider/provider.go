@@ -546,6 +546,7 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	defer os.RemoveAll(filepath.Dir(scriptPath))
 
 	cmd := exec.CommandContext(ctx, "node", scriptPath, w.URL, fmt.Sprintf("%d", timeout.Milliseconds()))
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
 		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR="+filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
@@ -606,6 +607,7 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 	}
 	defer os.RemoveAll(filepath.Dir(scriptPath))
 	cmd := exec.CommandContext(ctx, "node", scriptPath, rawURL)
+	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
 		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR="+filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
@@ -914,6 +916,22 @@ async function newCapturePage(browser) {
   const page = await browser.newPage();
   await installCaptureBrowserIdentity(page, browser.version());
   return page;
+}
+
+async function closeCaptureBrowser(browser) {
+  let timer;
+  try {
+    await Promise.race([
+      browser.close(),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('browser close timed out')), 2000);
+      }),
+    ]);
+  } catch (err) {
+    console.error('browser close warning: ' + errorMessage(err));
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function configuredWarmupURL(targetURL) {
@@ -1624,7 +1642,7 @@ async function main() {
     await clearAmazonContinuationMarkers(page);
     process.stdout.write(await page.content());
   } finally {
-    await browser.close();
+    await closeCaptureBrowser(browser);
   }
 }
 
@@ -1810,7 +1828,7 @@ async function main() {
       browser_signals: result.browser_signals,
     }, null, 2) + '\n');
   } finally {
-    await browser.close();
+    await closeCaptureBrowser(browser);
   }
 }
 

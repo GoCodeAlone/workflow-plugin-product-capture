@@ -2,6 +2,7 @@ package provider
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -4147,6 +4148,62 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptReportsAmazonDiagnosticsWhenBrowserCloseHangs(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+function withDocument(fn, arg) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'product shell' },
+    title: 'Amazon.com: Echo Dot',
+    querySelectorAll: () => [],
+    querySelector: (selector) => {
+      if (selector === 'link[rel="canonical"]') return { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/dp/B09B8V1LZ3' : '' };
+      return null;
+    },
+  };
+  try {
+    return fn(arg);
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async () => { throw new TimeoutError('timeout'); },
+      evaluate: async (fn, arg) => withDocument(fn, arg),
+      content: async () => '<html><body>product shell</body></html>',
+    }),
+    close: async () => new Promise(() => { setInterval(() => {}, 1000); }),
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	_, stderr, err := runPlaywrightScriptWithFakeURLTimeoutAndCommandTimeout(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3", "1000", 5*time.Second)
+	if err == nil {
+		t.Fatalf("expected missing title failure")
+	}
+	if !strings.Contains(stderr.String(), "amazon product page did not expose product title") {
+		t.Fatalf("stderr missing amazon diagnostics after hung browser close: %s", stderr.String())
+	}
+}
+
 func TestPlaywrightScriptTreatsContinuationPrecheckErrorAsOptional(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {
@@ -4396,6 +4453,10 @@ func runPlaywrightScriptWithFakeTimeout(t *testing.T, fakePlaywright string, tim
 }
 
 func runPlaywrightScriptWithFakeURLTimeout(t *testing.T, fakePlaywright string, targetURL string, timeout string) (bytes.Buffer, bytes.Buffer, error) {
+	return runPlaywrightScriptWithFakeURLTimeoutAndCommandTimeout(t, fakePlaywright, targetURL, timeout, 0)
+}
+
+func runPlaywrightScriptWithFakeURLTimeoutAndCommandTimeout(t *testing.T, fakePlaywright string, targetURL string, timeout string, commandTimeout time.Duration) (bytes.Buffer, bytes.Buffer, error) {
 	t.Helper()
 	if _, err := exec.LookPath("node"); err != nil {
 		t.Skipf("node not installed; CI provisions Node for generated Playwright script regressions: %v", err)
@@ -4412,7 +4473,13 @@ func runPlaywrightScriptWithFakeURLTimeout(t *testing.T, fakePlaywright string, 
 	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(fakePlaywright), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command("node", script, targetURL, timeout)
+	ctx := context.Background()
+	var cancel context.CancelFunc
+	if commandTimeout > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), commandTimeout)
+		defer cancel()
+	}
+	cmd := exec.CommandContext(ctx, "node", script, targetURL, timeout)
 	cmd.Env = withoutNodeOverrides(os.Environ())
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
