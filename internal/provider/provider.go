@@ -783,10 +783,11 @@ function isTransientNavigationError(err) {
 
 function isBrowserTargetCrashError(err) {
   const message = err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
+  const normalized = message.toLowerCase();
   return [
-    'Target crashed',
-    'Page crashed',
-  ].some((needle) => message.includes(needle));
+    'target crashed',
+    'page crashed',
+  ].some((needle) => normalized.includes(needle));
 }
 
 function diagnosticErrorToken(err) {
