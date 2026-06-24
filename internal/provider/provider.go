@@ -781,6 +781,14 @@ function isTransientNavigationError(err) {
   ].some((needle) => message.includes(needle));
 }
 
+function isBrowserTargetCrashError(err) {
+  const message = err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
+  return [
+    'Target crashed',
+    'Page crashed',
+  ].some((needle) => message.includes(needle));
+}
+
 function diagnosticErrorToken(err) {
   return errorMessage(err).replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 80);
 }
@@ -1358,6 +1366,7 @@ async function hasAmazonInterstitial(page, requestedURL, deadline) {
     try {
       return await probeAmazonInterstitial(page, requestedURL);
     } catch (err) {
+      if (isBrowserTargetCrashError(err)) throw err;
       if (!isTransientNavigationError(err)) return true;
       if ((!deadline || remainingTimeout(deadline) > 0) && await productTitleReady(page, requestedURL).catch(() => false)) return false;
       if (attempt >= maxAttempts - 1) break;
@@ -1608,6 +1617,20 @@ async function main() {
   const url = process.argv[2];
   const timeout = Number(process.argv[3] || 45000);
   const deadline = Date.now() + timeout;
+  let lastErr;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await captureMain(url, deadline);
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (!isBrowserTargetCrashError(err) || attempt >= 1 || remainingTimeout(deadline) <= 0) throw err;
+    }
+  }
+  throw lastErr || new Error('capture failed');
+}
+
+async function captureMain(url, deadline) {
   const browser = await launchChromeBrowser();
   const page = await newCapturePage(browser);
   try {
