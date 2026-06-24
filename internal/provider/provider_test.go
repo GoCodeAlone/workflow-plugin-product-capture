@@ -309,6 +309,16 @@ global.Intl = {
 };
 global.fetch = async () => ({ ok: true, status: 204 });
 exports.chromium = {
+  launchPersistentContext: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, arg) => { fn(arg); },
+      goto: async (url) => { global.location.href = url; return { status: () => 200 }; },
+      url: () => global.location.href,
+      evaluate: async (fn, arg) => await fn(arg),
+    }),
+    browser: () => ({}),
+    close: async () => {},
+  }),
   launch: async () => ({
     newPage: async () => ({
       addInitScript: async (fn, arg) => { fn(arg); },
@@ -340,6 +350,10 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 				Webdriver any    `json:"webdriver"`
 				UserAgent string `json:"user_agent"`
 			} `json:"navigator"`
+			Automation struct {
+				PlaywrightBinding     *bool `json:"playwright_binding_present"`
+				PlaywrightInitScripts *bool `json:"playwright_init_scripts_present"`
+			} `json:"automation"`
 			Document struct {
 				CookiePresent bool `json:"cookie_present"`
 				CookieLength  int  `json:"cookie_length"`
@@ -357,6 +371,12 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	}
 	if got.BrowserSignals.Navigator.UserAgent != "Fake Chrome" {
 		t.Fatalf("user agent = %q", got.BrowserSignals.Navigator.UserAgent)
+	}
+	if got.BrowserSignals.Automation.PlaywrightBinding == nil || got.BrowserSignals.Automation.PlaywrightInitScripts == nil {
+		t.Fatalf("diagnostic should report automation global presence: %+v", got.BrowserSignals.Automation)
+	}
+	if *got.BrowserSignals.Automation.PlaywrightBinding || *got.BrowserSignals.Automation.PlaywrightInitScripts {
+		t.Fatalf("fake diagnostic unexpectedly reported playwright globals: %+v", got.BrowserSignals.Automation)
 	}
 	if !got.BrowserSignals.Document.CookiePresent || got.BrowserSignals.Document.CookieLength == 0 {
 		t.Fatalf("diagnostic should report cookie presence without values: %+v", got.BrowserSignals.Document)
@@ -393,6 +413,16 @@ global.Intl = {
 };
 global.fetch = async () => { throw new Error('fetch should not run after a cross-origin redirect'); };
 exports.chromium = {
+  launchPersistentContext: async () => ({
+    newPage: async () => ({
+      addInitScript: async (fn, arg) => { fn(arg); },
+      goto: async () => { global.location.href = 'https://unexpected.example.test/capture'; return { status: () => 302 }; },
+      url: () => global.location.href,
+      evaluate: async (fn, arg) => await fn(arg),
+    }),
+    browser: () => ({}),
+    close: async () => {},
+  }),
   launch: async () => ({
     newPage: async () => ({
       addInitScript: async (fn, arg) => { fn(arg); },
@@ -871,6 +901,38 @@ func TestCaptureHTMLWithPlaywrightPassesWarmupURLToBrowserRuntime(t *testing.T) 
 		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
 		AllowedHosts:   []string{"www.amazon.com"},
 		WarmupURL:      "https://www.amazon.com/",
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err != nil {
+		t.Fatalf("captureHTMLWithPlaywright returned error: %v", err)
+	}
+	if html != "<html></html>" {
+		t.Fatalf("unexpected html: %q", html)
+	}
+}
+
+func TestCaptureHTMLWithPlaywrightProvidesDefaultProfileDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte(`#!/bin/sh
+case "$PRODUCT_CAPTURE_BROWSER_PROFILE_DIR" in
+  /tmp/product-capture-browser-*/chrome-profile) ;;
+  *) echo "profile=$PRODUCT_CAPTURE_BROWSER_PROFILE_DIR" >&2; exit 24 ;;
+esac
+printf '<html></html>'
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", "")
+
+	html, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
 		TimeoutSeconds: 1,
 		MaxHTMLBytes:   1024,
 	})
@@ -2343,7 +2405,7 @@ exports.chromium = {
 };
 exports.errors = { TimeoutError };
 `
-	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	_, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3")
 	if err == nil {
 		t.Fatalf("expected late interstitial to fail closed")
 	}
@@ -3152,7 +3214,7 @@ exports.chromium = {
       waitForLoadState: async () => {},
       waitForFunction: async (fn, arg) => withDocument(fn, arg),
       evaluate: async (fn, arg) => {
-        cleanupSweep = String(fn).includes("querySelectorAll('[' + marker + ']'") && !String(fn).includes('return { titleReady');
+        cleanupSweep = String(fn).includes("querySelectorAll('[' + marker + ']'") && !String(fn).includes('continuationGateText');
         try {
           return withDocument(fn, arg);
         } finally {
@@ -3572,7 +3634,14 @@ class TimeoutError extends Error {
 }
 function withDocument(fn, arg) {
   const previousDocument = global.document;
+  const previousLocation = global.location;
+  global.location = {
+    href: 'https://www.amazon.com/dp/B09B8V1LZ3',
+    origin: 'https://www.amazon.com',
+    pathname: '/dp/B09B8V1LZ3',
+  };
   global.document = {
+    title: 'Amazon.com. Spend less. Smile more.',
     body: { textContent: 'shopping page without product details' },
     querySelectorAll: (selector) => {
       if (selector === '#productTitle') return [];
@@ -3585,6 +3654,7 @@ function withDocument(fn, arg) {
     return fn(arg);
   } finally {
     global.document = previousDocument;
+    global.location = previousLocation;
   }
 }
 exports.chromium = {
@@ -3602,15 +3672,20 @@ exports.chromium = {
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
       waitForFunction: async () => { throw new TimeoutError('timeout'); },
-      evaluate: async (fn, arg) => withDocument(fn, arg),
-      content: async () => '<html><body>shopping page without product details</body></html>',
+      evaluate: async (fn, arg) => {
+        if (String(fn).includes('return {') && arg !== 'https://www.amazon.com/dp/B09B8V1LZ3') {
+          throw new Error('diagnostic requested URL mismatch: ' + arg);
+        }
+        return withDocument(fn, arg);
+      },
+      content: async () => '<html><head><title>Amazon.com. Spend less. Smile more.</title></head><body>shopping page without product details</body></html>',
     }),
     close: async () => {},
   }),
 };
 exports.errors = { TimeoutError };
 `
-	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	_, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3")
 	if err == nil {
 		t.Fatalf("expected missing title to fail")
 	}
@@ -3619,6 +3694,13 @@ exports.errors = { TimeoutError };
 		"title_ready=false",
 		"captcha=false",
 		"continuation_candidates=0",
+		"final_url_same_origin=true",
+		"final_path_kind=dp",
+		"requested_asin=B09B8V1LZ3",
+		"current_asin=B09B8V1LZ3",
+		"document_title_class=generic_amazon",
+		"landing_image_present=false",
+		"price_present=false",
 	} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Fatalf("stderr missing sanitized diagnostic %q: %s", want, stderr.String())
@@ -3751,6 +3833,7 @@ exports.chromium = {
       waitForTimeout: async () => {},
       waitForFunction: async () => { throw new TimeoutError('timeout'); },
       evaluate: async (fn, arg) => {
+        if (String(fn).includes('finalURLSameOrigin')) return withDocument(fn, arg);
         if (String(fn).includes('return { titleReady')) return withDocument(fn, arg);
         if (String(fn).includes("querySelectorAll('#productTitle')")) {
           titleReadyCalls++;
@@ -3840,10 +3923,10 @@ exports.errors = { TimeoutError };
 `
 	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
 	if err == nil {
-		t.Fatalf("expected missing title to fail")
+		t.Fatalf("expected uncertain interstitial state to fail closed")
 	}
 	for _, want := range []string{
-		"amazon product page did not expose product title",
+		"amazon interstitial requires manual review",
 		"diagnostics_available=false",
 		"diagnostics_error=captcha_form_count_failed",
 		"title_ready=false",
@@ -3889,6 +3972,10 @@ class TimeoutError extends Error {
       waitForTimeout: async () => {},
       waitForFunction: async () => { throw new TimeoutError('timeout'); },
       evaluate: async (fn, arg) => {
+        if (String(fn).includes('finalURLSameOrigin')) {
+          if (diagnosticsMayFail) throw new Error('execution context destroyed');
+          return { titleReady: false, captchaText: false, captchaChallengeCount: 0, continuationCandidates: 0 };
+        }
         if (String(fn).includes('return { titleReady')) {
           if (diagnosticsMayFail) throw new Error('execution context destroyed');
           return { titleReady: false, captchaText: false, captchaChallengeCount: 0, continuationCandidates: 0 };
@@ -3967,6 +4054,7 @@ exports.chromium = {
       },
       waitForFunction: async (fn, arg) => withDocument(fn, arg),
       evaluate: async (fn, arg) => {
+        if (String(fn).includes('finalURLSameOrigin')) return withDocument(fn, arg);
         if (String(fn).includes('return { titleReady')) return withDocument(fn, arg);
         if (!threwProductTitleReady && String(fn).includes("querySelectorAll('#productTitle')")) {
           threwProductTitleReady = true;

@@ -547,6 +547,9 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 
 	cmd := exec.CommandContext(ctx, "node", scriptPath, w.URL, fmt.Sprintf("%d", timeout.Milliseconds()))
 	cmd.Env = os.Environ()
+	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
+		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR="+filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
+	}
 	if strings.TrimSpace(w.WarmupURL) != "" {
 		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_WARMUP_URL="+strings.TrimSpace(w.WarmupURL))
 	}
@@ -604,6 +607,9 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 	defer os.RemoveAll(filepath.Dir(scriptPath))
 	cmd := exec.CommandContext(ctx, "node", scriptPath, rawURL)
 	cmd.Env = os.Environ()
+	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
+		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR="+filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
+	}
 	var stderr bytes.Buffer
 	cmd.Stdout = stdout
 	cmd.Stderr = &stderr
@@ -1131,6 +1137,48 @@ async function collectAmazonPageSignals(page, requestedURL) {
       const normalized = String(value || '').trim().toUpperCase();
       return /^[A-Z0-9]{10}$/.test(normalized) ? normalized : '';
     };
+    const pathKindFromURL = (value) => {
+      try {
+        const base = typeof location !== 'undefined' ? location.href : 'https://www.amazon.com/';
+        const parsed = new URL(String(value || ''), base);
+        const parts = parsed.pathname.split('/').filter(Boolean);
+        if (parts.length === 0) return 'home';
+        if (parts[0] === 'errors' && parts[1] === 'validateCaptcha') return 'errors_validate_captcha';
+        for (let index = 0; index < parts.length; index++) {
+          if (parts[index] === 'dp' && parts[index + 1]) return 'dp';
+          if (parts[index] === 'gp' && parts[index + 1] === 'product' && parts[index + 2]) return 'gp_product';
+          if (parts[index] === 'gp' && parts[index + 1] === 'aw' && parts[index + 2] === 'd' && parts[index + 3]) return 'gp_aw_d';
+        }
+      } catch {}
+      return 'other';
+    };
+    const documentTitleClass = () => {
+      const title = String((document && document.title) || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (!title) return 'empty';
+      if (title === 'amazon.com. spend less. smile more.') return 'generic_amazon';
+      if (title.includes('robot check')) return 'robot_check';
+      if (title.includes('captcha')) return 'captcha';
+      if (title.includes('sign in')) return 'sign_in';
+      if (title.includes('security challenge')) return 'security_challenge';
+      if (title.includes('unavailable') || title.includes('not available')) return 'unavailable';
+      if (title.includes('sorry') || title.includes('error')) return 'error';
+      return 'other';
+    };
+    const selectorPresent = (selectors) => selectors.some((selector) => Boolean(attr(selector, 'src') || attr(selector, 'data-a-dynamic-image') || attr(selector, 'data-old-hires') || text(selector)));
+    const bodyTermFlags = (bodyText) => {
+      const flags = [];
+      const add = (flag, terms) => {
+        if (terms.some((term) => bodyText.includes(term))) flags.push(flag);
+      };
+      add('continue_shopping', ['continue shopping', 'continue browsing']);
+      add('robot_check', ['not a robot', 'make sure you are not a robot']);
+      add('captcha', ['captcha', 'characters you see']);
+      add('unusual_activity', ['unusual activity', 'automated access']);
+      add('sign_in', ['sign in to continue', 'continue to sign in']);
+      add('unavailable', ['currently unavailable', 'not available']);
+      add('error', ['sorry', 'something went wrong']);
+      return flags.length > 0 ? flags : ['none'];
+    };
     const hasMetadataProductEvidence = () => {
       const canonical = attr('link[rel="canonical"]', 'href') || '';
       const canonicalASIN = asinFromURL(canonical);
@@ -1188,6 +1236,15 @@ async function collectAmazonPageSignals(page, requestedURL) {
     const titleReady = domTitleReady || metadataTitleReady || broadTitleReady;
     const captchaForms = Array.from(document.querySelectorAll('form[action*="/errors/validateCaptcha"]'));
     const bodyText = ((document.body && document.body.textContent) || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const canonical = attr('link[rel="canonical"]', 'href') || '';
+    const requestedASIN = asinFromURL(requestedURL);
+    const currentURL = typeof location !== 'undefined' ? location.href : '';
+    const currentASIN = asinFromURL(currentURL);
+    const canonicalASIN = asinFromURL(canonical);
+    let finalURLSameOrigin = false;
+    try {
+      finalURLSameOrigin = Boolean(requestedURL && currentURL && new URL(requestedURL, currentURL).origin === new URL(currentURL).origin);
+    } catch {}
     const captchaChallengeCount = document.querySelectorAll(captchaSelector).length;
     const captchaText = (
       bodyText.includes('enter the characters you see below') ||
@@ -1234,8 +1291,29 @@ async function collectAmazonPageSignals(page, requestedURL) {
         }
       }
     }
-    return { titleReady, metadataTitleReady, broadTitleReady, titleSamples, continuationGateText, captchaText, captchaChallengeCount, continuationCandidates, formContinuationCandidates, continuationLabelSamples };
-  });
+    return {
+      titleReady,
+      metadataTitleReady,
+      broadTitleReady,
+      titleSamples,
+      continuationGateText,
+      captchaText,
+      captchaChallengeCount,
+      continuationCandidates,
+      formContinuationCandidates,
+      continuationLabelSamples,
+      finalURLSameOrigin,
+      finalPathKind: pathKindFromURL(currentURL),
+      requestedASIN,
+      currentASIN,
+      canonicalASIN,
+      documentTitleClass: documentTitleClass(),
+      landingImagePresent: selectorPresent(['#landingImage', '#imgTagWrapperId img', '#main-image-container img']),
+      pricePresent: selectorPresent(['#corePrice_feature_div .a-offscreen', '#apex_desktop .a-offscreen', '.apexPriceToPay .a-offscreen', '.priceToPay .a-offscreen']),
+      availabilityPresent: selectorPresent(['#availability', '#outOfStock']),
+      bodyTermFlags: bodyTermFlags(bodyText),
+    };
+  }, requestedURL);
 }
 
 async function hasAmazonInterstitial(page, requestedURL) {
@@ -1293,6 +1371,10 @@ async function amazonCaptureDiagnostics(page, requestedURL) {
   const formatLabels = (labels) => Array.isArray(labels) && labels.length > 0
     ? labels.slice(0, 5).map((label) => String(label).replace(/[^a-z0-9 ._-]/g, '').slice(0, 80)).join('|')
     : '';
+  const formatToken = (value) => String(value || '').replace(/[^A-Za-z0-9_.:-]/g, '').slice(0, 80);
+  const formatTokens = (values) => Array.isArray(values) && values.length > 0
+    ? values.slice(0, 8).map(formatToken).filter(Boolean).join('|')
+    : '';
   return [
     'diagnostics_available=' + diagnosticsAvailable,
     diagnosticsError ? 'diagnostics_error=' + diagnosticsError : '',
@@ -1306,6 +1388,16 @@ async function amazonCaptureDiagnostics(page, requestedURL) {
     diagnosticsAvailable && formatLabels(signals.continuationLabelSamples) ? 'continuation_labels=' + formatLabels(signals.continuationLabelSamples) : '',
     signalsAvailable ? 'broad_title_ready=' + Boolean(signals.broadTitleReady) : '',
     signalsAvailable && formatLabels(signals.titleSamples) ? 'title_samples=' + formatLabels(signals.titleSamples) : '',
+    signalsAvailable ? 'final_url_same_origin=' + Boolean(signals.finalURLSameOrigin) : '',
+    signalsAvailable && formatToken(signals.finalPathKind) ? 'final_path_kind=' + formatToken(signals.finalPathKind) : '',
+    signalsAvailable && formatToken(signals.requestedASIN) ? 'requested_asin=' + formatToken(signals.requestedASIN) : '',
+    signalsAvailable && formatToken(signals.currentASIN) ? 'current_asin=' + formatToken(signals.currentASIN) : '',
+    signalsAvailable && formatToken(signals.canonicalASIN) ? 'canonical_asin=' + formatToken(signals.canonicalASIN) : '',
+    signalsAvailable && formatToken(signals.documentTitleClass) ? 'document_title_class=' + formatToken(signals.documentTitleClass) : '',
+    signalsAvailable ? 'landing_image_present=' + Boolean(signals.landingImagePresent) : '',
+    signalsAvailable ? 'price_present=' + Boolean(signals.pricePresent) : '',
+    signalsAvailable ? 'availability_present=' + Boolean(signals.availabilityPresent) : '',
+    signalsAvailable && formatTokens(signals.bodyTermFlags) ? 'body_terms=' + formatTokens(signals.bodyTermFlags) : '',
   ].filter(Boolean).join(' ');
 }
 
@@ -1640,6 +1732,10 @@ async function main() {
           device_pixel_ratio: safe(() => window.devicePixelRatio, null),
           chrome_runtime_present: safe(() => Boolean(window.chrome && window.chrome.runtime), false),
           prefers_color_scheme_dark: safe(() => window.matchMedia('(prefers-color-scheme: dark)').matches, null),
+        },
+        automation: {
+          playwright_binding_present: safe(() => typeof window.__playwright__binding__ !== 'undefined', false),
+          playwright_init_scripts_present: safe(() => typeof window.__pwInitScripts !== 'undefined', false),
         },
         screen: {
           width: safe(() => screen.width, null),
