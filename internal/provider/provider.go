@@ -922,7 +922,7 @@ function configuredWarmupURL(targetURL) {
 
 async function navigateFromCurrentDocument(page, targetURL, deadline) {
   const navigationTimeout = Math.min(10000, remainingTimeout(deadline));
-  const waitForNavigation = typeof page.waitForNavigation === 'function'
+  const waitForNavigation = typeof page.waitForNavigation === 'function' && navigationTimeout > 0
     ? page.waitForNavigation({ waitUntil: 'commit', timeout: navigationTimeout }).catch((err) => {
         if (!isTransientNavigationError(err)) throw err;
       })

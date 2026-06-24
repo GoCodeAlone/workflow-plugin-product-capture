@@ -483,6 +483,7 @@ func TestBrowserScriptSupportsNaturalWarmupNavigation(t *testing.T) {
 		"same origin",
 		"window.location.assign",
 		"const navigationTimeout = Math.min(10000, remainingTimeout(deadline));",
+		"navigationTimeout > 0",
 		"page.waitForNavigation({ waitUntil: 'commit', timeout: navigationTimeout })",
 	} {
 		if !strings.Contains(playwrightCaptureScript, required) {
