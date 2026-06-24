@@ -1319,7 +1319,7 @@ async function collectAmazonPageSignals(page, requestedURL) {
 async function hasAmazonInterstitial(page, requestedURL) {
   let captchaFormCount = 0;
   try {
-    captchaFormCount = await page.locator('form[action*="/errors/validateCaptcha"]').count();
+    captchaFormCount = await countAmazonCaptchaForms(page);
   } catch {
     return true;
   }
@@ -1354,7 +1354,7 @@ async function amazonCaptureDiagnostics(page, requestedURL) {
   let signalsAvailable = true;
   let diagnosticsError = '';
   try {
-    captchaFormCount = await page.locator('form[action*="/errors/validateCaptcha"]').count();
+    captchaFormCount = await countAmazonCaptchaForms(page);
   } catch {
     diagnosticsAvailable = false;
     diagnosticsError = 'captcha_form_count_failed';
@@ -1399,6 +1399,22 @@ async function amazonCaptureDiagnostics(page, requestedURL) {
     signalsAvailable ? 'availability_present=' + Boolean(signals.availabilityPresent) : '',
     signalsAvailable && formatTokens(signals.bodyTermFlags) ? 'body_terms=' + formatTokens(signals.bodyTermFlags) : '',
   ].filter(Boolean).join(' ');
+}
+
+async function countAmazonCaptchaForms(page) {
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await page.locator('form[action*="/errors/validateCaptcha"]').count();
+    } catch (err) {
+      lastErr = err;
+      if (!isTransientNavigationError(err)) throw err;
+      if (attempt < 2 && typeof page.waitForTimeout === 'function') {
+        await page.waitForTimeout(100 * (attempt + 1));
+      }
+    }
+  }
+  throw lastErr || new Error('captcha form count failed');
 }
 
 async function amazonManualReviewError(page, requestedURL) {
