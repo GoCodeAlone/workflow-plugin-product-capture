@@ -1583,7 +1583,7 @@ async function main() {
     if (await hasAmazonInterstitial(page, url)) {
       throw await amazonManualReviewError(page, url);
     }
-    const titleWait = Math.min(remainingTimeout(deadline), 15000);
+    const titleWait = remainingTimeout(deadline);
     if (titleWait > 0) {
       await waitForProductTitle(page, url, Date.now() + titleWait);
     }

@@ -4084,6 +4084,69 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptUsesCaptureTimeoutForAmazonTitleReadiness(t *testing.T) {
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let titleWaitTimeout = 0;
+function withDocument(fn, arg) {
+  const previousDocument = global.document;
+  global.document = {
+    body: { textContent: 'product page' },
+    querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: '', textContent: 'Echo Dot' }] : [],
+    querySelector: (selector) => {
+      if (selector === '#landingImage') return { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+      return null;
+    },
+  };
+  try {
+    return fn(arg);
+  } finally {
+    global.document = previousDocument;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async () => {},
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') {
+          return { count: async () => 0 };
+        }
+        return { count: async () => 0, first: () => ({ click: async () => {} }) };
+      },
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn, arg, options) => {
+        const waitOptions = options || arg || {};
+        if (String(fn).includes('hasMetadataProductEvidence')) {
+          titleWaitTimeout = waitOptions.timeout || 0;
+          if (titleWaitTimeout <= 60000) throw new Error('title wait did not use capture timeout: ' + titleWaitTimeout);
+        }
+        return true;
+      },
+      evaluate: async (fn, arg) => withDocument(fn, arg),
+      content: async () => '<html><body data-title-wait-timeout="' + titleWaitTimeout + '"><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURLTimeout(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3", "120000")
+	if err != nil {
+		t.Fatalf("capture script should use long capture timeout for amazon title readiness: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `data-title-wait-timeout="`) || strings.Contains(stdout.String(), `data-title-wait-timeout="15000"`) {
+		t.Fatalf("capture script did not expose a long title readiness wait: %s", stdout.String())
+	}
+}
+
 func TestPlaywrightScriptTreatsContinuationPrecheckErrorAsOptional(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {
@@ -4404,7 +4467,7 @@ func TestPlaywrightScriptRetriesPlainNavigationTimeoutWithinBudget(t *testing.T)
 		"productTitleReady(page, url)",
 		"waitForProductTitle(page, url, deadline)",
 		"if (timeout <= 0) return await productTitleReady(page, requestedURL).catch(() => false)",
-		"const titleWait = Math.min(remainingTimeout(deadline), 15000)",
+		"const titleWait = remainingTimeout(deadline)",
 		"await waitForProductTitle(page, url, Date.now() + titleWait)",
 		"remainingTimeout(deadline",
 		"Math.floor(budget * 0.65)",
