@@ -100,6 +100,7 @@ type productCaptureStepConfig struct {
 	URL                     string   `json:"url,omitempty"`
 	URLField                string   `json:"url_field,omitempty"`
 	AllowedHosts            []string `json:"allowed_hosts"`
+	WarmupURL               string   `json:"warmup_url,omitempty"`
 	CaptureMode             string   `json:"capture_mode,omitempty"`
 	CaptureTimeoutSeconds   int      `json:"capture_timeout_seconds,omitempty"`
 	MaxHTMLBytes            int64    `json:"max_html_bytes,omitempty"`
@@ -165,6 +166,7 @@ func (s *productCaptureStep) Execute(ctx context.Context, _ map[string]any, _ ma
 	input := productCaptureProviderInput{
 		URL:            url,
 		AllowedHosts:   append([]string(nil), s.config.AllowedHosts...),
+		WarmupURL:      s.config.WarmupURL,
 		CaptureMode:    s.config.CaptureMode,
 		TimeoutSeconds: s.config.CaptureTimeoutSeconds,
 		MaxHTMLBytes:   s.config.MaxHTMLBytes,
@@ -209,6 +211,7 @@ func (s *productCaptureStep) Execute(ctx context.Context, _ map[string]any, _ ma
 type productCaptureProviderInput struct {
 	URL            string   `json:"url"`
 	AllowedHosts   []string `json:"allowed_hosts"`
+	WarmupURL      string   `json:"warmup_url,omitempty"`
 	CaptureMode    string   `json:"capture_mode,omitempty"`
 	TimeoutSeconds int      `json:"timeout_seconds,omitempty"`
 	MaxHTMLBytes   int64    `json:"max_html_bytes,omitempty"`

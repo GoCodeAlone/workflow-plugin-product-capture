@@ -63,6 +63,7 @@ type dynamicEnvelope struct {
 type Workload struct {
 	URL            string   `json:"url"`
 	AllowedHosts   []string `json:"allowed_hosts"`
+	WarmupURL      string   `json:"warmup_url,omitempty"`
 	CaptureMode    string   `json:"capture_mode,omitempty"`
 	TimeoutSeconds int      `json:"timeout_seconds,omitempty"`
 	MaxHTMLBytes   int64    `json:"max_html_bytes,omitempty"`
@@ -454,6 +455,15 @@ func validateWorkload(w Workload) error {
 	if _, ok := supportedAmazonHosts[host]; !ok {
 		return fmt.Errorf("unsupported host %q", host)
 	}
+	if strings.TrimSpace(w.WarmupURL) != "" {
+		warmup, err := url.Parse(w.WarmupURL)
+		if err != nil {
+			return fmt.Errorf("parse warmup_url: %w", err)
+		}
+		if warmup.Scheme != parsed.Scheme || !strings.EqualFold(warmup.Host, parsed.Host) {
+			return errors.New("warmup_url must be same-origin with url")
+		}
+	}
 	if w.CaptureMode != "" && w.CaptureMode != CaptureModeBrowser && w.CaptureMode != CaptureModeMeta {
 		return fmt.Errorf("unsupported capture_mode %q", w.CaptureMode)
 	}
@@ -511,6 +521,9 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 
 	cmd := exec.CommandContext(ctx, "node", scriptPath, w.URL, fmt.Sprintf("%d", timeout.Milliseconds()))
 	cmd.Env = os.Environ()
+	if strings.TrimSpace(w.WarmupURL) != "" {
+		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_WARMUP_URL="+strings.TrimSpace(w.WarmupURL))
+	}
 	var stderr bytes.Buffer
 	var stdout limitedBuffer
 	stdout.max = maxHTMLBytes(w.MaxHTMLBytes)
