@@ -13,6 +13,18 @@ import (
 
 const releaseURLPrefix = "https://github.com/GoCodeAlone/workflow-plugin-product-capture/releases/download/"
 
+var releaseTargets = []struct {
+	os   string
+	arch string
+}{
+	{os: "linux", arch: "amd64"},
+	{os: "linux", arch: "arm64"},
+	{os: "darwin", arch: "amd64"},
+	{os: "darwin", arch: "arm64"},
+	{os: "windows", arch: "amd64"},
+	{os: "windows", arch: "arm64"},
+}
+
 type Manifest struct {
 	Name             string            `json:"name"`
 	Version          string            `json:"version"`
@@ -89,17 +101,14 @@ func Prepare(manifest Manifest, tag string) (Manifest, error) {
 	if manifest.Name == "" {
 		return Manifest{}, errors.New("plugin.json.name is required")
 	}
-	if len(manifest.Downloads) == 0 {
-		return Manifest{}, errors.New("plugin.json.downloads is required")
-	}
 	manifest.Version = version
-	manifest.Downloads = append([]Download(nil), manifest.Downloads...)
-	for i := range manifest.Downloads {
-		dl := &manifest.Downloads[i]
-		if dl.OS == "" || dl.Arch == "" {
-			return Manifest{}, fmt.Errorf("downloads[%d] must declare os and arch", i)
-		}
-		dl.URL = fmt.Sprintf("%s%s/%s-%s-%s.tar.gz", releaseURLPrefix, tag, manifest.Name, dl.OS, dl.Arch)
+	manifest.Downloads = make([]Download, 0, len(releaseTargets))
+	for _, target := range releaseTargets {
+		manifest.Downloads = append(manifest.Downloads, Download{
+			OS:   target.os,
+			Arch: target.arch,
+			URL:  fmt.Sprintf("%s%s/%s-%s-%s.tar.gz", releaseURLPrefix, tag, manifest.Name, target.os, target.arch),
+		})
 	}
 	return manifest, nil
 }

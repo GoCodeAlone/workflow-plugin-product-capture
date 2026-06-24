@@ -23,6 +23,24 @@ func TestPrepareUpdatesVersionAndDownloadURLs(t *testing.T) {
 	}
 }
 
+func TestPrepareIncludesPublishedWindowsARM64Download(t *testing.T) {
+	got, err := Prepare(sampleManifest(), "v0.2.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Download{
+		OS:   "windows",
+		Arch: "arm64",
+		URL:  "https://github.com/GoCodeAlone/workflow-plugin-product-capture/releases/download/v0.2.0/workflow-plugin-product-capture-windows-arm64.tar.gz",
+	}
+	for _, download := range got.Downloads {
+		if download == want {
+			return
+		}
+	}
+	t.Fatalf("prepared downloads missing %+v: %+v", want, got.Downloads)
+}
+
 func TestCheckRejectsStaleManifest(t *testing.T) {
 	current := sampleManifest()
 	expected, err := Prepare(current, "v0.2.0")
