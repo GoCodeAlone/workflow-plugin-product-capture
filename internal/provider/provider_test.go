@@ -4065,7 +4065,7 @@ exports.chromium = {
         if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
       },
       evaluate: async (fn, arg) => withDocument(fn, arg),
-      content: async () => '<html><body><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+      content: async () => '<html><body data-captcha-form-count-calls="' + captchaFormCountCalls + '"><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
     }),
     close: async () => {},
   }),
@@ -4078,6 +4078,9 @@ exports.errors = { TimeoutError };
 	}
 	if !strings.Contains(stdout.String(), `id="productTitle"`) {
 		t.Fatalf("capture script did not emit product html after transient captcha count: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), `data-captcha-form-count-calls="4"`) {
+		t.Fatalf("capture script did not retry transient captcha count before emitting html: %s", stdout.String())
 	}
 }
 
