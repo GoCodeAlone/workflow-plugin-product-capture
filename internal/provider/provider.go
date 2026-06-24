@@ -921,9 +921,9 @@ function configuredWarmupURL(targetURL) {
 }
 
 async function navigateFromCurrentDocument(page, targetURL, deadline) {
-  const timeout = remainingTimeout(deadline, 5000);
-  const waitForNavigation = typeof page.waitForNavigation === 'function'
-    ? page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout }).catch((err) => {
+  const navigationTimeout = Math.min(10000, remainingTimeout(deadline));
+  const waitForNavigation = typeof page.waitForNavigation === 'function' && navigationTimeout > 0
+    ? page.waitForNavigation({ waitUntil: 'commit', timeout: navigationTimeout }).catch((err) => {
         if (!isTransientNavigationError(err)) throw err;
       })
     : Promise.resolve();
@@ -932,7 +932,8 @@ async function navigateFromCurrentDocument(page, targetURL, deadline) {
   }, targetURL);
   await waitForNavigation;
   if (typeof page.waitForLoadState === 'function') {
-    await page.waitForLoadState('domcontentloaded', { timeout: remainingTimeout(deadline, 5000) }).catch((err) => {
+    const loadTimeout = Math.min(5000, remainingTimeout(deadline));
+    if (loadTimeout > 0) await page.waitForLoadState('domcontentloaded', { timeout: loadTimeout }).catch((err) => {
       if (!isTransientNavigationError(err)) throw err;
     });
   }
