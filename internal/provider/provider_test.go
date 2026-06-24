@@ -314,7 +314,7 @@ exports.chromium = {
       addInitScript: async (fn, arg) => { fn(arg); },
       goto: async (url) => { global.location.href = url; return { status: () => 200 }; },
       url: () => global.location.href,
-      evaluate: async (fn) => await fn(),
+      evaluate: async (fn, arg) => await fn(arg),
     }),
     close: async () => {},
   }),
@@ -398,7 +398,7 @@ exports.chromium = {
       addInitScript: async (fn, arg) => { fn(arg); },
       goto: async () => { global.location.href = 'https://unexpected.example.test/capture'; return { status: () => 302 }; },
       url: () => global.location.href,
-      evaluate: async (fn) => await fn(),
+      evaluate: async (fn, arg) => await fn(arg),
     }),
     close: async () => {},
   }),
@@ -450,6 +450,67 @@ func TestBrowserDiagnosticScriptSharesCaptureBrowserIdentity(t *testing.T) {
 		if !strings.Contains(playwrightBrowserDiagnosticScript, required) {
 			t.Fatalf("diagnostic script missing capture browser identity behavior %q", required)
 		}
+	}
+}
+
+func TestBrowserScriptSupportsConfiguredViewport(t *testing.T) {
+	for _, script := range []struct {
+		name string
+		body string
+	}{
+		{name: "capture", body: playwrightCaptureScript},
+		{name: "diagnostic", body: playwrightBrowserDiagnosticScript},
+	} {
+		t.Run(script.name, func(t *testing.T) {
+			for _, required := range []string{
+				"PRODUCT_CAPTURE_BROWSER_VIEWPORT",
+				"parseBrowserViewport",
+				"viewport: parseBrowserViewport()",
+			} {
+				if !strings.Contains(script.body, required) {
+					t.Fatalf("%s script missing configurable viewport behavior %q", script.name, required)
+				}
+			}
+		})
+	}
+}
+
+func TestBrowserScriptSupportsNaturalWarmupNavigation(t *testing.T) {
+	for _, required := range []string{
+		"PRODUCT_CAPTURE_BROWSER_WARMUP_URL",
+		"gotoTargetWithOptionalWarmup",
+		"navigateFromCurrentDocument",
+		"same origin",
+		"window.location.assign",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("capture script missing natural warmup navigation behavior %q", required)
+		}
+	}
+	if !strings.Contains(playwrightBrowserDiagnosticScript, "gotoTargetWithOptionalWarmup") {
+		t.Fatalf("diagnostic script should share warmup navigation path")
+	}
+}
+
+func TestBrowserScriptDoesNotExposeProductCaptureNamedPageGlobals(t *testing.T) {
+	for _, script := range []struct {
+		name string
+		body string
+	}{
+		{name: "capture", body: playwrightCaptureScript},
+		{name: "diagnostic", body: playwrightBrowserDiagnosticScript},
+	} {
+		t.Run(script.name, func(t *testing.T) {
+			for _, disallowed := range []string{
+				"__productCaptureRequestedURL",
+				"__productCaptureDiagnosticOrigin",
+				"globalThis.__productCapture",
+			} {
+				if strings.Contains(script.body, disallowed) {
+					t.Fatalf("%s script exposes product-capture named page global %q", script.name, disallowed)
+				}
+			}
+		})
 	}
 }
 
@@ -1052,7 +1113,7 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: 'product page' },
@@ -1063,7 +1124,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1084,10 +1145,10 @@ exports.chromium = {
         },
         waitForLoadState: async () => {},
         waitForTimeout: async () => {},
-        waitForFunction: async (fn) => {
-          if (!withDocument(fn)) throw new TimeoutError('timeout');
+        waitForFunction: async (fn, arg) => {
+          if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
         },
-        evaluate: async (fn) => withDocument(fn),
+        evaluate: async (fn, arg) => withDocument(fn, arg),
         content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
       }),
       close: async () => {},
@@ -1130,12 +1191,13 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
   const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/gp/anything' : '' };
   const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
-  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/gp/anything') {
+  arg = arg || 'https://www.amazon.com/gp/anything';
+  if (arg !== 'https://www.amazon.com/gp/anything') {
     throw new Error('requested URL was not injected');
   }
   global.document = {
@@ -1152,7 +1214,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1171,11 +1233,11 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (withDocument(fn)) throw new Error('generic /gp metadata was accepted by title wait predicate');
+      waitForFunction: async (fn, arg) => {
+        if (withDocument(fn, arg)) throw new Error('generic /gp metadata was accepted by title wait predicate');
         throw new TimeoutError('timeout');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/gp/anything"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
     }),
     close: async () => {},
@@ -1200,12 +1262,13 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
   const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/dp/not-a-real-product' : '' };
   const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
-  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/dp/not-a-real-product') {
+  arg = arg || 'https://www.amazon.com/dp/not-a-real-product';
+  if (arg !== 'https://www.amazon.com/dp/not-a-real-product') {
     throw new Error('requested URL was not injected');
   }
   global.document = {
@@ -1222,7 +1285,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1241,11 +1304,11 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (withDocument(fn)) throw new Error('malformed ASIN metadata was accepted by title wait predicate');
+      waitForFunction: async (fn, arg) => {
+        if (withDocument(fn, arg)) throw new Error('malformed ASIN metadata was accepted by title wait predicate');
         throw new TimeoutError('timeout');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/not-a-real-product"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
     }),
     close: async () => {},
@@ -1285,12 +1348,13 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
   const canonicalNode = { getAttribute: (name) => name === 'href' ? %q : '' };
   const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
-  if (global.__productCaptureRequestedURL !== %q) {
+  arg = arg || %q;
+  if (arg !== %q) {
     throw new Error('requested URL was not injected');
   }
   global.document = {
@@ -1307,7 +1371,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1326,17 +1390,17 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      waitForFunction: async (fn, arg) => {
+        if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="%s"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
     }),
     close: async () => {},
   }),
 };
 exports.errors = { TimeoutError };
-`, canonicalURL, targetURL, targetURL, canonicalURL)
+	`, canonicalURL, targetURL, targetURL, targetURL, canonicalURL)
 	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, targetURL)
 	if err != nil {
 		t.Fatalf("capture script failed with metadata evidence for %s: %v\nstderr=%s", targetURL, err, stderr.String())
@@ -1376,7 +1440,7 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: 'product page' },
@@ -1387,7 +1451,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1406,10 +1470,10 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (!withDocument(fn)) throw new Error('optional/title predicate did not accept main image container');
+      waitForFunction: async (fn, arg) => {
+        if (!withDocument(fn, arg)) throw new Error('optional/title predicate did not accept main image container');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span><div id="main-image-container"><img src="https://m.media-amazon.com/images/I/echo.jpg"></div></body></html>',
     }),
     close: async () => {},
@@ -1434,7 +1498,7 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = [
     { value: '', textContent: '' },
@@ -1445,7 +1509,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1459,11 +1523,11 @@ exports.chromium = {
         if (selector !== 'form[action*="/errors/validateCaptcha"]') throw new Error('unexpected selector ' + selector);
         return { count: async () => 0 };
       },
-      waitForFunction: async (fn) => {
-        withDocument(fn);
+      waitForFunction: async (fn, arg) => {
+withDocument(fn, arg);
         throw new TimeoutError('Timeout 15000ms exceeded');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B08H75RTZ8"></head><body><input id="productTitle" value="Xbox Series X"><img id="landingImage" src="https://m.media-amazon.com/images/I/xbox.jpg"></body></html>',
     }),
     close: async () => {},
@@ -1495,12 +1559,13 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
   const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3' : '' };
   const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
-  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
+  arg = arg || 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3';
+  if (arg !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
     throw new Error('requested URL was not injected');
   }
   global.document = {
@@ -1517,7 +1582,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1536,10 +1601,10 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      waitForFunction: async (fn, arg) => {
+        if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
     }),
     close: async () => {},
@@ -1568,12 +1633,13 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
   const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3' : '' };
   const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
-  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
+  arg = arg || 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3';
+  if (arg !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
     throw new Error('requested URL was not injected');
   }
   global.document = {
@@ -1590,7 +1656,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1609,10 +1675,10 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      waitForFunction: async (fn, arg) => {
+        if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><div id="main-image-container"><img src="https://m.media-amazon.com/images/I/echo.jpg"></div></body></html>',
     }),
     close: async () => {},
@@ -1641,12 +1707,13 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
   const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/dp/B09B8V1LZ3' : '' };
   const priceNode = { textContent: '$34.99', getAttribute: () => '' };
-  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/dp/B09B8V1LZ3') {
+  arg = arg || 'https://www.amazon.com/dp/B09B8V1LZ3';
+  if (arg !== 'https://www.amazon.com/dp/B09B8V1LZ3') {
     throw new Error('requested URL was not injected');
   }
   global.document = {
@@ -1663,7 +1730,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1682,10 +1749,10 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      waitForFunction: async (fn, arg) => {
+        if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><div class="priceToPay"><span class="a-offscreen">$34.99</span></div></body></html>',
     }),
     close: async () => {},
@@ -1726,10 +1793,11 @@ const continuationNode = {
   setAttribute: (name, value) => { attrs[name] = value; },
   removeAttribute: (name) => { delete attrs[name]; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
-  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
+  arg = arg || 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3';
+  if (arg !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
     throw new Error('requested URL was not injected');
   }
   global.document = {
@@ -1750,7 +1818,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1776,10 +1844,10 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      waitForFunction: async (fn, arg) => {
+        if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => clicked
         ? '<html><head><link rel="canonical" href="https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>'
         : '<html><head><link rel="canonical" href="https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><input value="Continue Shopping"></body></html>',
@@ -1806,12 +1874,13 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon.com. Spend less. Smile more.' : '' };
   const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/dp/B09B8V1LZ3' : '' };
   const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
-  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/dp/B09B8V1LZ3') {
+  arg = arg || 'https://www.amazon.com/dp/B09B8V1LZ3';
+  if (arg !== 'https://www.amazon.com/dp/B09B8V1LZ3') {
     throw new Error('requested URL was not injected');
   }
   global.document = {
@@ -1828,7 +1897,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1847,11 +1916,11 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (withDocument(fn)) throw new Error('generic metadata was accepted by title wait predicate');
+      waitForFunction: async (fn, arg) => {
+        if (withDocument(fn, arg)) throw new Error('generic metadata was accepted by title wait predicate');
         throw new TimeoutError('timeout');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><meta property="og:title" content="Amazon.com. Spend less. Smile more."></head><body>shopping page without product details</body></html>',
     }),
     close: async () => {},
@@ -1876,12 +1945,13 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const metaNode = { getAttribute: (name) => name === 'content' ? 'Amazon Echo Dot (newest model) - Vibrant sounding speaker' : '' };
   const canonicalNode = { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/dp/B08WRONG11' : '' };
   const imageNode = { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
-  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
+  arg = arg || 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3';
+  if (arg !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
     throw new Error('requested URL was not injected');
   }
   global.document = {
@@ -1898,7 +1968,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -1917,11 +1987,11 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (withDocument(fn)) throw new Error('mismatched canonical metadata was accepted by title wait predicate');
+      waitForFunction: async (fn, arg) => {
+        if (withDocument(fn, arg)) throw new Error('mismatched canonical metadata was accepted by title wait predicate');
         throw new TimeoutError('timeout');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B08WRONG11"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
     }),
     close: async () => {},
@@ -1958,9 +2028,10 @@ const continuationNode = {
   setAttribute: (name, value) => { attrs[name] = value; },
   removeAttribute: (name) => { delete attrs[name]; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
-  if (global.__productCaptureRequestedURL !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
+  arg = arg || 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3';
+  if (arg !== 'https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3') {
     throw new Error('requested URL was not injected');
   }
   global.document = {
@@ -1981,7 +2052,7 @@ function withDocument(fn) {
     },
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2007,10 +2078,10 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
-      waitForFunction: async (fn) => {
-        if (!withDocument(fn)) throw new TimeoutError('timeout');
+      waitForFunction: async (fn, arg) => {
+        if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
       },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3"><meta property="og:title" content="Amazon Echo Dot (newest model) - Vibrant sounding speaker"></head><body><input value="Continue Shopping"><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
     }),
     close: async () => {},
@@ -2035,7 +2106,7 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: '' },
@@ -2043,7 +2114,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2058,7 +2129,7 @@ exports.chromium = {
         return { count: async () => 0 };
       },
       waitForFunction: async () => { throw new Error('Target page, context or browser has been closed'); },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body><input id="productTitle" value="Xbox Series X"></body></html>',
     }),
     close: async () => {},
@@ -2084,7 +2155,7 @@ class TimeoutError extends Error {
   }
 }
 let locatorChecks = 0;
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = [
     { value: '', textContent: '' },
@@ -2095,7 +2166,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2109,8 +2180,8 @@ exports.chromium = {
         if (selector !== 'form[action*="/errors/validateCaptcha"]') throw new Error('unexpected selector ' + selector);
         return { count: async () => locatorChecks++ === 0 ? 0 : 1 };
       },
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body><input id="productTitle" value="Xbox Series X"><form action="/errors/validateCaptcha"></form></body></html>',
     }),
     close: async () => {},
@@ -2144,7 +2215,7 @@ const continuationNode = {
   setAttribute: (name, value) => { attrs[name] = value; },
   removeAttribute: (name) => { delete attrs[name]; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
@@ -2158,7 +2229,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2186,8 +2257,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
     }),
     close: async () => {},
@@ -2222,7 +2293,7 @@ const continuationNode = {
   removeAttribute: (name) => { delete attrs[name]; },
 };
 const captchaForm = { contains: (node) => node === continuationNode };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
@@ -2238,7 +2309,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2266,8 +2337,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
     }),
     close: async () => {},
@@ -2301,7 +2372,7 @@ const continuationNode = {
   removeAttribute: (name) => { delete attrs[name]; },
 };
 const captchaForm = { contains: () => false };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: 'Continue Shopping' },
@@ -2316,7 +2387,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2345,7 +2416,7 @@ exports.chromium = {
       },
       waitForLoadState: async () => {},
       waitForFunction: async () => { throw new TimeoutError('timeout'); },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body>continue shopping outside form</body></html>',
     }),
     close: async () => {},
@@ -2379,7 +2450,7 @@ const continuationNode = {
   setAttribute: (name, value) => { attrs[name] = value; },
   removeAttribute: (name) => { delete attrs[name]; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
@@ -2393,7 +2464,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2421,8 +2492,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
     }),
     close: async () => {},
@@ -2455,7 +2526,7 @@ const continuationNode = {
   getAttribute: (name) => attrs[name] || '',
   setAttribute: (name, value) => { attrs[name] = value; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
@@ -2469,7 +2540,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2497,8 +2568,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
     }),
     close: async () => {},
@@ -2532,7 +2603,7 @@ const continuationNode = {
   setAttribute: (name, value) => { attrs[name] = value; },
   removeAttribute: (name) => { delete attrs[name]; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
@@ -2546,7 +2617,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2577,8 +2648,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body><span id="productTitle">Echo Dot</span></body></html>',
     }),
     close: async () => {},
@@ -2621,7 +2692,7 @@ const continuationNodes = [
     removeAttribute: (name) => { delete attrs[1][name]; },
   },
 ];
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
@@ -2634,7 +2705,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2674,8 +2745,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
     }),
     close: async () => {},
@@ -2709,7 +2780,7 @@ const continuationNode = {
   setAttribute: (name, value) => { attrs[name] = value; },
   removeAttribute: (name) => { delete attrs[name]; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
@@ -2722,7 +2793,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2761,8 +2832,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span></body></html>',
     }),
     close: async () => {},
@@ -2796,7 +2867,7 @@ const continuationNode = {
   setAttribute: (name, value) => { attrs[name] = value; },
   removeAttribute: (name) => { delete attrs[name]; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
@@ -2810,7 +2881,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2841,8 +2912,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body><span id="productTitle">Echo Dot</span><input value="Continue Shopping" ' + (attrs['data-product-capture-continuation-candidate'] ? 'data-product-capture-continuation-candidate="true"' : '') + '></body></html>',
     }),
     close: async () => {},
@@ -2880,7 +2951,7 @@ const continuationNode = {
     delete attrs[name];
   },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const titleNodes = clicked ? [{ value: '', textContent: ' Echo Dot ' }] : [];
   global.document = {
@@ -2894,7 +2965,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2925,11 +2996,11 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => {
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => {
         cleanupSweep = String(fn).includes("querySelectorAll('[' + marker + ']'") && !String(fn).includes('return { titleReady');
         try {
-          return withDocument(fn);
+          return withDocument(fn, arg);
         } finally {
           cleanupSweep = false;
         }
@@ -2967,7 +3038,7 @@ const mutatedNode = {
   setAttribute: (name, value) => { attrs[name] = value; },
   removeAttribute: (name) => { delete attrs[name]; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: ' product page ' },
@@ -2980,7 +3051,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -2997,11 +3068,11 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => {
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => {
         cleanupSweep = String(fn).includes("querySelectorAll('[' + marker + ']'") && !String(fn).includes('return { titleReady');
         try {
-          return withDocument(fn);
+          return withDocument(fn, arg);
         } finally {
           cleanupSweep = false;
         }
@@ -3030,7 +3101,7 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: "Sorry, we need to make sure you're not a robot." },
@@ -3038,7 +3109,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3063,8 +3134,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body>captcha</body></html>',
     }),
     close: async () => {},
@@ -3089,7 +3160,7 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   const attrs = {};
   const continuationNode = {
@@ -3109,7 +3180,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3134,8 +3205,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body>challenge</body></html>',
     }),
     close: async () => {},
@@ -3168,7 +3239,7 @@ const continuationNode = {
   setAttribute: (name, value) => { attrs[name] = value; },
   removeAttribute: (name) => { delete attrs[name]; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: 'We detected unusual activity. Continue to sign in.' },
@@ -3181,7 +3252,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3211,7 +3282,7 @@ exports.chromium = {
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
       waitForFunction: async () => { throw new TimeoutError('timeout'); },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body>blocked continue</body></html>',
     }),
     close: async () => {},
@@ -3236,7 +3307,7 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: 'Continue Shopping' },
@@ -3248,7 +3319,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3273,8 +3344,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body>captcha image</body></html>',
     }),
     close: async () => {},
@@ -3345,7 +3416,7 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: 'shopping page without product details' },
@@ -3357,7 +3428,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3377,7 +3448,7 @@ exports.chromium = {
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
       waitForFunction: async () => { throw new TimeoutError('timeout'); },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body>shopping page without product details</body></html>',
     }),
     close: async () => {},
@@ -3425,7 +3496,7 @@ const privateControl = {
   setAttribute: () => {},
   removeAttribute: () => {},
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: 'shopping page without product details' },
@@ -3437,7 +3508,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3456,7 +3527,7 @@ exports.chromium = {
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
       waitForFunction: async () => { throw new TimeoutError('timeout'); },
-      evaluate: async (fn) => withDocument(fn),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body>shopping page without product details</body></html>',
     }),
     close: async () => {},
@@ -3498,7 +3569,7 @@ class TimeoutError extends Error {
   }
 }
 let titleReadyCalls = 0;
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: 'plain page' },
@@ -3506,7 +3577,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3525,13 +3596,13 @@ exports.chromium = {
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
       waitForFunction: async () => { throw new TimeoutError('timeout'); },
-      evaluate: async (fn) => {
-        if (String(fn).includes('return { titleReady')) return withDocument(fn);
+      evaluate: async (fn, arg) => {
+        if (String(fn).includes('return { titleReady')) return withDocument(fn, arg);
         if (String(fn).includes("querySelectorAll('#productTitle')")) {
           titleReadyCalls++;
           if (titleReadyCalls >= 3) throw new Error('execution context destroyed during final title check');
         }
-        return withDocument(fn);
+        return withDocument(fn, arg);
       },
       content: async () => '<html><body>plain page</body></html>',
     }),
@@ -3560,7 +3631,7 @@ class TimeoutError extends Error {
     this.name = 'TimeoutError';
   }
 }
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: 'shopping page without product details' },
@@ -3572,7 +3643,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3598,13 +3669,13 @@ exports.chromium = {
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
       waitForFunction: async () => { throw new TimeoutError('timeout'); },
-      evaluate: async (fn) => {
-        if (String(fn).includes('return { titleReady')) return withDocument(fn);
+      evaluate: async (fn, arg) => {
+        if (String(fn).includes('return { titleReady')) return withDocument(fn, arg);
         if (String(fn).includes("querySelectorAll('#productTitle')")) {
           titleReadyCalls++;
           if (titleReadyCalls >= 3) diagnosticsMayFail = true;
         }
-        return withDocument(fn);
+        return withDocument(fn, arg);
       },
       content: async () => '<html><body>shopping page without product details</body></html>',
     }),
@@ -3661,7 +3732,7 @@ class TimeoutError extends Error {
       waitForLoadState: async () => {},
       waitForTimeout: async () => {},
       waitForFunction: async () => { throw new TimeoutError('timeout'); },
-      evaluate: async (fn) => {
+      evaluate: async (fn, arg) => {
         if (String(fn).includes('return { titleReady')) {
           if (diagnosticsMayFail) throw new Error('execution context destroyed');
           return { titleReady: false, captchaText: false, captchaChallengeCount: 0, continuationCandidates: 0 };
@@ -3712,14 +3783,14 @@ class TimeoutError extends Error {
   }
 }
 let threwProductTitleReady = false;
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     querySelectorAll: (selector) => selector === '#productTitle' ? [{ value: '', textContent: ' Echo Dot ' }] : [],
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3738,14 +3809,14 @@ exports.chromium = {
         }
         throw new Error('unexpected selector ' + selector);
       },
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => {
-        if (String(fn).includes('return { titleReady')) return withDocument(fn);
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => {
+        if (String(fn).includes('return { titleReady')) return withDocument(fn, arg);
         if (!threwProductTitleReady && String(fn).includes("querySelectorAll('#productTitle')")) {
           threwProductTitleReady = true;
           throw new Error('Execution context was destroyed');
         }
-        return withDocument(fn);
+        return withDocument(fn, arg);
       },
       content: async () => '<html><body><span id="productTitle">Echo Dot</span></body></html>',
     }),
@@ -3780,7 +3851,7 @@ const continuationNode = {
   setAttribute: (name, value) => { attrs[name] = value; },
   removeAttribute: (name) => { delete attrs[name]; },
 };
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: ' Continue Shopping ' },
@@ -3793,7 +3864,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3827,8 +3898,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => '<html><body><span id="productTitle">Echo Dot</span></body></html>',
     }),
     close: async () => {},
@@ -3865,7 +3936,7 @@ const continuationNodes = attrs.map((nodeAttrs) => ({
   setAttribute: (name, value) => { nodeAttrs[name] = value; },
   removeAttribute: (name) => { delete nodeAttrs[name]; },
 }));
-function withDocument(fn) {
+function withDocument(fn, arg) {
   const previousDocument = global.document;
   global.document = {
     body: { textContent: ' Continue Shopping ' },
@@ -3877,7 +3948,7 @@ function withDocument(fn) {
     querySelector: () => null,
   };
   try {
-    return fn();
+    return fn(arg);
   } finally {
     global.document = previousDocument;
   }
@@ -3914,8 +3985,8 @@ exports.chromium = {
         return { count: async () => 0, first: () => ({ click: async () => {} }) };
       },
       waitForLoadState: async () => {},
-      waitForFunction: async (fn) => withDocument(fn),
-      evaluate: async (fn) => withDocument(fn),
+      waitForFunction: async (fn, arg) => withDocument(fn, arg),
+      evaluate: async (fn, arg) => withDocument(fn, arg),
       content: async () => titleReady ? '<html><body><span id="productTitle">Echo Dot</span></body></html>' : '<html><body>No title yet</body></html>',
     }),
     close: async () => {},
@@ -4003,14 +4074,11 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 			t.Fatalf("playwright script must retry transient navigation failure path %q", required)
 		}
 	}
-	if strings.Contains(playwrightCaptureScript, "waitUntil: 'domcontentloaded'") {
-		t.Fatalf("playwright script should not make Amazon DOMContentLoaded the primary navigation gate")
-	}
-	retryIndex := strings.Index(playwrightCaptureScript, "await gotoWithTransientRetry(page, url, deadline);")
+	retryIndex := strings.Index(playwrightCaptureScript, "await gotoTargetWithOptionalWarmup(page, url, deadline);")
 	captchaIndex := -1
 	if retryIndex >= 0 {
 		afterRetry := playwrightCaptureScript[retryIndex:]
-		if relative := strings.Index(afterRetry, "if (await hasAmazonInterstitial(page))"); relative >= 0 {
+		if relative := strings.Index(afterRetry, "if (await hasAmazonInterstitial(page, url))"); relative >= 0 {
 			captchaIndex = retryIndex + relative
 		}
 	}
@@ -4022,11 +4090,11 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 func TestPlaywrightScriptRetriesPlainNavigationTimeoutWithinBudget(t *testing.T) {
 	for _, required := range []string{
 		"'Timeout',",
-		"productTitleReady(page)",
-		"waitForProductTitle(page, deadline)",
-		"if (timeout <= 0) return await safeProductTitleReady(page)",
+		"productTitleReady(page, url)",
+		"waitForProductTitle(page, url, deadline)",
+		"if (timeout <= 0) return await productTitleReady(page, requestedURL).catch(() => false)",
 		"const titleWait = Math.min(remainingTimeout(deadline), 15000)",
-		"await waitForProductTitle(page, Date.now() + titleWait)",
+		"await waitForProductTitle(page, url, Date.now() + titleWait)",
 		"remainingTimeout(deadline",
 		"Math.floor(budget * 0.65)",
 		"if (loadTimeout > 0) await page.waitForLoadState('domcontentloaded'",
