@@ -467,6 +467,43 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	}
 }
 
+func TestRunBrowserDiagnosticAcceptsSuccessfulOutputWithNonzeroTeardown(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte(`#!/bin/sh
+printf '%s\n' '
+{
+  "target_url": "https://diagnostic.example.test/",
+  "final_url": "https://diagnostic.example.test/",
+  "posted_to_origin": true,
+  "post_error": "",
+  "browser_signals": {
+    "webgl": {
+      "available": true,
+      "vendor": "Google Inc. (Google)",
+      "renderer": "ANGLE (Google, Vulkan 1.3.0 (SwiftShader Device (Subzero) (0x0000C0DE)), SwiftShader driver)"
+    }
+  }
+}
+'
+exit 1
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+
+	var stdout bytes.Buffer
+	if err := runBrowserDiagnostic("https://diagnostic.example.test/", &stdout); err != nil {
+		t.Fatalf("runBrowserDiagnostic should accept complete successful output: %v", err)
+	}
+	if !strings.Contains(stdout.String(), `"posted_to_origin": true`) {
+		t.Fatalf("diagnostic output was not preserved: %s", stdout.String())
+	}
+}
+
 func TestBrowserDiagnosticScriptSharesCaptureBrowserIdentity(t *testing.T) {
 	if !strings.Contains(playwrightBrowserDiagnosticScript, "launchChromeBrowser") {
 		t.Fatalf("diagnostic script must use the shared browser launcher")
@@ -529,6 +566,18 @@ func TestBrowserScriptSupportsConfiguredViewport(t *testing.T) {
 	}
 	if !strings.Contains(playwrightCaptureScript, "const fallback = { width: 1920, height: 1080 };") {
 		t.Fatal("capture script should use a desktop-sized default viewport")
+	}
+}
+
+func TestBrowserScriptEnablesContainerWebGL(t *testing.T) {
+	for _, required := range []string{
+		"--enable-webgl",
+		"--use-gl=swiftshader",
+		"--enable-unsafe-swiftshader",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Fatalf("browser prelude missing container WebGL launch flag %q", required)
+		}
 	}
 }
 
@@ -1148,7 +1197,7 @@ func TestRuntimeDockerfileInstallsXvfbDependencies(t *testing.T) {
 		t.Fatalf("read Dockerfile: %v", err)
 	}
 	dockerfile := string(content)
-	for _, pkg := range []string{"xvfb", "xauth"} {
+	for _, pkg := range []string{"libegl1", "libgl1-mesa-dri", "libgles2", "xvfb", "xauth"} {
 		if !strings.Contains(dockerfile, pkg) {
 			t.Fatalf("runtime Dockerfile must install %s for headed browser mode", pkg)
 		}
