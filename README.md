@@ -78,9 +78,10 @@ reset the capture identity.
 
 Amazon browser captures default to a same-origin homepage warmup before
 document navigation to the product URL, so staging tasks that omit `warmup_url`
-still enter through `https://<amazon-host>/`. Set `warmup_url` only when the
-caller needs a different same-origin page. The default browser viewport is
-`1920x1080`; operators can override it with
+still enter through the submitted URL's scheme and Amazon host, such as
+`https://www.amazon.com/` for HTTPS `www.amazon.com` submissions. Set
+`warmup_url` only when the caller needs a different same-origin page. The
+default browser viewport is `1920x1080`; operators can override it with
 `PRODUCT_CAPTURE_BROWSER_VIEWPORT=<width>x<height>` within the supported
 desktop range.
 

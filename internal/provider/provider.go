@@ -549,14 +549,14 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
-		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR="+filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
 	}
 	warmupURL := strings.TrimSpace(w.WarmupURL)
 	if warmupURL == "" {
 		warmupURL = defaultBrowserWarmupURL(w.URL)
 	}
 	if warmupURL != "" {
-		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_WARMUP_URL="+warmupURL)
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_WARMUP_URL", warmupURL)
 	}
 	var stderr bytes.Buffer
 	var stdout limitedBuffer
@@ -577,6 +577,26 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 		return "", fmt.Errorf("browser capture failed: %w", stdout.err)
 	}
 	return stdout.String(), nil
+}
+
+func withEnvValue(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			if !replaced {
+				out = append(out, prefix+value)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, entry)
+	}
+	if !replaced {
+		out = append(out, prefix+value)
+	}
+	return out
 }
 
 func defaultBrowserWarmupURL(rawURL string) string {
@@ -625,7 +645,7 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
-		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR="+filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
 	}
 	var stderr bytes.Buffer
 	cmd.Stdout = stdout

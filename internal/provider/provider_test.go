@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -939,6 +940,23 @@ func TestCaptureHTMLWithPlaywrightDefaultsAmazonWarmupURL(t *testing.T) {
 	}
 	if html != "<html></html>" {
 		t.Fatalf("unexpected html: %q", html)
+	}
+}
+
+func TestWithEnvValueReplacesExistingKey(t *testing.T) {
+	got := withEnvValue([]string{
+		"PATH=/bin",
+		"PRODUCT_CAPTURE_BROWSER_WARMUP_URL=",
+		"OTHER=value",
+		"PRODUCT_CAPTURE_BROWSER_WARMUP_URL=https://old.example.test/",
+	}, "PRODUCT_CAPTURE_BROWSER_WARMUP_URL", "https://www.amazon.com/")
+	want := []string{
+		"PATH=/bin",
+		"PRODUCT_CAPTURE_BROWSER_WARMUP_URL=https://www.amazon.com/",
+		"OTHER=value",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("withEnvValue() = %#v, want %#v", got, want)
 	}
 }
 
