@@ -648,23 +648,18 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
 	}
 	var stderr, out bytes.Buffer
-	cmd.Stdout = &out
+	cmd.Stdout = io.MultiWriter(stdout, &out)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		if out.Len() > 0 {
-			_, _ = stdout.Write(out.Bytes())
-			if browserDiagnosticOutputSucceeded(out.Bytes()) {
-				return nil
-			}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && browserDiagnosticOutputSucceeded(out.Bytes()) {
+			return nil
 		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
 		return fmt.Errorf("browser diagnostic failed: %s", msg)
-	}
-	if out.Len() > 0 {
-		_, _ = stdout.Write(out.Bytes())
 	}
 	return nil
 }

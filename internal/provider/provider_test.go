@@ -494,6 +494,7 @@ exit 1
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
 
 	var stdout bytes.Buffer
 	if err := runBrowserDiagnostic("https://diagnostic.example.test/", &stdout); err != nil {
