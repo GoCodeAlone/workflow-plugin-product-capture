@@ -14,7 +14,7 @@ RUN set -eux; \
     chmod 0644 /etc/apt/keyrings/google-linux.gpg; \
     echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-linux.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list; \
     apt-get update; \
-    apt-get install -y --no-install-recommends google-chrome-stable xvfb; \
+    apt-get install -y --no-install-recommends google-chrome-stable xauth xvfb; \
     npm install -g playwright@1.57.0; \
     npm cache clean --force; \
     apt-get purge -y --auto-remove curl gnupg; \
