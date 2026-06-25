@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -504,6 +505,9 @@ func TestBrowserScriptSupportsConfiguredViewport(t *testing.T) {
 			}
 		})
 	}
+	if !strings.Contains(playwrightCaptureScript, "const fallback = { width: 1920, height: 1080 };") {
+		t.Fatal("capture script should use a desktop-sized default viewport")
+	}
 }
 
 func TestBrowserScriptSupportsNaturalWarmupNavigation(t *testing.T) {
@@ -910,6 +914,69 @@ func TestCaptureHTMLWithPlaywrightPassesWarmupURLToBrowserRuntime(t *testing.T) 
 	}
 	if html != "<html></html>" {
 		t.Fatalf("unexpected html: %q", html)
+	}
+}
+
+func TestCaptureHTMLWithPlaywrightDefaultsAmazonWarmupURL(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\n[ \"$PRODUCT_CAPTURE_BROWSER_WARMUP_URL\" = 'https://www.amazon.com/' ] || { echo \"warmup=$PRODUCT_CAPTURE_BROWSER_WARMUP_URL\" >&2; exit 23; }\nprintf '<html></html>'\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_WARMUP_URL", "")
+
+	html, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err != nil {
+		t.Fatalf("captureHTMLWithPlaywright returned error: %v", err)
+	}
+	if html != "<html></html>" {
+		t.Fatalf("unexpected html: %q", html)
+	}
+}
+
+func TestWithEnvValueReplacesExistingKey(t *testing.T) {
+	got := withEnvValue([]string{
+		"PATH=/bin",
+		"PRODUCT_CAPTURE_BROWSER_WARMUP_URL=",
+		"OTHER=value",
+		"PRODUCT_CAPTURE_BROWSER_WARMUP_URL=https://old.example.test/",
+	}, "PRODUCT_CAPTURE_BROWSER_WARMUP_URL", "https://www.amazon.com/")
+	want := []string{
+		"PATH=/bin",
+		"PRODUCT_CAPTURE_BROWSER_WARMUP_URL=https://www.amazon.com/",
+		"OTHER=value",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("withEnvValue() = %#v, want %#v", got, want)
+	}
+}
+
+func TestDefaultBrowserWarmupURLRequiresSupportedAmazonHost(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		url  string
+		want string
+	}{
+		{name: "www amazon", url: "https://www.amazon.com/dp/B09B8V1LZ3", want: "https://www.amazon.com/"},
+		{name: "amazon", url: "https://amazon.com/dp/B09B8V1LZ3", want: "https://amazon.com/"},
+		{name: "preserves port", url: "https://www.amazon.com:443/dp/B09B8V1LZ3", want: "https://www.amazon.com:443/"},
+		{name: "unsupported", url: "https://example.com/product", want: ""},
+		{name: "invalid", url: "://bad", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := defaultBrowserWarmupURL(tc.url); got != tc.want {
+				t.Fatalf("defaultBrowserWarmupURL(%q) = %q, want %q", tc.url, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -4876,6 +4943,20 @@ func TestPlaywrightScriptRetriesTransientNavigationFailures(t *testing.T) {
 	}
 	if retryIndex < 0 || captchaIndex < 0 || captchaIndex < retryIndex {
 		t.Fatal("playwright script must check CAPTCHA/interstitials after retryable navigation only")
+	}
+}
+
+func TestPlaywrightScriptTreatsClosedTargetsAsBrowserCrashes(t *testing.T) {
+	for _, required := range []string{
+		"target page, context or browser has been closed",
+		"target page context or browser has been closed",
+		"browser has been closed",
+		"context has been closed",
+		"page has been closed",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("playwright script must retry closed browser target error %q", required)
+		}
 	}
 }
 

@@ -549,10 +549,14 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
-		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR="+filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
 	}
-	if strings.TrimSpace(w.WarmupURL) != "" {
-		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_WARMUP_URL="+strings.TrimSpace(w.WarmupURL))
+	warmupURL := strings.TrimSpace(w.WarmupURL)
+	if warmupURL == "" {
+		warmupURL = defaultBrowserWarmupURL(w.URL)
+	}
+	if warmupURL != "" {
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_WARMUP_URL", warmupURL)
 	}
 	var stderr bytes.Buffer
 	var stdout limitedBuffer
@@ -573,6 +577,37 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 		return "", fmt.Errorf("browser capture failed: %w", stdout.err)
 	}
 	return stdout.String(), nil
+}
+
+func withEnvValue(env []string, key, value string) []string {
+	prefix := key + "="
+	out := make([]string, 0, len(env)+1)
+	replaced := false
+	for _, entry := range env {
+		if strings.HasPrefix(entry, prefix) {
+			if !replaced {
+				out = append(out, prefix+value)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, entry)
+	}
+	if !replaced {
+		out = append(out, prefix+value)
+	}
+	return out
+}
+
+func defaultBrowserWarmupURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	if _, ok := supportedAmazonHosts[canonicalHost(parsed.Hostname())]; !ok {
+		return ""
+	}
+	return parsed.Scheme + "://" + parsed.Host + "/"
 }
 
 func writeBrowserCaptureScript() (string, error) {
@@ -610,7 +645,7 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
-		cmd.Env = append(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR="+filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
 	}
 	var stderr bytes.Buffer
 	cmd.Stdout = stdout
@@ -787,6 +822,11 @@ function isBrowserTargetCrashError(err) {
   return [
     'target crashed',
     'page crashed',
+    'target page, context or browser has been closed',
+    'target page context or browser has been closed',
+    'browser has been closed',
+    'context has been closed',
+    'page has been closed',
   ].some((needle) => normalized.includes(needle));
 }
 
@@ -795,7 +835,7 @@ function diagnosticErrorToken(err) {
 }
 
 function parseBrowserViewport() {
-  const fallback = { width: 1440, height: 900 };
+  const fallback = { width: 1920, height: 1080 };
   const raw = String(process.env.PRODUCT_CAPTURE_BROWSER_VIEWPORT || '').trim();
   if (!raw) return fallback;
   const match = raw.match(/^(\d{3,5})x(\d{3,5})$/i);
