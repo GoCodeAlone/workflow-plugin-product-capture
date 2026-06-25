@@ -545,7 +545,7 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	}
 	defer os.RemoveAll(filepath.Dir(scriptPath))
 
-	cmd := exec.CommandContext(ctx, "node", scriptPath, w.URL, fmt.Sprintf("%d", timeout.Milliseconds()))
+	cmd := browserNodeCommand(ctx, scriptPath, w.URL, fmt.Sprintf("%d", timeout.Milliseconds()))
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
@@ -641,7 +641,7 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 		return err
 	}
 	defer os.RemoveAll(filepath.Dir(scriptPath))
-	cmd := exec.CommandContext(ctx, "node", scriptPath, rawURL)
+	cmd := browserNodeCommand(ctx, scriptPath, rawURL)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
@@ -671,6 +671,28 @@ func writeBrowserDiagnosticScript() (string, error) {
 		return "", fmt.Errorf("write browser diagnostic script: %w", err)
 	}
 	return path, nil
+}
+
+func browserNodeCommand(ctx context.Context, scriptPath string, args ...string) *exec.Cmd {
+	nodeArgs := append([]string{scriptPath}, args...)
+	if browserShouldUseXvfb() {
+		xvfbArgs := append([]string{"-a", "node"}, nodeArgs...)
+		return exec.CommandContext(ctx, "xvfb-run", xvfbArgs...)
+	}
+	return exec.CommandContext(ctx, "node", nodeArgs...)
+}
+
+func browserShouldUseXvfb() bool {
+	return !browserHeadlessEnabled() && strings.TrimSpace(os.Getenv("DISPLAY")) == ""
+}
+
+func browserHeadlessEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_HEADLESS"))) {
+	case "0", "false", "no", "off", "headed":
+		return false
+	default:
+		return true
+	}
 }
 
 func timeoutSeconds(value int) int {
@@ -847,6 +869,11 @@ function parseBrowserViewport() {
   return { width, height };
 }
 
+function parseBrowserHeadless() {
+  const raw = String(process.env.PRODUCT_CAPTURE_BROWSER_HEADLESS || '').trim().toLowerCase();
+  return !['0', 'false', 'no', 'off', 'headed'].includes(raw);
+}
+
 async function installCaptureBrowserIdentity(page, rawChromeVersion) {
   const chromeVersion = normalizeChromeVersion(rawChromeVersion);
   const chromeMajor = chromeMajorVersion(chromeVersion);
@@ -932,7 +959,7 @@ async function installCaptureBrowserIdentity(page, rawChromeVersion) {
 async function launchChromeBrowser() {
   const launchOptions = {
     channel: 'chrome',
-    headless: true,
+    headless: parseBrowserHeadless(),
     args: [
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
