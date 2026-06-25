@@ -998,6 +998,34 @@ function configuredWarmupURL(targetURL) {
   return warmup.href;
 }
 
+function normalizedAmazonASIN(value) {
+  const normalized = String(value || '').trim().toUpperCase();
+  return /^[A-Z0-9]{10}$/.test(normalized) ? normalized : '';
+}
+
+function amazonASINFromURL(value, baseURL) {
+  if (!String(value || '').trim()) return '';
+  try {
+    const parsed = new URL(String(value || ''), baseURL || 'https://www.amazon.com/');
+    const parts = parsed.pathname.split('/');
+    for (let index = 0; index < parts.length; index++) {
+      if (parts[index] === 'dp' && parts[index + 1]) return normalizedAmazonASIN(parts[index + 1]);
+      if (parts[index] === 'gp' && parts[index + 1] === 'product' && parts[index + 2]) return normalizedAmazonASIN(parts[index + 2]);
+      if (parts[index] === 'gp' && parts[index + 1] === 'aw' && parts[index + 2] === 'd' && parts[index + 3]) return normalizedAmazonASIN(parts[index + 3]);
+    }
+  } catch {}
+  return '';
+}
+
+function canonicalAmazonProductURL(value) {
+  try {
+    const parsed = new URL(String(value || ''));
+    const asin = amazonASINFromURL(parsed.href, parsed.href);
+    return asin ? parsed.origin + '/dp/' + asin : '';
+  } catch {}
+  return '';
+}
+
 async function navigateFromCurrentDocument(page, targetURL, deadline) {
   const navigationTimeout = Math.min(10000, remainingTimeout(deadline));
   const waitForNavigation = typeof page.waitForNavigation === 'function' && navigationTimeout > 0
@@ -1542,6 +1570,27 @@ async function handleAmazonContinuationGate(page, requestedURL, deadline) {
   return true;
 }
 
+function isAmazonHomeLandingWithoutProductEvidence(signals) {
+  if (!signals || !signals.requestedASIN) return false;
+  if (signals.titleReady || signals.metadataTitleReady || signals.broadTitleReady) return false;
+  if (signals.currentASIN || signals.canonicalASIN) return false;
+  if (signals.finalPathKind !== 'home') return false;
+  if (signals.landingImagePresent || signals.pricePresent || signals.availabilityPresent) return false;
+  const bodyTerms = Array.isArray(signals.bodyTermFlags) ? signals.bodyTermFlags : [];
+  return bodyTerms.length === 0 || (bodyTerms.length === 1 && bodyTerms[0] === 'none');
+}
+
+async function retryCanonicalAmazonProductURLAfterHomeLanding(page, requestedURL, deadline) {
+  const signals = await collectAmazonPageSignals(page, requestedURL).catch(() => null);
+  if (!isAmazonHomeLandingWithoutProductEvidence(signals)) return false;
+  const canonicalURL = canonicalAmazonProductURL(requestedURL);
+  if (!canonicalURL) return false;
+  const currentURL = typeof page.url === 'function' ? page.url() : '';
+  if (currentURL === canonicalURL) return false;
+  await gotoWithTransientRetry(page, canonicalURL, deadline);
+  return true;
+}
+
 async function waitForProductTitle(page, requestedURL, deadline) {
   const timeout = remainingTimeout(deadline);
   if (timeout <= 0) return await productTitleReady(page, requestedURL).catch(() => false);
@@ -1687,6 +1736,12 @@ async function captureMain(url, deadline) {
     await handleAmazonContinuationGate(page, url, deadline);
     if (await hasAmazonInterstitial(page, url, deadline)) {
       throw await amazonManualReviewError(page, url);
+    }
+    if (await retryCanonicalAmazonProductURLAfterHomeLanding(page, url, deadline)) {
+      if (await hasAmazonInterstitial(page, url, deadline)) {
+        throw await amazonManualReviewError(page, url);
+      }
+      await handleAmazonContinuationGate(page, url, deadline);
     }
     if (remainingTimeout(deadline) > 0) {
       await waitForProductTitle(page, url, deadline);
