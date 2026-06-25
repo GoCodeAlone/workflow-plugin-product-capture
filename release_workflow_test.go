@@ -77,6 +77,7 @@ func TestRuntimeImageInstallsChromeAndPlaywrightWithoutBundledBrowser(t *testing
 	dockerfile := string(data)
 	for _, want := range []string{
 		"google-chrome-stable",
+		"xvfb",
 		"npm install -g playwright@",
 		"PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1",
 	} {

@@ -473,7 +473,7 @@ func TestBrowserDiagnosticScriptSharesCaptureBrowserIdentity(t *testing.T) {
 	}
 	for _, required := range []string{
 		"channel: 'chrome'",
-		"headless: true",
+		"headless: parseBrowserHeadless()",
 		"--disable-blink-features=AutomationControlled",
 		"chromeUserAgent",
 		"Network.setUserAgentOverride",
@@ -482,6 +482,28 @@ func TestBrowserDiagnosticScriptSharesCaptureBrowserIdentity(t *testing.T) {
 		if !strings.Contains(playwrightBrowserDiagnosticScript, required) {
 			t.Fatalf("diagnostic script missing capture browser identity behavior %q", required)
 		}
+	}
+}
+
+func TestBrowserScriptSupportsConfiguredHeadlessMode(t *testing.T) {
+	for _, script := range []struct {
+		name string
+		body string
+	}{
+		{name: "capture", body: playwrightCaptureScript},
+		{name: "diagnostic", body: playwrightBrowserDiagnosticScript},
+	} {
+		t.Run(script.name, func(t *testing.T) {
+			for _, required := range []string{
+				"PRODUCT_CAPTURE_BROWSER_HEADLESS",
+				"parseBrowserHeadless",
+				"headless: parseBrowserHeadless()",
+			} {
+				if !strings.Contains(script.body, required) {
+					t.Fatalf("%s script missing configurable headless behavior %q", script.name, required)
+				}
+			}
+		})
 	}
 }
 
@@ -1009,6 +1031,109 @@ printf '<html></html>'
 	}
 	if html != "<html></html>" {
 		t.Fatalf("unexpected html: %q", html)
+	}
+}
+
+func TestCaptureHTMLWithPlaywrightRunsHeadedBrowserThroughXvfbWhenNoDisplay(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte(`#!/bin/sh
+[ "$PRODUCT_CAPTURE_XVFB_WRAPPED" = "1" ] || { echo "node was not launched through xvfb-run" >&2; exit 25; }
+printf '<html></html>'
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	xvfbRun := filepath.Join(dir, "xvfb-run")
+	if err := os.WriteFile(xvfbRun, []byte(`#!/bin/sh
+[ "$1" = "-a" ] || { echo "xvfb-run missing -a" >&2; exit 26; }
+shift
+export PRODUCT_CAPTURE_XVFB_WRAPPED=1
+exec "$@"
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "0")
+	t.Setenv("DISPLAY", "")
+
+	html, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err != nil {
+		t.Fatalf("captureHTMLWithPlaywright returned error: %v", err)
+	}
+	if html != "<html></html>" {
+		t.Fatalf("unexpected html: %q", html)
+	}
+}
+
+func TestCaptureHTMLWithPlaywrightRunsHeadedBrowserDirectlyWhenXvfbUnavailable(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte(`#!/bin/sh
+[ -z "${PRODUCT_CAPTURE_XVFB_WRAPPED:-}" ] || { echo "node unexpectedly launched through xvfb-run" >&2; exit 25; }
+printf '<html></html>'
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "0")
+	t.Setenv("DISPLAY", "")
+
+	html, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err != nil {
+		t.Fatalf("captureHTMLWithPlaywright returned error: %v", err)
+	}
+	if html != "<html></html>" {
+		t.Fatalf("unexpected html: %q", html)
+	}
+}
+
+func TestRunBrowserDiagnosticRunsHeadedBrowserThroughXvfbWhenNoDisplay(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte(`#!/bin/sh
+[ "$PRODUCT_CAPTURE_XVFB_WRAPPED" = "1" ] || { echo "node was not launched through xvfb-run" >&2; exit 25; }
+printf '{"target_url":"https://diagnostic.example.test/","final_url":"https://diagnostic.example.test/"}'
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	xvfbRun := filepath.Join(dir, "xvfb-run")
+	if err := os.WriteFile(xvfbRun, []byte(`#!/bin/sh
+[ "$1" = "-a" ] || { echo "xvfb-run missing -a" >&2; exit 26; }
+shift
+export PRODUCT_CAPTURE_XVFB_WRAPPED=1
+exec "$@"
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "0")
+	t.Setenv("DISPLAY", "")
+
+	var stdout bytes.Buffer
+	if err := runBrowserDiagnostic("https://diagnostic.example.test/", &stdout); err != nil {
+		t.Fatalf("runBrowserDiagnostic returned error: %v", err)
+	}
+	if !strings.Contains(stdout.String(), `"target_url":"https://diagnostic.example.test/"`) {
+		t.Fatalf("unexpected diagnostic output: %s", stdout.String())
 	}
 }
 
