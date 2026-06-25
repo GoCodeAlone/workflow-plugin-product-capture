@@ -647,10 +647,14 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
 		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
 	}
-	var stderr bytes.Buffer
-	cmd.Stdout = stdout
+	var stderr, out bytes.Buffer
+	cmd.Stdout = io.MultiWriter(stdout, &out)
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) && browserDiagnosticOutputSucceeded(out.Bytes()) {
+			return nil
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
@@ -658,6 +662,18 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 		return fmt.Errorf("browser diagnostic failed: %s", msg)
 	}
 	return nil
+}
+
+func browserDiagnosticOutputSucceeded(data []byte) bool {
+	var result struct {
+		FinalURL       string `json:"final_url"`
+		PostedToOrigin bool   `json:"posted_to_origin"`
+		PostError      string `json:"post_error"`
+	}
+	if err := json.Unmarshal(data, &result); err != nil {
+		return false
+	}
+	return result.FinalURL != "" && result.PostedToOrigin && strings.TrimSpace(result.PostError) == ""
 }
 
 func writeBrowserDiagnosticScript() (string, error) {
@@ -969,6 +985,9 @@ async function launchChromeBrowser() {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
+      '--enable-webgl',
+      '--use-gl=swiftshader',
+      '--enable-unsafe-swiftshader',
     ],
   };
   const contextOptions = {
