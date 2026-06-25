@@ -1137,6 +1137,24 @@ exec "$@"
 	}
 }
 
+func TestRuntimeDockerfileInstallsXvfbDependencies(t *testing.T) {
+	_, file, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	root := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+	content, err := os.ReadFile(filepath.Join(root, "docker", "product-capture-browser", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("read Dockerfile: %v", err)
+	}
+	dockerfile := string(content)
+	for _, pkg := range []string{"xvfb", "xauth"} {
+		if !strings.Contains(dockerfile, pkg) {
+			t.Fatalf("runtime Dockerfile must install %s for headed browser mode", pkg)
+		}
+	}
+}
+
 func TestValidateWorkloadRequiresWarmupSameOrigin(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
