@@ -683,7 +683,11 @@ func browserNodeCommand(ctx context.Context, scriptPath string, args ...string) 
 }
 
 func browserShouldUseXvfb() bool {
-	return !browserHeadlessEnabled() && strings.TrimSpace(os.Getenv("DISPLAY")) == ""
+	if browserHeadlessEnabled() || strings.TrimSpace(os.Getenv("DISPLAY")) != "" {
+		return false
+	}
+	_, err := exec.LookPath("xvfb-run")
+	return err == nil
 }
 
 func browserHeadlessEnabled() bool {
