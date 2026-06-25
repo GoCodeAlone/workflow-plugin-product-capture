@@ -1620,12 +1620,16 @@ async function main() {
   const url = process.argv[2];
   const timeout = Number(process.argv[3] || 45000);
   const deadline = Date.now() + timeout;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  const maxBrowserCrashAttempts = 4;
+  for (let attempt = 0; attempt < maxBrowserCrashAttempts; attempt++) {
     try {
       await captureMain(url, deadline);
       return;
     } catch (err) {
-      if (isBrowserTargetCrashError(err) && attempt < 1 && remainingTimeout(deadline) > 0) continue;
+      if (isBrowserTargetCrashError(err) && attempt < maxBrowserCrashAttempts - 1 && remainingTimeout(deadline) > 0) {
+        console.error('product capture: browser target crashed; retrying with fresh browser');
+        continue;
+      }
       throw err;
     }
   }
