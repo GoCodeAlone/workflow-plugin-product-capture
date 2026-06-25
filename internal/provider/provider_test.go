@@ -4286,6 +4286,100 @@ exports.errors = { TimeoutError };
 	}
 }
 
+func TestPlaywrightScriptRetriesCanonicalDPAfterAmazonHomeLanding(t *testing.T) {
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_WARMUP_URL", "https://www.amazon.com/")
+	fakePlaywright := `
+class TimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'TimeoutError';
+  }
+}
+let href = 'about:blank';
+const visits = [];
+function asinFromHref() {
+  const match = href.match(/\/dp\/([A-Z0-9]{10})/i);
+  return match ? match[1].toUpperCase() : '';
+}
+function withDocument(fn, arg) {
+  const asin = asinFromHref();
+  const previousDocument = global.document;
+  const previousLocation = global.location;
+  const previousWindow = global.window;
+  global.location = { href };
+  global.window = { location: { assign: (target) => { href = 'https://www.amazon.com/'; visits.push('assign:' + target + '->home'); } } };
+  global.document = {
+    title: asin ? 'Amazon.com: Echo Dot' : 'Amazon.com. Spend less. Smile more.',
+    body: { textContent: asin ? 'Echo Dot product page' : 'Amazon home' },
+    querySelectorAll: (selector) => {
+      if (selector === '#productTitle' && asin) return [{ value: '', textContent: 'Echo Dot' }];
+      if (selector === 'button,input[type="submit"],input[type="button"],a,[role="button"]') return [];
+      if (selector === '[data-product-capture-continuation-candidate]') return [];
+      if (selector === 'form[action*="/errors/validateCaptcha"]') return [];
+      if (selector.includes('captcha') || selector.includes('challenge')) return [];
+      return [];
+    },
+    querySelector: (selector) => {
+      if (selector === 'link[rel="canonical"]' && asin) return { getAttribute: (name) => name === 'href' ? 'https://www.amazon.com/dp/' + asin : '' };
+      if (selector === '#landingImage' && asin) return { getAttribute: (name) => name === 'src' ? 'https://m.media-amazon.com/images/I/echo.jpg' : '' };
+      return null;
+    },
+  };
+  try {
+    return fn(arg);
+  } finally {
+    global.document = previousDocument;
+    global.location = previousLocation;
+    global.window = previousWindow;
+  }
+}
+exports.chromium = {
+  launch: async () => ({
+    newPage: async () => ({
+      addInitScript: async () => {},
+      goto: async (url) => {
+        visits.push('goto:' + url);
+        href = url;
+      },
+      url: () => href,
+      locator: (selector) => {
+        if (selector === 'form[action*="/errors/validateCaptcha"]') return { count: async () => 0 };
+        if (selector === '[data-product-capture-continuation-candidate="true"]') return { count: async () => 0, first: () => ({ click: async () => {} }), nth: () => ({ click: async () => {} }) };
+        return { count: async () => 0, first: () => ({ click: async () => {} }), nth: () => ({ click: async () => {} }) };
+      },
+      waitForNavigation: async () => {},
+      waitForLoadState: async () => {},
+      waitForTimeout: async () => {},
+      waitForFunction: async (fn, arg) => {
+        if (!withDocument(fn, arg)) throw new TimeoutError('timeout');
+      },
+      evaluate: async (fn, arg) => {
+        if (String(fn).includes('window.location.assign')) {
+          href = 'https://www.amazon.com/';
+          visits.push('assign:' + arg + '->home');
+          return;
+        }
+        return withDocument(fn, arg);
+      },
+      content: async () => '<html><body data-visits="' + visits.join('|') + '"><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError };
+`
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3")
+	if err != nil {
+		t.Fatalf("capture script should retry canonical dp URL after Amazon home landing: %v\nstderr=%s", err, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), `goto:https://www.amazon.com/dp/B09B8V1LZ3`) {
+		t.Fatalf("capture script did not retry canonical dp URL after home landing: %s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), `id="productTitle"`) {
+		t.Fatalf("capture script did not emit product html after canonical retry: %s", stdout.String())
+	}
+}
+
 func TestPlaywrightScriptRetriesFreshBrowserAfterTargetCrashDuringManualReviewDiagnostics(t *testing.T) {
 	fakePlaywright := `
 class TimeoutError extends Error {
