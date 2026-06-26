@@ -11,7 +11,7 @@
       {
         "name": "product-capture",
         "description": "Validate and inspect product capture provider requests",
-        "flags_passthrough": true,
+        "flagsPassthrough": true,
         "subcommands": [
           {
             "name": "probe",
