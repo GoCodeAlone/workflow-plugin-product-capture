@@ -567,6 +567,13 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 		if stdout.err != nil {
 			return "", fmt.Errorf("browser capture failed: %w", stdout.err)
 		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			msg := strings.TrimSpace(stderr.String())
+			if msg != "" {
+				return "", fmt.Errorf("browser capture timed out after %s; last browser stderr: %s", timeout, msg)
+			}
+			return "", fmt.Errorf("browser capture timed out after %s", timeout)
+		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
@@ -719,7 +726,7 @@ func timeoutSeconds(value int) int {
 	if value <= 0 {
 		return 45
 	}
-	return min(value, 300)
+	return min(value, 600)
 }
 
 func maxHTMLBytes(value int64) int64 {
