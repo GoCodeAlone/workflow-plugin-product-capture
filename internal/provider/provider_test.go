@@ -1015,6 +1015,59 @@ func TestCaptureHTMLWithPlaywrightDefaultsAmazonWarmupURL(t *testing.T) {
 	}
 }
 
+func TestCaptureHTMLWithPlaywrightHonorsLongCaptureBudget(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\nprintf '<html data-timeout=\"%s\"></html>' \"$3\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	html, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 480,
+		MaxHTMLBytes:   1024,
+	})
+	if err != nil {
+		t.Fatalf("captureHTMLWithPlaywright returned error: %v", err)
+	}
+	if html != `<html data-timeout="480000"></html>` {
+		t.Fatalf("unexpected timeout arg in html: %q", html)
+	}
+}
+
+func TestCaptureHTMLWithPlaywrightReportsParentContextTimeoutBeforeStaleStderr(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\nprintf 'product capture: browser target crashed; retrying with fresh browser\\n' >&2\nsleep 10\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err == nil {
+		t.Fatalf("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "browser capture timed out after 1s") {
+		t.Fatalf("expected timeout error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "last browser stderr: product capture: browser target crashed; retrying with fresh browser") {
+		t.Fatalf("expected timeout to preserve last stderr, got: %v", err)
+	}
+}
+
 func TestWithEnvValueReplacesExistingKey(t *testing.T) {
 	got := withEnvValue([]string{
 		"PATH=/bin",
