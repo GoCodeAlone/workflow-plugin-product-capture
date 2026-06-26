@@ -1041,6 +1041,9 @@ func TestCaptureHTMLWithPlaywrightHonorsLongCaptureBudget(t *testing.T) {
 }
 
 func TestCaptureHTMLWithPlaywrightReportsParentContextTimeoutBeforeStaleStderr(t *testing.T) {
+	if testing.Short() {
+		t.Skip("timeout regression intentionally waits for the parent context deadline")
+	}
 	if runtime.GOOS == "windows" {
 		t.Skip("fake node executable uses a POSIX shell script")
 	}
