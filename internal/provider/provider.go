@@ -23,15 +23,17 @@ import (
 )
 
 const (
-	ProviderName           = "workflow-plugin-product-capture"
-	ExecutorProvider       = "product-capture-browser"
-	WorkloadKind           = "provider"
-	CaptureOperation       = "capture_product"
-	ProductJSONArtifact    = "product_json"
-	CaptureModeBrowser     = "browser"
-	CaptureModeMeta        = "metadata"
-	ComputeProtocolVersion = "compute.v1alpha1"
-	productArtifactMode    = 0o644
+	ProviderName                  = "workflow-plugin-product-capture"
+	ExecutorProvider              = "product-capture-browser"
+	WorkloadKind                  = "provider"
+	CaptureOperation              = "capture_product"
+	ProductJSONArtifact           = "product_json"
+	BrowserDiagnosticOperation    = "browser_diagnostic"
+	BrowserDiagnosticJSONArtifact = "browser_diagnostic_json"
+	CaptureModeBrowser            = "browser"
+	CaptureModeMeta               = "metadata"
+	ComputeProtocolVersion        = "compute.v1alpha1"
+	productArtifactMode           = 0o644
 )
 
 var Version = "0.1.0"
@@ -69,6 +71,10 @@ type Workload struct {
 	MaxHTMLBytes   int64    `json:"max_html_bytes,omitempty"`
 	MaxImageCount  int      `json:"max_image_count,omitempty"`
 	MetadataOnly   bool     `json:"metadata_only,omitempty"`
+}
+
+type BrowserDiagnosticWorkload struct {
+	URL string `json:"url"`
 }
 
 type probeResponse struct {
@@ -166,26 +172,53 @@ func runDynamic(r io.Reader, stdout io.Writer) error {
 	if err := validateDynamicEnvelope(env); err != nil {
 		return err
 	}
-	var workload Workload
-	dec := json.NewDecoder(bytes.NewReader(env.Input))
+	var artifacts []string
+	switch env.Operation {
+	case CaptureOperation:
+		var workload Workload
+		if err := decodeDynamicOperationInput(env.Input, &workload); err != nil {
+			return err
+		}
+		if err := runWorkload(workload, ProductJSONArtifact); err != nil {
+			return err
+		}
+		artifacts = []string{ProductJSONArtifact}
+	case BrowserDiagnosticOperation:
+		var workload BrowserDiagnosticWorkload
+		if err := decodeDynamicOperationInput(env.Input, &workload); err != nil {
+			return err
+		}
+		var diagnostic bytes.Buffer
+		if err := runBrowserDiagnostic(workload.URL, &diagnostic); err != nil {
+			return err
+		}
+		if err := writeArtifactBytes(BrowserDiagnosticJSONArtifact, diagnostic.Bytes()); err != nil {
+			return err
+		}
+		artifacts = []string{BrowserDiagnosticJSONArtifact}
+	default:
+		return fmt.Errorf("unsupported operation %q", env.Operation)
+	}
+	resp := struct {
+		Artifacts []string `json:"artifacts"`
+	}{
+		Artifacts: artifacts,
+	}
+	enc := json.NewEncoder(stdout)
+	return enc.Encode(resp)
+}
+
+func decodeDynamicOperationInput(data json.RawMessage, out any) error {
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&workload); err != nil {
+	if err := dec.Decode(out); err != nil {
 		return fmt.Errorf("decode operation input: %w", err)
 	}
 	var extra struct{}
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		return errors.New("decode operation input: multiple JSON values")
 	}
-	if err := runWorkload(workload, ProductJSONArtifact); err != nil {
-		return err
-	}
-	resp := struct {
-		Artifacts []string `json:"artifacts"`
-	}{
-		Artifacts: []string{ProductJSONArtifact},
-	}
-	enc := json.NewEncoder(stdout)
-	return enc.Encode(resp)
+	return nil
 }
 
 func readDynamicEnvelope(r io.Reader) (dynamicEnvelope, error) {
@@ -218,7 +251,7 @@ func validateDynamicEnvelope(env dynamicEnvelope) error {
 		env.ProviderConfig.Version != "v1.0.0" {
 		return fmt.Errorf("provider_config does not match product-capture browser v1")
 	}
-	if env.Operation != CaptureOperation {
+	if env.Operation != CaptureOperation && env.Operation != BrowserDiagnosticOperation {
 		return fmt.Errorf("unsupported operation %q", env.Operation)
 	}
 	if err := validateExecutorMetadata(env.Executor); err != nil {
@@ -742,11 +775,15 @@ func writeSnapshot(path string, snap snapshot.Snapshot) error {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
 	data = append(data, '\n')
+	return writeArtifactBytes(path, data)
+}
+
+func writeArtifactBytes(path string, data []byte) error {
 	if err := os.WriteFile(path, data, productArtifactMode); err != nil {
-		return fmt.Errorf("write snapshot: %w", err)
+		return fmt.Errorf("write artifact %q: %w", path, err)
 	}
 	if err := os.Chmod(path, productArtifactMode); err != nil {
-		return fmt.Errorf("chmod snapshot: %w", err)
+		return fmt.Errorf("chmod artifact %q: %w", path, err)
 	}
 	return nil
 }

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema://providers/workflow-plugin-product-capture/browser/operations/browser_diagnostic/input/v1",
+  "title": "Browser diagnostic operation input",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "url": {
+      "type": "string",
+      "format": "uri",
+      "description": "HTTP or HTTPS controlled diagnostic endpoint URL."
+    }
+  },
+  "required": ["url"]
+}
