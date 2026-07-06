@@ -105,6 +105,32 @@ func TestProviderContractAlignsWithWorkflowComputeGenericProviderABI(t *testing.
 	if !containsString(capture.Artifacts, ProductJSONArtifact) {
 		t.Fatalf("operation artifacts = %v, want %q", capture.Artifacts, ProductJSONArtifact)
 	}
+	var diagnostic *struct {
+		ID                 string   `json:"id"`
+		InputSchemaRef     string   `json:"input_schema_ref"`
+		InputSchemaDigest  string   `json:"input_schema_digest"`
+		OutputSchemaRef    string   `json:"output_schema_ref"`
+		OutputSchemaDigest string   `json:"output_schema_digest"`
+		Artifacts          []string `json:"artifacts"`
+	}
+	for i := range contract.Operations {
+		if contract.Operations[i].ID == "browser_diagnostic" {
+			diagnostic = &contract.Operations[i]
+			break
+		}
+	}
+	if diagnostic == nil {
+		t.Fatalf("missing browser_diagnostic operation in %+v", contract.Operations)
+	}
+	if diagnostic.InputSchemaRef == "" || diagnostic.OutputSchemaRef == "" {
+		t.Fatalf("diagnostic operation schema refs missing: %+v", *diagnostic)
+	}
+	if !strings.HasPrefix(diagnostic.InputSchemaDigest, "sha256:") || !strings.HasPrefix(diagnostic.OutputSchemaDigest, "sha256:") {
+		t.Fatalf("diagnostic operation schema digests missing: %+v", *diagnostic)
+	}
+	if !containsString(diagnostic.Artifacts, "browser_diagnostic_json") {
+		t.Fatalf("diagnostic artifacts = %v, want browser_diagnostic_json", diagnostic.Artifacts)
+	}
 }
 
 func TestPluginManifestsExposeProviderContract(t *testing.T) {
@@ -826,6 +852,67 @@ func TestMainRunsWorkflowComputeProviderEnvelopeWithRuntimeMetadata(t *testing.T
 	}
 	if !containsString(result.Artifacts, ProductJSONArtifact) {
 		t.Fatalf("artifacts = %v, want %q", result.Artifacts, ProductJSONArtifact)
+	}
+}
+
+func TestMainRunsWorkflowComputeBrowserDiagnosticOperation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte(`#!/bin/sh
+printf '%s\n' '{
+  "target_url": "https://diagnostic.example.test/product-capture-browser",
+  "final_url": "https://diagnostic.example.test/product-capture-browser",
+  "posted_to_origin": true,
+  "post_error": "",
+  "browser_signals": {
+    "automation": {
+      "playwright_binding_present": true,
+      "playwright_init_scripts_present": false
+    },
+    "document": {
+      "cookie_present": true,
+      "cookie_length": 17
+    }
+  }
+}'
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Chdir(dir)
+	env := validWorkflowComputeProviderEnvelope(t)
+	env.Operation = "browser_diagnostic"
+	env.Input = json.RawMessage(`{"url":"https://diagnostic.example.test/product-capture-browser"}`)
+	input := marshalNestedProviderEnvelopeFromValidatedRuntimeRequest(t, env)
+
+	var stdout, stderr bytes.Buffer
+	code := Main(nil, &stdout, &stderr, bytes.NewReader(input))
+	if code != 0 {
+		t.Fatalf("diagnostic failed: stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	var result struct {
+		Artifacts []string `json:"artifacts"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &result); err != nil {
+		t.Fatalf("decode provider result: %v\n%s", err, stdout.String())
+	}
+	const diagnosticArtifact = "browser_diagnostic_json"
+	if !containsString(result.Artifacts, diagnosticArtifact) {
+		t.Fatalf("artifacts = %v, want %q", result.Artifacts, diagnosticArtifact)
+	}
+	data, err := os.ReadFile(diagnosticArtifact)
+	if err != nil {
+		t.Fatalf("read diagnostic artifact: %v", err)
+	}
+	assertFileMode(t, diagnosticArtifact, 0o644)
+	if !strings.Contains(string(data), `"playwright_binding_present": true`) {
+		t.Fatalf("diagnostic artifact missing browser automation signal: %s", string(data))
+	}
+	if strings.Contains(string(data), "redacted=value") {
+		t.Fatalf("diagnostic artifact must not include cookie values: %s", string(data))
 	}
 }
 

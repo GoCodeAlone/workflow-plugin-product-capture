@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema://providers/workflow-plugin-product-capture/browser/operations/browser_diagnostic/output/v1",
+  "title": "Browser diagnostic operation output",
+  "description": "Provider stdout lists produced artifacts. The browser_diagnostic_json artifact contains bounded browser identity signals and never includes cookie values.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["browser_diagnostic_json"]
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    }
+  },
+  "required": ["artifacts"]
+}
