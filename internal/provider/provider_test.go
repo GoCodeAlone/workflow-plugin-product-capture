@@ -1,18 +1,24 @@
 package provider
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -331,7 +337,7 @@ global.document = {
   hasFocus: () => true,
   get cookie() { return 'redacted=value'; },
 };
-global.location = { href: 'https://diag.example.test/capture' };
+global.location = { href: 'https://93.184.216.34/capture' };
 global.Intl = {
   DateTimeFormat: () => ({ resolvedOptions: () => ({ timeZone: 'UTC' }) }),
 };
@@ -358,13 +364,15 @@ exports.chromium = {
   }),
 };
 exports.errors = { TimeoutError: class TimeoutError extends Error {} };
-`), 0o600); err != nil {
+`+fakeConnectOverCDPAdapter), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("NODE_PATH", filepath.Join(dir, "node_modules"))
+	installFakeGoogleChrome(t, dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
 
 	var stdout, stderr bytes.Buffer
-	code := Main([]string{"--browser-diagnostic-url", "https://diag.example.test/capture"}, &stdout, &stderr)
+	code := Main([]string{"--browser-diagnostic-url", "https://93.184.216.34/capture"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("diagnostic failed with code %d stderr=%s", code, stderr.String())
 	}
@@ -391,11 +399,11 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
 		t.Fatalf("decode diagnostic output: %v\nstdout=%s", err, stdout.String())
 	}
-	if got.TargetURL != "https://diag.example.test/capture" || got.FinalURL != got.TargetURL {
+	if got.TargetURL != "https://93.184.216.34/capture" || got.FinalURL != got.TargetURL {
 		t.Fatalf("unexpected diagnostic URLs: %+v", got)
 	}
-	if got.BrowserSignals.Navigator.Webdriver != nil {
-		t.Fatalf("diagnostic did not apply webdriver guard: %#v", got.BrowserSignals.Navigator.Webdriver)
+	if got.BrowserSignals.Navigator.Webdriver != true {
+		t.Fatalf("diagnostic did not preserve native webdriver signal: %#v", got.BrowserSignals.Navigator.Webdriver)
 	}
 	if got.BrowserSignals.Navigator.UserAgent != "Fake Chrome" {
 		t.Fatalf("user agent = %q", got.BrowserSignals.Navigator.UserAgent)
@@ -408,6 +416,9 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	}
 	if !got.BrowserSignals.Document.CookiePresent || got.BrowserSignals.Document.CookieLength == 0 {
 		t.Fatalf("diagnostic should report cookie presence without values: %+v", got.BrowserSignals.Document)
+	}
+	if strings.Contains(stdout.String(), "redacted=value") {
+		t.Fatalf("diagnostic leaked cookie value: %s", stdout.String())
 	}
 	if !got.PostedToOrigin {
 		t.Fatalf("diagnostic should post browser signals back to the controlled origin: %+v", got)
@@ -435,7 +446,7 @@ global.document = {
   createElement: () => ({ getContext: () => null }),
   get cookie() { return ''; },
 };
-global.location = { href: 'https://diag.example.test/capture' };
+global.location = { href: 'https://93.184.216.34/capture' };
 global.Intl = {
   DateTimeFormat: () => ({ resolvedOptions: () => ({ timeZone: 'UTC' }) }),
 };
@@ -462,13 +473,15 @@ exports.chromium = {
   }),
 };
 exports.errors = { TimeoutError: class TimeoutError extends Error {} };
-`), 0o600); err != nil {
+`+fakeConnectOverCDPAdapter), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("NODE_PATH", filepath.Join(dir, "node_modules"))
+	installFakeGoogleChrome(t, dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
 
 	var stdout, stderr bytes.Buffer
-	code := Main([]string{"--browser-diagnostic-url", "https://diag.example.test/capture"}, &stdout, &stderr)
+	code := Main([]string{"--browser-diagnostic-url", "https://93.184.216.34/capture"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("diagnostic failed with code %d stderr=%s", code, stderr.String())
 	}
@@ -521,9 +534,10 @@ exit 1
 	}
 	t.Setenv("PATH", dir)
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
 
 	var stdout bytes.Buffer
-	if err := runBrowserDiagnostic("https://diagnostic.example.test/", &stdout); err != nil {
+	if err := runBrowserDiagnostic("https://93.184.216.34/", &stdout); err != nil {
 		t.Fatalf("runBrowserDiagnostic should accept complete successful output: %v", err)
 	}
 	if !strings.Contains(stdout.String(), `"posted_to_origin": true`) {
@@ -531,21 +545,398 @@ exit 1
 	}
 }
 
-func TestBrowserDiagnosticScriptSharesCaptureBrowserIdentity(t *testing.T) {
+func TestBrowserDiagnosticScriptSharesNativeChromeLaunchPath(t *testing.T) {
 	if !strings.Contains(playwrightBrowserDiagnosticScript, "launchChromeBrowser") {
 		t.Fatalf("diagnostic script must use the shared browser launcher")
 	}
 	for _, required := range []string{
-		"channel: 'chrome'",
-		"headless: parseBrowserHeadless()",
-		"--disable-blink-features=AutomationControlled",
-		"chromeUserAgent",
-		"Network.setUserAgentOverride",
-		"navigator, 'webdriver'",
+		"spawn(chromeExecutable, chromeArgs",
+		"chromium.connectOverCDP",
+		"browser.contexts()",
+		"newPage: () => context.newPage()",
 	} {
 		if !strings.Contains(playwrightBrowserDiagnosticScript, required) {
-			t.Fatalf("diagnostic script missing capture browser identity behavior %q", required)
+			t.Fatalf("diagnostic script missing shared native browser behavior %q", required)
 		}
+	}
+}
+
+func TestNativeChromeScriptLaunchesInstalledChromeAndConnectsOverCDP(t *testing.T) {
+	for _, required := range []string{
+		"const chromeExecutable = 'google-chrome';",
+		"spawn(chromeExecutable, chromeArgs",
+		"'--remote-debugging-port=0'",
+		"'--remote-debugging-address=127.0.0.1'",
+		"'--window-size=' + viewport.width + ',' + viewport.height",
+		"DevToolsActivePort",
+		"chromium.connectOverCDP(cdpEndpoint",
+		"browser.contexts()",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Errorf("native Chrome prelude missing %q", required)
+		}
+	}
+
+	for _, forbidden := range []string{
+		"chromium.launch(",
+		"chromium.launchPersistentContext(",
+		"addInitScript",
+		"Network.setUserAgentOverride",
+		"AutomationControlled",
+		"userAgentMetadata",
+		"timezoneId",
+		"--enable-webgl",
+		"--use-gl=",
+		"--enable-unsafe-swiftshader",
+	} {
+		if strings.Contains(playwrightBrowserPrelude, forbidden) {
+			t.Errorf("native Chrome prelude retains identity/launch override %q", forbidden)
+		}
+	}
+}
+
+func TestBrowserScriptRequiresFreshOwnedChromeEndpoint(t *testing.T) {
+	for _, required := range []string{
+		"fs.unlinkSync(devToolsActivePortPath)",
+		"endpointStat.mtimeMs < chromeStartedAt",
+		"chromeExit !== null",
+		"process.kill(chrome.pid, 0)",
+		"ownsChromeListeningPort(chrome.pid, port)",
+		"process.platform !== 'linux'",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Errorf("Chrome endpoint validation missing %q", required)
+		}
+	}
+}
+
+func TestBrowserProcessScriptTerminatesChromeChildOnSignals(t *testing.T) {
+	for _, required := range []string{
+		"process.once('SIGTERM'",
+		"process.once('SIGINT'",
+		"await terminateChromeChild(activeChromeChild",
+		"process.exit(exitCode)",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Errorf("browser signal cleanup missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"pkill", "killall", "process.kill(-"} {
+		if strings.Contains(playwrightBrowserPrelude, forbidden) {
+			t.Errorf("browser signal cleanup uses broad process killing %q", forbidden)
+		}
+	}
+}
+
+func TestBrowserDiagnosticScriptEnforcesExactOriginAndEphemeralProfile(t *testing.T) {
+	for _, required := range []string{
+		"PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN",
+		"PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES",
+		"--host-resolver-rules=",
+		"context.route('**/*'",
+		"requestURL.origin !== allowedOrigin",
+		"route.abort('blockedbyclient')",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude+playwrightBrowserDiagnosticScript, required) {
+			t.Errorf("browser diagnostic boundary missing %q", required)
+		}
+	}
+}
+
+func TestBrowserProcessPolicyHasPlatformOwnershipAndBoundedTermination(t *testing.T) {
+	linuxSource, err := os.ReadFile("browser_process_linux.go")
+	if err != nil {
+		t.Fatalf("read Linux browser process policy: %v", err)
+	}
+	otherSource, err := os.ReadFile("browser_process_other.go")
+	if err != nil {
+		t.Fatalf("read non-Linux browser process policy: %v", err)
+	}
+
+	for _, required := range []string{
+		"Setpgid: true",
+		"/proc/net/tcp",
+		"/proc/net/tcp6",
+		"/task/",
+		"/children",
+		"syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)",
+		"syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)",
+		"if errors.Is(termErr, syscall.ESRCH)",
+	} {
+		if !strings.Contains(string(linuxSource), required) {
+			t.Errorf("Linux browser process policy missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"//go:build !linux",
+		"os.FindProcess(pid)",
+		"runtime.GOOS == \"windows\"",
+		"exec.Command(\"taskkill\", \"/PID\"",
+		"\"/T\", \"/F\"",
+		"process.Signal(syscall.Signal(0))",
+		"cmd.Process.Signal(os.Interrupt)",
+		"errors.Is(interruptErr, os.ErrProcessDone)",
+		"cmd.Process.Kill()",
+	} {
+		if !strings.Contains(string(otherSource), required) {
+			t.Errorf("non-Linux browser process policy missing %q", required)
+		}
+	}
+	if strings.Contains(string(otherSource), "return interruptErr") {
+		t.Error("non-Linux browser process policy must still kill when graceful interrupt is unsupported")
+	}
+}
+
+func TestBrowserDiagnosticRequiresOneExactHTTPSOriginAndPublicDNSPin(t *testing.T) {
+	lookup := func(_ context.Context, host string) ([]net.IPAddr, error) {
+		if host != "diagnostic.example" {
+			t.Fatalf("lookup host = %q", host)
+		}
+		return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+	}
+
+	target, err := resolveBrowserDiagnosticTarget(
+		context.Background(),
+		"https://diagnostic.example/probe?run=one",
+		"https://diagnostic.example",
+		lookup,
+	)
+	if err != nil {
+		t.Fatalf("resolve diagnostic target: %v", err)
+	}
+	if target.allowedOrigin != "https://diagnostic.example" {
+		t.Fatalf("allowed origin = %q", target.allowedOrigin)
+	}
+	if target.resolverRules != "MAP diagnostic.example 93.184.216.34" {
+		t.Fatalf("resolver rules = %q", target.resolverRules)
+	}
+	defaultPortTarget, err := resolveBrowserDiagnosticTarget(
+		context.Background(),
+		"https://diagnostic.example/probe",
+		"https://diagnostic.example:443",
+		lookup,
+	)
+	if err != nil {
+		t.Fatalf("resolve default-port diagnostic target: %v", err)
+	}
+	if defaultPortTarget.allowedOrigin != "https://diagnostic.example" {
+		t.Fatalf("default-port allowed origin = %q", defaultPortTarget.allowedOrigin)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		url     string
+		allowed string
+		lookup  browserDiagnosticLookup
+		want    string
+	}{
+		{name: "disabled", url: "https://diagnostic.example/probe", want: "disabled"},
+		{name: "multiple", url: "https://diagnostic.example/probe", allowed: "https://diagnostic.example,https://other.example", want: "exactly one"},
+		{name: "http allowlist", url: "https://diagnostic.example/probe", allowed: "http://diagnostic.example", want: "HTTPS origin"},
+		{name: "allowlist path", url: "https://diagnostic.example/probe", allowed: "https://diagnostic.example/path", want: "origin"},
+		{name: "origin mismatch", url: "https://other.example/probe", allowed: "https://diagnostic.example", want: "does not match"},
+		{
+			name:    "private DNS",
+			url:     "https://diagnostic.example/probe",
+			allowed: "https://diagnostic.example",
+			lookup: func(context.Context, string) ([]net.IPAddr, error) {
+				return []net.IPAddr{{IP: net.ParseIP("10.0.0.8")}}, nil
+			},
+			want: "non-public",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			resolver := tc.lookup
+			if resolver == nil {
+				resolver = lookup
+			}
+			_, err := resolveBrowserDiagnosticTarget(context.Background(), tc.url, tc.allowed, resolver)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBrowserDiagnosticForcesEphemeralProfile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "profile-path")
+	stableProfile := filepath.Join(dir, "stable-profile")
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte(`#!/bin/sh
+printf '%s' "$PRODUCT_CAPTURE_BROWSER_PROFILE_DIR" > "$PRODUCT_CAPTURE_TEST_PROFILE_MARKER"
+printf '{"target_url":"https://93.184.216.34/","final_url":"https://93.184.216.34/","posted_to_origin":true,"post_error":""}'
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", stableProfile)
+	t.Setenv("PRODUCT_CAPTURE_TEST_PROFILE_MARKER", marker)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
+
+	if err := runBrowserDiagnostic("https://93.184.216.34/", io.Discard); err != nil {
+		t.Fatalf("run browser diagnostic: %v", err)
+	}
+	data, err := os.ReadFile(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	diagnosticProfile := string(data)
+	if diagnosticProfile == "" || diagnosticProfile == stableProfile {
+		t.Fatalf("diagnostic profile = %q, stable profile = %q", diagnosticProfile, stableProfile)
+	}
+	if _, err := os.Stat(diagnosticProfile); !os.IsNotExist(err) {
+		t.Fatalf("diagnostic profile still exists after return: %v", err)
+	}
+}
+
+func TestBrowserScriptRejectsActiveProfileLock(t *testing.T) {
+	profileDir := filepath.Join(t.TempDir(), "chrome-profile")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, "SingletonLock"), []byte("active"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
+	fakePlaywright := `
+exports.chromium = {
+  launch: async () => { throw new Error('Playwright connection should not be reached'); },
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatal("capture succeeded with an active profile lock")
+	}
+	if !strings.Contains(stderr.String(), "Chrome profile is already active: SingletonLock") {
+		t.Fatalf("stderr missing active profile error: %s", stderr.String())
+	}
+}
+
+func TestBrowserScriptCaptureDoesNotInheritDiagnosticDNSPin(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte(`#!/bin/sh
+[ -z "$PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN" ] || exit 31
+[ -z "$PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES" ] || exit 32
+printf '<html></html>'
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", "https://diagnostic.example")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", "MAP diagnostic.example 93.184.216.34")
+
+	html, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err != nil {
+		t.Fatalf("capture HTML: %v", err)
+	}
+	if html != "<html></html>" {
+		t.Fatalf("HTML = %q", html)
+	}
+}
+
+func TestBrowserProcessOwnsListenerInChildTree(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux procfs ownership contract")
+	}
+	cmd := exec.Command("sh", "-c", `PRODUCT_CAPTURE_TEST_BROWSER_LISTENER=1 "$1" -test.run=^TestBrowserProcessListenerHelper$`, "sh", os.Args[0])
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read listener port: %v", err)
+	}
+	port, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatalf("parse listener port %q: %v", line, err)
+	}
+	policy := newBrowserProcessPolicy()
+	deadline := time.Now().Add(2 * time.Second)
+	for !policy.OwnsListeningPort(cmd.Process.Pid, port) && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !policy.OwnsListeningPort(cmd.Process.Pid, port) {
+		t.Fatalf("process tree rooted at %d does not own listener %d", cmd.Process.Pid, port)
+	}
+}
+
+func TestBrowserProcessListenerHelper(t *testing.T) {
+	if os.Getenv("PRODUCT_CAPTURE_TEST_BROWSER_LISTENER") != "1" {
+		return
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	fmt.Println(listener.Addr().(*net.TCPAddr).Port)
+	for {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		_ = conn.Close()
+	}
+}
+
+func TestBrowserProcessTerminatesAndReapsProcessGroup(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux process-group contract")
+	}
+	cmd := exec.Command("sh", "-c", `trap '' TERM; sleep 30 & child=$!; echo "$child"; wait`)
+	newBrowserProcessPolicy().Configure(cmd)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	line, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil {
+		t.Fatalf("read child pid: %v", err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(line))
+	if err != nil {
+		t.Fatalf("parse child pid %q: %v", line, err)
+	}
+
+	started := time.Now()
+	if err := newBrowserProcessPolicy().TerminateGroup(cmd, 50*time.Millisecond); err != nil {
+		t.Fatalf("terminate process group: %v", err)
+	}
+	_ = cmd.Wait()
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("process-group termination took %s", elapsed)
+	}
+	if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
+		t.Fatalf("browser command was not reaped: %+v", cmd.ProcessState)
+	}
+	if _, err := os.Stat(filepath.Join("/proc", strconv.Itoa(childPID))); !os.IsNotExist(err) {
+		t.Fatalf("browser child %d still exists after group termination: %v", childPID, err)
 	}
 }
 
@@ -561,7 +952,7 @@ func TestBrowserScriptSupportsConfiguredHeadlessMode(t *testing.T) {
 			for _, required := range []string{
 				"PRODUCT_CAPTURE_BROWSER_HEADLESS",
 				"parseBrowserHeadless",
-				"headless: parseBrowserHeadless()",
+				"if (parseBrowserHeadless()) chromeArgs.push('--headless=new');",
 			} {
 				if !strings.Contains(script.body, required) {
 					t.Fatalf("%s script missing configurable headless behavior %q", script.name, required)
@@ -583,7 +974,7 @@ func TestBrowserScriptSupportsConfiguredViewport(t *testing.T) {
 			for _, required := range []string{
 				"PRODUCT_CAPTURE_BROWSER_VIEWPORT",
 				"parseBrowserViewport",
-				"viewport: parseBrowserViewport()",
+				"'--window-size=' + viewport.width + ',' + viewport.height",
 			} {
 				if !strings.Contains(script.body, required) {
 					t.Fatalf("%s script missing configurable viewport behavior %q", script.name, required)
@@ -596,14 +987,14 @@ func TestBrowserScriptSupportsConfiguredViewport(t *testing.T) {
 	}
 }
 
-func TestBrowserScriptEnablesContainerWebGL(t *testing.T) {
-	for _, required := range []string{
+func TestBrowserScriptDoesNotForceWebGLIdentity(t *testing.T) {
+	for _, forbidden := range []string{
 		"--enable-webgl",
 		"--use-gl=swiftshader",
 		"--enable-unsafe-swiftshader",
 	} {
-		if !strings.Contains(playwrightBrowserPrelude, required) {
-			t.Fatalf("browser prelude missing container WebGL launch flag %q", required)
+		if strings.Contains(playwrightBrowserPrelude, forbidden) {
+			t.Fatalf("browser prelude forces WebGL launch flag %q", forbidden)
 		}
 	}
 }
@@ -656,71 +1047,18 @@ func TestBrowserScriptDoesNotExposeProductCaptureNamedPageGlobals(t *testing.T) 
 	}
 }
 
-func TestPlaywrightBrowserIdentityAvoidsMixedChromeVersionSignals(t *testing.T) {
-	if strings.Contains(playwrightBrowserPrelude, "Chrome/124.0.0.0") {
-		t.Fatalf("browser identity must not pin a stale Chrome version")
-	}
-	for _, required := range []string{
-		"browser.version()",
-		"normalizeChromeVersion",
+func TestNativeChromeBrowserIdentityIsNotSpoofed(t *testing.T) {
+	for _, forbidden := range []string{
+		"Chrome/124.0.0.0",
 		"Network.setUserAgentOverride",
 		"userAgentMetadata",
-		"fullVersionList",
-	} {
-		if !strings.Contains(playwrightBrowserPrelude, required) {
-			t.Fatalf("browser identity must align user agent and client hints; missing %q", required)
-		}
-	}
-}
-
-func TestPlaywrightBrowserIdentityAvoidsHostPlatformContradiction(t *testing.T) {
-	for _, required := range []string{
-		"userAgentPlatform: 'X11; Linux x86_64'",
-		"navigatorPlatform: 'Linux x86_64'",
-		"userAgentDataPlatform: 'Linux'",
-		"platformVersion: ''",
-		"platform: productCaptureBrowserIdentity.navigatorPlatform",
-		"Object.defineProperty(navigator, 'platform'",
-		"Object.defineProperty(navigator, 'userAgentData'",
-		"getHighEntropyValues",
-	} {
-		if !strings.Contains(playwrightBrowserPrelude, required) {
-			t.Fatalf("browser identity must align JS platform signals; missing %q", required)
-		}
-	}
-	for _, disallowed := range []string{
-		"Macintosh; Intel Mac OS X",
-		"navigatorPlatform: 'MacIntel'",
-		"userAgentDataPlatform: 'macOS'",
-		"platformVersion: '10_15_7'",
-	} {
-		if strings.Contains(playwrightBrowserPrelude, disallowed) {
-			t.Fatalf("browser identity must not claim macOS from Linux container runtime; found %q", disallowed)
-		}
-	}
-}
-
-func TestPlaywrightBrowserIdentityAvoidsMalformedLanguageSignals(t *testing.T) {
-	for _, disallowed := range []string{
-		"acceptLanguage: 'en-US,en;q=0.9'",
-		"'Accept-Language': 'en-US,en;q=0.9'",
 		"extraHTTPHeaders",
-		"en;q=0.9']",
+		"Object.defineProperty(navigator",
+		"timezoneId",
+		"locale:",
 	} {
-		if strings.Contains(playwrightBrowserPrelude, disallowed) {
-			t.Fatalf("browser identity must not create malformed language signals; found %q", disallowed)
-		}
-	}
-	for _, required := range []string{
-		"acceptLanguage: productCaptureBrowserIdentity.languages.join(',')",
-		"Object.defineProperty(navigator, 'language'",
-		"Object.defineProperty(navigator, 'languages'",
-		"Object.freeze([...identity.languages])",
-		"languages: ['en-US', 'en']",
-		"locale: productCaptureBrowserIdentity.language",
-	} {
-		if !strings.Contains(playwrightBrowserPrelude, required) {
-			t.Fatalf("browser identity must align language signals; missing %q", required)
+		if strings.Contains(playwrightBrowserPrelude, forbidden) {
+			t.Fatalf("native Chrome browser identity is overridden by %q", forbidden)
 		}
 	}
 }
@@ -863,8 +1201,8 @@ func TestMainRunsWorkflowComputeBrowserDiagnosticOperation(t *testing.T) {
 	node := filepath.Join(dir, "node")
 	if err := os.WriteFile(node, []byte(`#!/bin/sh
 printf '%s\n' '{
-  "target_url": "https://diagnostic.example.test/product-capture-browser",
-  "final_url": "https://diagnostic.example.test/product-capture-browser",
+  "target_url": "https://93.184.216.34/product-capture-browser",
+  "final_url": "https://93.184.216.34/product-capture-browser",
   "posted_to_origin": true,
   "post_error": "",
   "browser_signals": {
@@ -882,10 +1220,11 @@ printf '%s\n' '{
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
 	t.Chdir(dir)
 	env := validWorkflowComputeProviderEnvelope(t)
 	env.Operation = "browser_diagnostic"
-	env.Input = json.RawMessage(`{"url":"https://diagnostic.example.test/product-capture-browser"}`)
+	env.Input = json.RawMessage(`{"url":"https://93.184.216.34/product-capture-browser"}`)
 	input := marshalNestedProviderEnvelopeFromValidatedRuntimeRequest(t, env)
 
 	var stdout, stderr bytes.Buffer
@@ -1304,7 +1643,7 @@ func TestRunBrowserDiagnosticRunsHeadedBrowserThroughXvfbWhenNoDisplay(t *testin
 	node := filepath.Join(dir, "node")
 	if err := os.WriteFile(node, []byte(`#!/bin/sh
 [ "$PRODUCT_CAPTURE_XVFB_WRAPPED" = "1" ] || { echo "node was not launched through xvfb-run" >&2; exit 25; }
-printf '{"target_url":"https://diagnostic.example.test/","final_url":"https://diagnostic.example.test/"}'
+printf '{"target_url":"https://93.184.216.34/","final_url":"https://93.184.216.34/"}'
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -1320,12 +1659,13 @@ exec "$@"
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "0")
 	t.Setenv("DISPLAY", "")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
 
 	var stdout bytes.Buffer
-	if err := runBrowserDiagnostic("https://diagnostic.example.test/", &stdout); err != nil {
+	if err := runBrowserDiagnostic("https://93.184.216.34/", &stdout); err != nil {
 		t.Fatalf("runBrowserDiagnostic returned error: %v", err)
 	}
-	if !strings.Contains(stdout.String(), `"target_url":"https://diagnostic.example.test/"`) {
+	if !strings.Contains(stdout.String(), `"target_url":"https://93.184.216.34/"`) {
 		t.Fatalf("unexpected diagnostic output: %s", stdout.String())
 	}
 }
@@ -1593,20 +1933,17 @@ func TestPlaywrightScriptHandlesOnlyBenignAmazonContinuationGates(t *testing.T) 
 		"stealth",
 		"HeadlessChrome",
 		"'continue',",
+		"Network.setUserAgentOverride",
+		"addInitScript",
+		"AutomationControlled",
 	} {
 		if strings.Contains(playwrightCaptureScript, disallowed) {
 			t.Fatalf("playwright script contains disallowed automation marker %q", disallowed)
 		}
 	}
 	for _, required := range []string{
-		"userAgent",
-		"Mozilla/5.0",
-		"AppleWebKit/537.36",
-		"Chrome/",
-		"navigator",
-		"webdriver",
-		"undefined",
-		"--disable-blink-features=AutomationControlled",
+		"const chromeExecutable = 'google-chrome';",
+		"chromium.connectOverCDP",
 		"--no-sandbox",
 		"--disable-setuid-sandbox",
 		"--disable-dev-shm-usage",
@@ -1631,9 +1968,10 @@ func TestPlaywrightScriptHandlesOnlyBenignAmazonContinuationGates(t *testing.T) 
 	}
 }
 
-func TestPlaywrightScriptPrefersStandardChromeChannel(t *testing.T) {
+func TestPlaywrightScriptUsesInstalledGoogleChrome(t *testing.T) {
 	for _, required := range []string{
-		"channel: 'chrome'",
+		"const chromeExecutable = 'google-chrome';",
+		"spawn(chromeExecutable, chromeArgs",
 		"launchChromeBrowser",
 	} {
 		if !strings.Contains(playwrightCaptureScript, required) {
@@ -1641,9 +1979,10 @@ func TestPlaywrightScriptPrefersStandardChromeChannel(t *testing.T) {
 		}
 	}
 	for _, disallowed := range []string{
-		"channel of",
+		"channel: 'chrome'",
 		"msedge",
-		"chromium.launch(launchOptions)",
+		"chromium.launch(",
+		"chromium.launchPersistentContext(",
 	} {
 		if strings.Contains(playwrightCaptureScript, disallowed) {
 			t.Fatalf("playwright script should not silently fall back to non-Chrome launch path %q", disallowed)
@@ -1654,7 +1993,8 @@ func TestPlaywrightScriptPrefersStandardChromeChannel(t *testing.T) {
 func TestPlaywrightScriptUsesPersistentProfileWhenConfigured(t *testing.T) {
 	profileDir := filepath.Join(t.TempDir(), "chrome-profile")
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
-	fakePlaywright := fmt.Sprintf(`
+	t.Setenv("PRODUCT_CAPTURE_TEST_EXPECT_PROFILE_DIR", profileDir)
+	fakePlaywright := `
 class TimeoutError extends Error {
   constructor(message) {
     super(message);
@@ -1678,13 +2018,8 @@ function withDocument(fn, arg) {
   }
 }
 exports.chromium = {
-  launch: async () => { throw new Error('ephemeral browser launch used despite configured profile'); },
-  launchPersistentContext: async (userDataDir, options) => {
-    if (userDataDir !== %q) throw new Error('profile dir mismatch: ' + userDataDir);
-    if (!options || options.channel !== 'chrome') throw new Error('standard Chrome channel not preserved');
-    return {
-      newPage: async () => ({
-        addInitScript: async (fn, requestedURL) => { fn(requestedURL); },
+  launch: async () => ({
+    newPage: async () => ({
         goto: async () => {},
         url: () => 'https://www.amazon.com/dp/B09B8V1LZ3',
         locator: (selector) => {
@@ -1698,13 +2033,12 @@ exports.chromium = {
         },
         evaluate: async (fn, arg) => withDocument(fn, arg),
         content: async () => '<html><head><link rel="canonical" href="https://www.amazon.com/dp/B09B8V1LZ3"></head><body><span id="productTitle">Echo Dot</span><img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg"></body></html>',
-      }),
-      close: async () => {},
-    };
-  },
+    }),
+    close: async () => {},
+  }),
 };
 exports.errors = { TimeoutError };
-`, profileDir)
+`
 	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3")
 	if err != nil {
 		t.Fatalf("capture script failed with configured persistent profile: %v\nstderr=%s", err, stderr.String())
@@ -5318,9 +5652,10 @@ func runPlaywrightScriptWithFakeURLTimeoutAndCommandTimeout(t *testing.T, fakePl
 	if err := os.MkdirAll(moduleDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(fakePlaywright), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(fakePlaywright+fakeConnectOverCDPAdapter), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	installFakeGoogleChrome(t, dir)
 	ctx := context.Background()
 	var cancel context.CancelFunc
 	if commandTimeout > 0 {
@@ -5329,11 +5664,89 @@ func runPlaywrightScriptWithFakeURLTimeoutAndCommandTimeout(t *testing.T, fakePl
 	}
 	cmd := exec.CommandContext(ctx, "node", script, targetURL, timeout)
 	cmd.Env = withoutNodeOverrides(os.Environ())
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_TEST_NATIVE_CHROME", "1")
+	testBinary, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_TEST_BINARY", testBinary)
+	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(dir, "chrome-profile"))
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err = cmd.Run()
 	return stdout, stderr, err
+}
+
+const fakeConnectOverCDPAdapter = `
+if (exports.chromium && typeof exports.chromium.connectOverCDP !== 'function') {
+  const productCaptureFakeLaunch = exports.chromium.launch;
+  exports.chromium.connectOverCDP = async () => {
+    const launched = await productCaptureFakeLaunch();
+    const context = {
+      newPage: () => launched.newPage(),
+      route: async () => {},
+    };
+    return {
+      contexts: () => [context],
+      close: () => launched.close(),
+    };
+  };
+}
+`
+
+func installFakeGoogleChrome(t *testing.T, dir string) {
+	t.Helper()
+	chrome := filepath.Join(dir, "google-chrome")
+	if err := os.WriteFile(chrome, []byte("#!/bin/sh\nexec \"$PRODUCT_CAPTURE_TEST_BINARY\" -test.run=^TestNativeChromeHelper$ -- \"$@\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_TEST_NATIVE_CHROME", "1")
+	testBinary, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRODUCT_CAPTURE_TEST_BINARY", testBinary)
+}
+
+func TestNativeChromeHelper(t *testing.T) {
+	if os.Getenv("PRODUCT_CAPTURE_TEST_NATIVE_CHROME") != "1" {
+		return
+	}
+	profileDir := ""
+	for _, arg := range os.Args {
+		if strings.HasPrefix(arg, "--user-data-dir=") {
+			profileDir = strings.TrimPrefix(arg, "--user-data-dir=")
+			break
+		}
+	}
+	if profileDir == "" {
+		t.Fatal("missing --user-data-dir")
+	}
+	if expected := os.Getenv("PRODUCT_CAPTURE_TEST_EXPECT_PROFILE_DIR"); expected != "" && profileDir != expected {
+		t.Fatalf("profile dir = %q, want %q", profileDir, expected)
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	endpoint := fmt.Sprintf("%d\n/devtools/browser/product-capture-test\n", port)
+	if err := os.WriteFile(filepath.Join(profileDir, "DevToolsActivePort"), []byte(endpoint), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGTERM, os.Interrupt)
+	defer signal.Stop(signals)
+	<-signals
 }
 
 func withoutNodeOverrides(env []string) []string {

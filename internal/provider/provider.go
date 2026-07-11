@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -37,6 +38,21 @@ const (
 )
 
 var Version = "0.1.0"
+
+type browserProcessPolicy interface {
+	Configure(*exec.Cmd)
+	OwnsListeningPort(pid, port int) bool
+	TerminateGroup(*exec.Cmd, time.Duration) error
+}
+
+type browserDiagnosticLookup func(context.Context, string) ([]net.IPAddr, error)
+
+type browserDiagnosticTarget struct {
+	allowedOrigin string
+	resolverRules string
+}
+
+var browserProcesses browserProcessPolicy = newBrowserProcessPolicy()
 
 var supportedAmazonHosts = map[string]struct{}{
 	"amazon.com":     {},
@@ -581,6 +597,8 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	cmd := browserNodeCommand(ctx, scriptPath, w.URL, fmt.Sprintf("%d", timeout.Milliseconds()))
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", "")
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
 		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
 	}
@@ -664,18 +682,17 @@ func writeBrowserCaptureScript() (string, error) {
 }
 
 func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("parse diagnostic url: %w", err)
-	}
-	if parsed.Scheme != "https" && parsed.Scheme != "http" {
-		return fmt.Errorf("unsupported diagnostic url scheme %q", parsed.Scheme)
-	}
-	if parsed.Hostname() == "" {
-		return errors.New("diagnostic url host is required")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	target, err := resolveBrowserDiagnosticTarget(
+		ctx,
+		rawURL,
+		os.Getenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS"),
+		net.DefaultResolver.LookupIPAddr,
+	)
+	if err != nil {
+		return err
+	}
 	scriptPath, err := writeBrowserDiagnosticScript()
 	if err != nil {
 		return err
@@ -684,9 +701,9 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 	cmd := browserNodeCommand(ctx, scriptPath, rawURL)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
-	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
-		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
-	}
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", target.allowedOrigin)
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", target.resolverRules)
 	var stderr, out bytes.Buffer
 	cmd.Stdout = io.MultiWriter(stdout, &out)
 	cmd.Stderr = &stderr
@@ -702,6 +719,114 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 		return fmt.Errorf("browser diagnostic failed: %s", msg)
 	}
 	return nil
+}
+
+func resolveBrowserDiagnosticTarget(ctx context.Context, rawURL, allowedOrigins string, lookup browserDiagnosticLookup) (browserDiagnosticTarget, error) {
+	if strings.TrimSpace(allowedOrigins) == "" {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostics are disabled; PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS is unset")
+	}
+	parts := strings.Split(allowedOrigins, ",")
+	if len(parts) != 1 || strings.TrimSpace(parts[0]) == "" {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostics require exactly one allowed origin")
+	}
+
+	allowed, err := url.Parse(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return browserDiagnosticTarget{}, fmt.Errorf("parse diagnostic allowed origin: %w", err)
+	}
+	if allowed.Scheme != "https" || allowed.Hostname() == "" {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostic allowlist must contain one exact HTTPS origin")
+	}
+	if allowed.User != nil || (allowed.Path != "" && allowed.Path != "/") || allowed.RawQuery != "" || allowed.Fragment != "" {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostic allowlist entry must be an origin without credentials, path, query, or fragment")
+	}
+	allowed.Path = ""
+	allowed.RawPath = ""
+
+	requested, err := url.Parse(rawURL)
+	if err != nil {
+		return browserDiagnosticTarget{}, fmt.Errorf("parse diagnostic url: %w", err)
+	}
+	if requested.Scheme != "https" || requested.Hostname() == "" || requested.User != nil {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostic URL must use HTTPS and include a host without credentials")
+	}
+	if !sameOriginURL(requested, allowed) {
+		return browserDiagnosticTarget{}, fmt.Errorf("browser diagnostic URL origin %q does not match allowed origin %q", browserURLOrigin(requested), browserURLOrigin(allowed))
+	}
+
+	host := canonicalHost(allowed.Hostname())
+	addresses := []net.IPAddr(nil)
+	if literal := net.ParseIP(host); literal != nil {
+		addresses = []net.IPAddr{{IP: literal}}
+	} else {
+		if lookup == nil {
+			return browserDiagnosticTarget{}, errors.New("browser diagnostic DNS resolver is unavailable")
+		}
+		addresses, err = lookup(ctx, host)
+		if err != nil {
+			return browserDiagnosticTarget{}, fmt.Errorf("resolve browser diagnostic host %q: %w", host, err)
+		}
+	}
+	if len(addresses) == 0 {
+		return browserDiagnosticTarget{}, fmt.Errorf("resolve browser diagnostic host %q: no addresses", host)
+	}
+	var selected netip.Addr
+	for _, address := range addresses {
+		candidate, ok := netip.AddrFromSlice(address.IP)
+		if !ok || !isPublicDiagnosticIP(candidate) {
+			return browserDiagnosticTarget{}, fmt.Errorf("browser diagnostic host %q resolved to non-public address %q", host, address.IP.String())
+		}
+		if !selected.IsValid() {
+			selected = candidate.Unmap()
+		}
+	}
+	resolverAddress := selected.String()
+	if selected.Is6() {
+		resolverAddress = "[" + resolverAddress + "]"
+	}
+	return browserDiagnosticTarget{
+		allowedOrigin: browserURLOrigin(allowed),
+		resolverRules: "MAP " + host + " " + resolverAddress,
+	}, nil
+}
+
+func browserURLOrigin(value *url.URL) string {
+	host := canonicalHost(value.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	port := value.Port()
+	isDefaultPort := (strings.EqualFold(value.Scheme, "https") && port == "443") ||
+		(strings.EqualFold(value.Scheme, "http") && port == "80")
+	if port != "" && !isDefaultPort {
+		host += ":" + port
+	}
+	return strings.ToLower(value.Scheme) + "://" + host
+}
+
+func isPublicDiagnosticIP(address netip.Addr) bool {
+	address = address.Unmap()
+	if !address.IsValid() || !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() || address.IsLinkLocalUnicast() {
+		return false
+	}
+	for _, prefix := range []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/8"),
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("192.88.99.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+		netip.MustParsePrefix("100::/64"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	} {
+		if prefix.Contains(address) {
+			return false
+		}
+	}
+	return true
 }
 
 func browserDiagnosticOutputSucceeded(data []byte) bool {
@@ -731,11 +856,18 @@ func writeBrowserDiagnosticScript() (string, error) {
 
 func browserNodeCommand(ctx context.Context, scriptPath string, args ...string) *exec.Cmd {
 	nodeArgs := append([]string{scriptPath}, args...)
+	var cmd *exec.Cmd
 	if browserShouldUseXvfb() {
 		xvfbArgs := append([]string{"-a", "node"}, nodeArgs...)
-		return exec.CommandContext(ctx, "xvfb-run", xvfbArgs...)
+		cmd = exec.CommandContext(ctx, "xvfb-run", xvfbArgs...)
+	} else {
+		cmd = exec.CommandContext(ctx, "node", nodeArgs...)
 	}
-	return exec.CommandContext(ctx, "node", nodeArgs...)
+	browserProcesses.Configure(cmd)
+	cmd.Cancel = func() error {
+		return browserProcesses.TerminateGroup(cmd, 500*time.Millisecond)
+	}
+	return cmd
 }
 
 func browserShouldUseXvfb() bool {
@@ -817,75 +949,9 @@ func supportedHosts() []string {
 
 const playwrightBrowserPrelude = `
 const { chromium, errors } = require('playwright');
-
-const productCaptureBrowserIdentity = {
-  userAgentPlatform: 'X11; Linux x86_64',
-  navigatorPlatform: 'Linux x86_64',
-  userAgentDataPlatform: 'Linux',
-  platformVersion: '',
-  language: 'en-US',
-  languages: ['en-US', 'en'],
-};
-
-function normalizeChromeVersion(rawVersion) {
-  const fallback = '149.0.0.0';
-  const match = String(rawVersion || '').match(/(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?/);
-  if (!match) return fallback;
-  return [
-    match[1],
-    match[2] || '0',
-    match[3] || '0',
-    match[4] || '0',
-  ].join('.');
-}
-
-function chromeMajorVersion(chromeVersion) {
-  return String(chromeVersion || '').split('.')[0] || '149';
-}
-
-function chromeUserAgent(chromeVersion) {
-  return 'Mozilla/5.0 (' + productCaptureBrowserIdentity.userAgentPlatform + ') AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + chromeVersion + ' Safari/537.36';
-}
-
-function chromeBrandList(chromeMajor) {
-  return [
-    { brand: 'Google Chrome', version: chromeMajor },
-    { brand: 'Chromium', version: chromeMajor },
-    { brand: 'Not)A;Brand', version: '24' },
-  ];
-}
-
-function chromeFullVersionList(chromeVersion) {
-  return [
-    { brand: 'Google Chrome', version: chromeVersion },
-    { brand: 'Chromium', version: chromeVersion },
-    { brand: 'Not)A;Brand', version: '24.0.0.0' },
-  ];
-}
-
-function chromeUserAgentMetadata(chromeVersion) {
-  const chromeMajor = chromeMajorVersion(chromeVersion);
-  return {
-    brands: chromeBrandList(chromeMajor),
-    fullVersionList: chromeFullVersionList(chromeVersion),
-    fullVersion: chromeVersion,
-    platform: productCaptureBrowserIdentity.userAgentDataPlatform,
-    platformVersion: productCaptureBrowserIdentity.platformVersion,
-    architecture: 'x86',
-    model: '',
-    mobile: false,
-    bitness: '64',
-  };
-}
-
-function browserRuntimeVersion(browser) {
-  try {
-    if (browser && typeof browser.version === 'function') {
-      return browser.version();
-    }
-  } catch {}
-  return '';
-}
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
 
 function remainingTimeout(deadline) {
   return Math.max(0, deadline - Date.now());
@@ -938,147 +1004,235 @@ function parseBrowserHeadless() {
   return !['0', 'false', 'no', 'off', 'headed'].includes(raw);
 }
 
-async function installCaptureBrowserIdentity(page, rawChromeVersion) {
-  const chromeVersion = normalizeChromeVersion(rawChromeVersion);
-  const chromeMajor = chromeMajorVersion(chromeVersion);
-  const userAgent = chromeUserAgent(chromeVersion);
-  const userAgentMetadata = chromeUserAgentMetadata(chromeVersion);
-  try {
-    const context = page && typeof page.context === 'function' ? page.context() : null;
-    const session = context && typeof context.newCDPSession === 'function' ? await context.newCDPSession(page) : null;
-    if (session && typeof session.send === 'function') {
-      await session.send('Network.setUserAgentOverride', {
-        userAgent,
-        acceptLanguage: productCaptureBrowserIdentity.languages.join(','),
-        platform: productCaptureBrowserIdentity.navigatorPlatform,
-        userAgentMetadata,
-      });
-    }
-  } catch {}
-  await page.addInitScript((identity) => {
-    if (typeof navigator === 'undefined') return;
-    try {
-      Object.defineProperty(navigator, 'webdriver', { configurable: true, get: () => undefined });
-    } catch {}
-    try {
-      Object.defineProperty(navigator, 'platform', { configurable: true, get: () => identity.navigatorPlatform });
-    } catch {}
-    try {
-      Object.defineProperty(navigator, 'language', { configurable: true, get: () => identity.language });
-    } catch {}
-    try {
-      Object.defineProperty(navigator, 'languages', { configurable: true, get: () => Object.freeze([...identity.languages]) });
-    } catch {}
-    const highEntropyValues = {
-      architecture: 'x86',
-      bitness: '64',
-      brands: identity.brands,
-      fullVersionList: identity.fullVersionList,
-      mobile: false,
-      model: '',
-      platform: identity.userAgentDataPlatform,
-      platformVersion: identity.platformVersion,
-      uaFullVersion: identity.chromeVersion,
-      wow64: false,
-    };
-    const userAgentData = {
-      brands: identity.brands,
-      mobile: false,
-      platform: identity.userAgentDataPlatform,
-      getHighEntropyValues: async (hints) => {
-        const result = {
-          brands: identity.brands,
-          mobile: false,
-          platform: identity.userAgentDataPlatform,
-        };
-        for (const hint of Array.from(hints || [])) {
-          if (Object.prototype.hasOwnProperty.call(highEntropyValues, hint)) {
-            result[hint] = highEntropyValues[hint];
-          }
-        }
-        return result;
-      },
-      toJSON: () => ({
-        brands: identity.brands,
-        mobile: false,
-        platform: identity.userAgentDataPlatform,
-      }),
-    };
-    try {
-      Object.defineProperty(navigator, 'userAgentData', { configurable: true, get: () => userAgentData });
-    } catch {}
-  }, {
-    chromeVersion,
-    chromeMajorVersion: chromeMajor,
-    navigatorPlatform: productCaptureBrowserIdentity.navigatorPlatform,
-    userAgentDataPlatform: productCaptureBrowserIdentity.userAgentDataPlatform,
-    platformVersion: productCaptureBrowserIdentity.platformVersion,
-    language: productCaptureBrowserIdentity.language,
-    languages: productCaptureBrowserIdentity.languages,
-    brands: chromeBrandList(chromeMajor),
-    fullVersionList: chromeFullVersionList(chromeVersion),
-  });
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function launchChromeBrowser() {
-  const launchOptions = {
-    channel: 'chrome',
-    headless: parseBrowserHeadless(),
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--enable-webgl',
-      '--use-gl=swiftshader',
-      '--enable-unsafe-swiftshader',
-    ],
-  };
-  const contextOptions = {
-    viewport: parseBrowserViewport(),
-    locale: productCaptureBrowserIdentity.language,
-    timezoneId: 'America/New_York',
-  };
-  const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();
-  if (profileDir) {
-    const context = await chromium.launchPersistentContext(profileDir, {
-      ...launchOptions,
-      ...contextOptions,
-    });
-    return {
-      newPage: () => context.newPage(),
-      version: () => browserRuntimeVersion(context && typeof context.browser === 'function' ? context.browser() : null),
-      close: () => context.close(),
-    };
+let activeChromeChild = null;
+let browserShutdownStarted = false;
+
+function chromeProcessAlive(chrome) {
+  if (!chrome || !chrome.pid || chrome.chromeExit !== null) return false;
+  try {
+    process.kill(chrome.pid, 0);
+    return true;
+  } catch {
+    return false;
   }
-  const browser = await chromium.launch({ ...launchOptions });
-  return {
-    newPage: () => browser.newPage(contextOptions),
-    version: () => browserRuntimeVersion(browser),
-    close: () => browser.close(),
-  };
+}
+
+function chromeProcessTree(rootPID) {
+  const processIDs = new Set([rootPID]);
+  const queue = [rootPID];
+  while (queue.length > 0) {
+    const current = queue.shift();
+    try {
+      const children = fs.readFileSync('/proc/' + current + '/task/' + current + '/children', 'utf8');
+      for (const value of children.trim().split(/\s+/)) {
+        if (!value) continue;
+        const child = Number(value);
+        if (!Number.isInteger(child) || child <= 0 || processIDs.has(child)) continue;
+        processIDs.add(child);
+        queue.push(child);
+      }
+    } catch {}
+  }
+  return processIDs;
+}
+
+function listeningSocketInodes(port) {
+  const inodes = new Set();
+  for (const procPath of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    try {
+      for (const line of fs.readFileSync(procPath, 'utf8').split('\n')) {
+        const fields = line.trim().split(/\s+/);
+        if (fields.length < 10 || fields[3] !== '0A') continue;
+        const separator = fields[1].lastIndexOf(':');
+        if (separator < 0 || Number.parseInt(fields[1].slice(separator + 1), 16) !== port) continue;
+        const address = fields[1].slice(0, separator);
+        if (address !== '0100007F' && address !== '00000000000000000000000001000000') continue;
+        inodes.add(fields[9]);
+      }
+    } catch {}
+  }
+  return inodes;
+}
+
+function ownsChromeListeningPort(rootPID, port) {
+  if (process.platform !== 'linux') return true;
+  const inodes = listeningSocketInodes(port);
+  if (inodes.size === 0) return false;
+  for (const processID of chromeProcessTree(rootPID)) {
+    let descriptors = [];
+    try {
+      descriptors = fs.readdirSync('/proc/' + processID + '/fd');
+    } catch {
+      continue;
+    }
+    for (const descriptor of descriptors) {
+      try {
+        const target = fs.readlinkSync('/proc/' + processID + '/fd/' + descriptor);
+        const match = target.match(/^socket:\[(\d+)\]$/);
+        if (match && inodes.has(match[1])) return true;
+      } catch {}
+    }
+  }
+  return false;
+}
+
+function parseDevToolsActivePort(contents) {
+  const lines = String(contents || '').trim().split(/\r?\n/);
+  const port = Number(lines[0]);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error('Chrome DevToolsActivePort contains an invalid port');
+  }
+  if (!lines[1] || !lines[1].startsWith('/devtools/browser/')) {
+    throw new Error('Chrome DevToolsActivePort contains an invalid browser endpoint');
+  }
+  return port;
+}
+
+async function waitForChromeEndpoint(chrome, endpointPath, chromeStartedAt) {
+  const deadline = Date.now() + 15000;
+  while (Date.now() < deadline) {
+    if (chrome.startError) throw chrome.startError;
+    if (chrome.chromeExit !== null) {
+      throw new Error('google-chrome exited before creating DevToolsActivePort');
+    }
+    try {
+      const endpointStat = fs.statSync(endpointPath);
+      if (endpointStat.mtimeMs < chromeStartedAt) {
+        throw new Error('Chrome DevToolsActivePort is stale');
+      }
+      const port = parseDevToolsActivePort(fs.readFileSync(endpointPath, 'utf8'));
+      if (!chromeProcessAlive(chrome)) throw new Error('google-chrome exited before CDP attach');
+      if (!ownsChromeListeningPort(chrome.pid, port)) {
+        throw new Error('google-chrome process tree does not own its CDP listener');
+      }
+      return 'http://127.0.0.1:' + port;
+    } catch (err) {
+      if (String(err && err.message || err).includes('stale')) throw err;
+    }
+    await delay(25);
+  }
+  throw new Error('timed out waiting for google-chrome DevToolsActivePort');
+}
+
+async function terminateChromeChild(chrome, graceMilliseconds) {
+  if (!chrome || chrome.chromeExit !== null) return;
+  if (chrome.pid) chrome.kill('SIGTERM');
+  await Promise.race([chrome.exited, delay(graceMilliseconds)]);
+  if (chrome.chromeExit === null && chrome.pid) {
+    chrome.kill('SIGKILL');
+    await Promise.race([chrome.exited, delay(graceMilliseconds)]);
+  }
+  if (chrome.chromeExit === null) throw new Error('google-chrome did not exit after SIGKILL');
+}
+
+async function shutdownBrowserProcess(exitCode) {
+  if (browserShutdownStarted) return;
+  browserShutdownStarted = true;
+  try {
+    await terminateChromeChild(activeChromeChild, 500);
+  } catch (err) {
+    console.error('browser signal cleanup warning: ' + errorMessage(err));
+  } finally {
+    process.exit(exitCode);
+  }
+}
+
+process.once('SIGTERM', () => { void shutdownBrowserProcess(143); });
+process.once('SIGINT', () => { void shutdownBrowserProcess(130); });
+
+async function launchChromeBrowser() {
+  const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();
+  if (!profileDir) throw new Error('PRODUCT_CAPTURE_BROWSER_PROFILE_DIR is required');
+  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  for (const lockName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+    if (fs.existsSync(path.join(profileDir, lockName))) {
+      throw new Error('Chrome profile is already active: ' + lockName);
+    }
+  }
+  const devToolsActivePortPath = path.join(profileDir, 'DevToolsActivePort');
+  if (fs.existsSync(devToolsActivePortPath)) fs.unlinkSync(devToolsActivePortPath);
+
+  const viewport = parseBrowserViewport();
+  const chromeArgs = [
+    '--remote-debugging-port=0',
+    '--remote-debugging-address=127.0.0.1',
+    '--user-data-dir=' + profileDir,
+    '--window-size=' + viewport.width + ',' + viewport.height,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+  ];
+  if (parseBrowserHeadless()) chromeArgs.push('--headless=new');
+  const resolverRules = String(process.env.PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES || '').trim();
+  if (resolverRules) chromeArgs.push('--host-resolver-rules=' + resolverRules);
+  chromeArgs.push('about:blank');
+
+  const chromeExecutable = 'google-chrome';
+  const chromeStartedAt = Date.now();
+  const chrome = spawn(chromeExecutable, chromeArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+  activeChromeChild = chrome;
+  chrome.chromeExit = null;
+  chrome.startError = null;
+  chrome.exited = new Promise((resolve) => {
+    chrome.once('error', (err) => {
+      chrome.startError = err;
+      resolve();
+    });
+    chrome.once('exit', (code, signal) => {
+      chrome.chromeExit = { code, signal };
+      resolve();
+    });
+  });
+  if (chrome.stderr) chrome.stderr.on('data', (chunk) => process.stderr.write(chunk));
+
+  let browser;
+  try {
+    const cdpEndpoint = await waitForChromeEndpoint(chrome, devToolsActivePortPath, chromeStartedAt);
+    browser = await chromium.connectOverCDP(cdpEndpoint, { timeout: 10000 });
+    const contexts = browser.contexts();
+    if (!contexts || contexts.length !== 1) throw new Error('native Chrome default context is unavailable');
+    const context = contexts[0];
+    return {
+      browser,
+      context,
+      chrome,
+      newPage: () => context.newPage(),
+    };
+  } catch (err) {
+    if (browser) await browser.close().catch(() => {});
+    await terminateChromeChild(chrome, 1000).catch(() => {});
+    if (activeChromeChild === chrome) activeChromeChild = null;
+    throw err;
+  }
 }
 
 async function newCapturePage(browser) {
-  const page = await browser.newPage();
-  await installCaptureBrowserIdentity(page, browser.version());
-  return page;
+  return await browser.newPage();
 }
 
 async function closeCaptureBrowser(browser) {
-  let timer;
+  let closeError = null;
   try {
     await Promise.race([
-      browser.close(),
-      new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('browser close timed out')), 2000);
-      }),
+      browser.browser.close(),
+      delay(2000).then(() => { throw new Error('browser close timed out'); }),
     ]);
   } catch (err) {
-    console.error('browser close warning: ' + errorMessage(err));
-  } finally {
-    if (timer) clearTimeout(timer);
+    closeError = err;
   }
+  try {
+    await terminateChromeChild(browser.chrome, 1000);
+  } catch (err) {
+    if (!closeError) closeError = err;
+  }
+  if (activeChromeChild === browser.chrome) activeChromeChild = null;
+  if (closeError) console.error('browser close warning: ' + errorMessage(closeError));
 }
 
 function configuredWarmupURL(targetURL) {
@@ -1917,8 +2071,19 @@ async function gotoWithTransientRetry(page, url, deadline) {
 
 async function main() {
   const url = process.argv[2];
-  const requestedOrigin = new URL(url).origin;
+  const allowedOrigin = String(process.env.PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN || '').trim();
+  if (!allowedOrigin || new URL(url).origin !== allowedOrigin) {
+    throw new Error('diagnostic target does not match the configured allowed origin');
+  }
   const browser = await launchChromeBrowser();
+  await browser.context.route('**/*', async (route) => {
+    const requestURL = new URL(route.request().url());
+    if ((requestURL.protocol === 'http:' || requestURL.protocol === 'https:') && requestURL.origin !== allowedOrigin) {
+      await route.abort('blockedbyclient');
+      return;
+    }
+    await route.continue();
+  });
   const page = await newCapturePage(browser);
   try {
     await gotoTargetWithOptionalWarmup(page, url, Date.now() + 30000);
@@ -2055,7 +2220,7 @@ async function main() {
         post_error,
         browser_signals: browserSignals,
       };
-    }, { requestedOrigin });
+    }, { requestedOrigin: allowedOrigin });
     process.stdout.write(JSON.stringify({
       target_url: url,
       final_url: result.final_url,
