@@ -14,9 +14,9 @@
 
 ## Scope Manifest
 
-**PR Count:** 3
-**Tasks:** 7
-**Estimated Lines of Change:** ~3,500 including removed workflow-compute proof code (informational; not enforced)
+**PR Count:** 4
+**Tasks:** 8
+**Estimated Lines of Change:** ~4,000 including removed workflow-compute proof code (informational; not enforced)
 
 **Out of scope:**
 - Production BMW/provider deployment or live Stripe objects.
@@ -28,20 +28,86 @@
 
 | PR # | Title | Tasks | Branch |
 |---|---|---|---|
-| 1 | Native Chrome product-capture runtime and proof ownership | Task 1, Task 2, Task 3 | `codex/native-chrome-session-20260710` |
-| 2 | Remove workflow-compute product-specific OCI proof | Task 4 | `codex/product-capture-proof-ownership-20260711` |
-| 3 | Bind BMW staging commerce proof to tested runtime | Task 5, Task 6, Task 7 | `codex/staging-commerce-runtime-proof-20260711` |
+| 1 | Add bounded staging-proof client APIs | Task 1 | `codex/provider-proof-client-20260711` |
+| 2 | Native Chrome product-capture runtime and proof ownership | Task 2, Task 3, Task 4 | `codex/native-chrome-session-20260710` |
+| 3 | Bound provider artifacts and remove product-specific proof | Task 5 | `codex/product-capture-proof-ownership-20260711` |
+| 4 | Bind BMW staging commerce proof to tested runtime | Task 6, Task 7, Task 8 | `codex/staging-commerce-runtime-proof-20260711` |
 
 **Status:** Draft
 
 ## Delivery Order
 
-1. Merge PR 1; tag `v0.1.60`; retain candidate image digest + conformance artifact.
-2. Run the product-owned staging proof against the retained staging worker.
-3. Merge PR 2 only after step 2 succeeds, so proof ownership never has a gap.
-4. Merge PR 3; set BMW staging image-ref variable to the exact PR 1 digest; deploy staging; run Task 7.
+1. Merge PR 1; tag compute-core `v0.5.1`.
+2. Merge PR 2; tag product-capture `v0.1.60`; retain candidate digest/conformance.
+3. Run the product-owned staging proof after its API capacity preflight succeeds.
+4. Merge/deploy PR 3 only after step 3 succeeds, so proof ownership never has a gap.
+5. Set BMW staging image-ref variable before PR 4 merge; merge PR 4; let its
+   existing CI `workflow_run` deploy exact main SHA; run Task 8.
 
-### Task 1: Native Chrome/CDP Runtime
+### Task 1: Generic Bounded Staging-Proof Client APIs
+
+**Repository:** `GoCodeAlone/workflow-plugin-compute-core`
+
+**Files:**
+- Modify: `protocol/client.go`
+- Modify: `protocol/client_test.go`
+- Modify: `protocol/types.go`
+- Modify: `protocol/types_test.go`
+
+**Step 1: Write failing read-only client tests**
+
+Define exact exported methods:
+
+```go
+func (c *Client) ListAgents(ctx context.Context) ([]Agent, error)
+func (c *Client) ListLeases(ctx context.Context) ([]Lease, error)
+func (c *Client) ListTaskArtifacts(ctx context.Context, taskID string) ([]TaskArtifact, error)
+func (c *Client) DownloadTaskArtifact(ctx context.Context, ref string, maxBytes int64) ([]byte, error)
+```
+
+Tests require bearer auth, URL escaping, strict JSON, status-only errors, and
+`maxBytes+1` rejection without returning partial data. Add helpers that select
+one online matching idle agent and reject an active lease/queued matching task.
+Extend `Lease` with server-derived `provider_artifact_specs` so an agent can
+enforce the registered operation contract before upload; clients cannot set
+this field on task submission.
+
+Run: `GOWORK=off go test ./protocol -run 'Client.*(Agent|Lease|Artifact|Capacity)' -count=1`
+
+Expected: FAIL because methods/types are absent.
+
+**Step 2: Implement narrow APIs against existing endpoints**
+
+Use existing `/v1/agents`, `/v1/leases`, and `/v1/tasks/{id}/artifacts`
+contracts. Download accepts only the returned
+`artifact://<pool>/tasks/<task>/proofs/<proof>/<name>` ref, validates/escapes all
+segments, and calls the existing proof-scoped download route. Do not expose
+generic arbitrary-path requests. Download rejects nonpositive limits and reads
+at most `maxBytes+1`. Strictly decode the lease's normalized artifact specs.
+
+**Step 3: Prepare and verify `v0.5.1`**
+
+Run:
+```bash
+GOWORK=off go test ./...
+golangci-lint run --new-from-rev=origin/main
+```
+
+Expected: tests PASS; lint exit 0; representative `httptest` downloads exact JSON artifact.
+
+After PR 1 merges, create tag `v0.5.1`, monitor the existing release workflow,
+and require its GitHub release to be published before Task 4 updates `go.mod`.
+
+**Step 4: Commit**
+
+```bash
+git add protocol
+git commit -m "feat(protocol): add bounded proof reads"
+```
+
+Rollback: product proof remains pinned to compute-core `v0.5.0`; no server change is required.
+
+### Task 2: Native Chrome/CDP Runtime
 
 **Files:**
 - Modify: `internal/provider/provider.go`
@@ -115,7 +181,7 @@ git commit -m "fix(provider): use native Chrome sessions"
 
 Rollback: revert the commit and run the `v0.1.59` runtime image smoke.
 
-### Task 2: Candidate Conformance, Release, and Runtime Provenance
+### Task 3: Candidate Conformance, Release, and Runtime Provenance
 
 **Files:**
 - Create: `internal/conformance/browser.go`
@@ -154,8 +220,14 @@ The command serves a bounded self-reporting page, accepts run-correlated direct
 and attached observations, launches direct headed Chrome without CDP/Playwright,
 runs the provider diagnostic for the attached observation, and writes redacted
 JSON containing versions, stable comparisons, informational values, and verdict.
-It accepts either an explicit HTTPS origin or a locally-started checksum-pinned
-Quick Tunnel from ADR 0002.
+It accepts either an explicit HTTPS origin or starts a Quick Tunnel from ADR
+0002. Pin `cloudflared` `2026.7.1` Linux amd64 from the official GitHub release
+with SHA-256
+`79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1`.
+Reject any version/digest mismatch. The command owns a teardown trap, kills and
+reaps the tunnel on success/signal/failure, and verifies the generated HTTPS
+origin by fetching the run-correlated `/healthz` before launching Chrome. Tests
+use a fake tunnel process to prove endpoint rejection and cleanup.
 
 **Step 3: Add exact candidate runtime launch checks**
 
@@ -171,12 +243,16 @@ SIGTERM; assert no Chrome/Xvfb process or profile lock remains.
 
 Expected: command exit 0 and JSON `.verdict == "pass"`.
 
-**Step 4: Publish the exact tested image**
+**Step 4: Gate release publication on the exact tested image**
 
 Change release workflow to `docker push` the already-loaded local tag without a
 second build, resolve registry `@sha256:` digest, and include image ID, digest,
 versions, and conformance artifact in the job summary. No OCI archive is sent to
-workflow-compute.
+workflow-compute. GoReleaser may create/update only a draft release before this
+job; move `gh release edit --draft=false` and registry notification into a
+`publish-release` job that needs both Go release build and runtime-image success.
+If conformance fails, `v0.1.60` remains an unpublished draft with no registry
+dispatch.
 
 **Step 5: Prepare `v0.1.60` and verify**
 
@@ -202,23 +278,27 @@ git commit -m "feat: gate product runtime promotion"
 
 Rollback: re-promote digest-pinned `v0.1.59`; rebuild/launch it and rerun its diagnostic.
 
-### Task 3: Product-Owned Staging Proof Without OCI Upload
+### Task 4: Product-Owned Staging Proof Without OCI Upload
 
 **Files:**
 - Create: `internal/stagingproof/proof.go`
 - Create: `internal/stagingproof/proof_test.go`
 - Create: `cmd/product-capture-staging-proof/main.go`
 - Create: `.github/workflows/staging-proof.yml`
+- Modify: `contracts/product-capture-provider.json`
+- Modify: `go.mod`
+- Modify: `go.sum`
 - Modify: `README.md`
 - Modify: `docs/buymywishlist-live-usage.md`
 
 **Step 1: Write failing proof-client tests**
 
-Use `httptest.Server` to require: exact digest-pinned `provider_image_ref`, an
-already-online retained worker whose runtime digest matches, task submission,
-terminal success, accepted proof, downloaded product JSON, and bounded summary
-fields. Reject package/directive/campaign upload calls and any artifact over the
-declared result/log limits.
+Use compute-core `v0.5.1` and `httptest.Server` to require: exact digest-pinned
+`provider_image_ref`; one matching online agent; zero active matching leases;
+zero queued matching product tasks; task submission; terminal success; accepted
+proof; bounded artifact download; and bounded summary fields. Reject
+package/directive/campaign calls, undeclared artifacts, and artifacts over the
+operation contract's limit.
 
 Run: `GOWORK=off go test ./internal/stagingproof -count=1`
 
@@ -226,21 +306,35 @@ Expected: FAIL because the product-owned proof client does not exist.
 
 **Step 2: Implement against generic workflow-compute APIs**
 
-Use the existing compute-core client types. The command takes server/token,
+Use the released compute-core client methods from Task 1. The command takes server/token,
 org/pool/product/policy, retained worker ID, product URL/host, and exact image
-ref. It never builds, saves, chunks, or uploads a container/package. It writes a
+ref. Before dispatch it polls every 30 seconds for at most 30 minutes until the
+named matching worker is online and idle with no queued matching task; it stores
+only redacted counts/status/digest. It never builds, saves, chunks, or uploads a
+container/package. It downloads at most 1 MiB for each JSON result and writes a
 redacted summary with task/proof/artifact hash, runtime ref, title/image/price,
 and optional accepted browser diagnostic artifact.
 
 **Step 3: Add staging workflow**
 
-The workflow runs from `main`, validates image ref/URL/worker inputs, executes
+The workflow runs from `main`, validates image ref/URL/worker inputs, uses a
+concurrency group with `cancel-in-progress: false`, executes
 the Go command, and uploads only bounded JSON/log artifacts. Use the org-level
 self-hosted Linux/X64 runner only if the public repo is allowed; otherwise use
 `ubuntu-latest` for the control client while the registered retained compute
 worker executes Chrome.
 
-**Step 4: Verify no OCI/package path**
+**Step 4: Declare and verify bounded provider results**
+
+Change both operations from legacy artifact names to `artifact_specs`:
+
+```json
+{"name":"product_json","content_type":"application/json","max_bytes":1048576}
+{"name":"browser_diagnostic_json","content_type":"application/json","max_bytes":1048576}
+```
+
+The command validates declared name/content/size and JSON before accepting
+evidence. Lexical checks are supplementary only.
 
 Run:
 ```bash
@@ -250,18 +344,19 @@ actionlint .github/workflows/staging-proof.yml
 golangci-lint run --new-from-rev=origin/main
 ```
 
-Expected: tests/lint/actionlint PASS; forbidden search returns no matches.
+Expected: tests/lint/actionlint PASS; renamed/oversized/OCI-shaped JSON artifact
+fixtures are rejected; forbidden search returns no matches.
 
 **Step 5: Commit**
 
 ```bash
-git add internal/stagingproof cmd/product-capture-staging-proof .github/workflows/staging-proof.yml README.md docs
+git add internal/stagingproof cmd/product-capture-staging-proof .github/workflows/staging-proof.yml contracts go.mod go.sum README.md docs
 git commit -m "feat: own product capture staging proof"
 ```
 
 Rollback: retain the prior proof workflow until this workflow has one accepted staging run; never restore OCI upload after cutover.
 
-### Task 4: Remove Workflow-Compute Product-Specific Proof Logic
+### Task 5: Bound Provider Artifacts and Remove Product-Specific Proof Logic
 
 **Repository:** `GoCodeAlone/workflow-compute`
 
@@ -272,13 +367,33 @@ Rollback: retain the prior proof workflow until this workflow has one accepted s
 - Modify: `ci_workflows_test.go`
 - Modify: `scripts/agent-runner-lifecycle-proof.sh`
 - Modify: `scripts/agent-runner-lifecycle-proof.ps1`
-- Modify: related runner lifecycle tests/docs found by `rg 'staging-product-capture-proof|PRODUCT_CAPTURE_DELEGATE_PROOF|product-capture.oci.tar'`
+- Modify: `.github/workflows/manual-agent-runner-proof.yml`
+- Modify: `proof_scripts_test.go`
+- Modify: `internal/agent/worker.go`
+- Modify: `internal/agent/worker_test.go`
+- Modify: `internal/server/server.go`
+- Modify: `internal/server/artifacts_test.go` or existing task-artifact server tests
+- Modify: all runner/workflow tests/docs found by the inventory command below
 
 **Step 1: Capture the failing ownership invariant**
 
-Add/adjust a repository test that fails when workflow-compute contains a
+First run and save the complete inventory:
+
+```bash
+rg -n 'product.?capture|staging-product-capture-proof|PRODUCT_CAPTURE_DELEGATE_PROOF|product-capture\.oci\.tar' .github scripts docs
+rg -n 'product.?capture|staging-product-capture-proof|PRODUCT_CAPTURE_DELEGATE_PROOF|product-capture\.oci\.tar' . --glob '*_test.go'
+```
+
+Add/adjust repository tests that fail when workflow-compute contains a
 product-capture-specific staging workflow, OCI packaging/upload, or delegated
-product proof orchestration while preserving generic dynamic-provider APIs.
+product proof orchestration in the staging workflow, manual runner workflow,
+shell/PowerShell runner scripts, or their tests. Preserve generic dynamic-provider APIs.
+
+Add agent/server tests requiring provider result uploads to match the registered
+operation's `artifact_specs`: declared name, content type, and max bytes. For
+`application/json`, reject invalid JSON and OCI/Docker archive structures even
+when renamed. Agent update packages under `/v1/agent-artifacts/` remain a separate
+admin-to-agent channel and are not accepted as task proof artifacts.
 
 Run: `go test ./... -run 'ProductCapture.*Ownership|CIWorkflows' -count=1`
 
@@ -286,32 +401,40 @@ Expected: FAIL on current script/workflow references.
 
 **Step 2: Remove product-owned orchestration**
 
-Delete the dedicated proof workflow/script and remove product-specific runner
-delegation/import code. Keep generic provider workload validation, retained
+Delete the dedicated proof workflow/script and remove or genericize product
+inputs/IDs/component refs/artifact names from `manual-agent-runner-proof.yml`,
+runner delegation/import code, `proof_scripts_test.go`, and `ci_workflows_test.go`.
+Keep generic provider workload validation, retained
 agent enrollment, image digest enforcement, proof acceptance, and bounded
-artifact APIs unchanged.
+artifact APIs. Resolve the registered operation at lease creation and attach its
+normalized specs to the lease. Enforce those specs in `internal/agent/worker.go`
+before open/upload and again in `handleTaskArtifactUpload` before storage;
+content is bounded before validation and task submitters cannot weaken policy.
 
 **Step 3: Verify cutover and generic behavior**
 
 Run:
 ```bash
-rg -n 'staging-product-capture-proof|product-capture-browser\.oci\.tar|PRODUCT_CAPTURE_DELEGATE_PROOF' . && exit 1 || true
+if rg -n 'staging-product-capture-proof|product-capture-browser\.oci\.tar|PRODUCT_CAPTURE_DELEGATE_PROOF' .github scripts docs; then exit 1; fi
+if rg -n 'staging-product-capture-proof|product-capture-browser\.oci\.tar|PRODUCT_CAPTURE_DELEGATE_PROOF' . --glob '*_test.go'; then exit 1; fi
 go test ./...
 golangci-lint run --new-from-rev=origin/main
 ```
 
-Expected: forbidden search empty; all generic compute tests and lint PASS.
+Expected: forbidden search empty; all generic compute tests/lint PASS; renamed
+OCI, invalid JSON, wrong content type, and max+1-byte task artifacts receive a
+bounded local error/HTTP 413 and are never stored.
 
 **Step 4: Commit**
 
 ```bash
-git add -A scripts .github/workflows staging_product_capture_proof_test.go ci_workflows_test.go
+git add -A scripts .github/workflows internal staging_product_capture_proof_test.go proof_scripts_test.go ci_workflows_test.go docs
 git commit -m "refactor: remove product capture proof ownership"
 ```
 
 Rollback: revert this deletion only if the product-owned workflow has no accepted run; do not restore OCI upload as a long-term path.
 
-### Task 5: BMW Runtime Provenance and Staging Binding
+### Task 6: BMW Runtime Provenance and Staging Binding
 
 **Repository:** `GoCodeAlone/buymywishlist`
 
@@ -321,7 +444,6 @@ Rollback: revert this deletion only if the product-owned workflow has no accepte
 - Modify: `bmwplugin/integration_user_test.go`
 - Modify: `bmwplugin/product_capture_backend_test.go`
 - Modify: `e2e/tests/staging-product-capture-commerce.spec.ts`
-- Modify: `.github/workflows/deploy.yml`
 - Modify: `.github/workflows/staging-commerce-product-capture-proof.yml`
 
 **Step 1: Write failing provenance tests**
@@ -343,16 +465,19 @@ to protected staging workflow environment and redact it to digest-only summary.
 
 **Step 3: Bind staging deployment**
 
-Set the GitHub staging environment variable
-`PRODUCT_CAPTURE_COMPUTE_IMAGE_REF=<candidate@sha256:...>`, dispatch BMW staging
-deploy, and require deploy summary/runtime env inspection to equal the candidate.
+Before PR 4 is admin-merged, set the GitHub staging environment variable
+`PRODUCT_CAPTURE_COMPUTE_IMAGE_REF=<candidate@sha256:...>`. Merge only after the
+variable readback is the exact ref. The merge's existing CI success triggers
+`deploy.yml` through `workflow_run`; monitor that run and require its main SHA,
+deploy summary, and DigitalOcean runtime env inspection to equal the candidate.
+If PR 4 does not merge, restore the prior variable.
 
 **Step 4: Verify**
 
 Run:
 ```bash
 wfctl plugin install --locked
-wfctl validate --strict workflow.yaml
+wfctl validate --strict --skip-unknown-types app.yaml
 go test ./bmwplugin -run 'ProductCapture|AmazonLookup' -count=1
 go test ./scripts -run 'DeployRuntime|ProductCapture' -count=1
 golangci-lint run --new-from-rev=origin/main
@@ -369,7 +494,7 @@ git commit -m "feat: bind capture imports to runtime digest"
 
 Rollback: restore the prior staging environment image ref and redeploy; no production variable changes.
 
-### Task 6: Crash-Safe Test-Mode Issuing Proof
+### Task 7: Crash-Safe Test-Mode Issuing Proof
 
 **Repository:** `GoCodeAlone/buymywishlist`
 
@@ -436,7 +561,7 @@ git commit -m "feat: make staging card proof crash safe"
 
 Rollback: revert pipelines/steps and redeploy staging; run a one-time test-card reconciliation before rollback completes.
 
-### Task 7: Full BMW Staging Commerce Validation
+### Task 8: Full BMW Staging Commerce Validation
 
 **Repository:** `GoCodeAlone/buymywishlist`
 
@@ -482,7 +607,7 @@ golangci-lint run --new-from-rev=origin/main
 
 Expected: tests/actionlint/lint PASS; one E2E test listed.
 
-**Step 5: Commit and publish PR 3**
+**Step 5: Commit and publish PR 4**
 
 ```bash
 git add app.yaml bmwplugin e2e .github/workflows
@@ -495,11 +620,16 @@ After PRs are green/merged and `v0.1.60` is published:
 ```bash
 gh workflow run provision-stripe-payments-webhook.yml -f environment=staging -f mode=ensure
 gh workflow run provision-stripe-issuing-webhook.yml -f environment=staging -f mode=ensure
-gh workflow run deploy.yml -f environment=staging
 gh workflow run staging-commerce-product-capture-proof.yml -f product_url=https://www.amazon.com/dp/B08N5WRWNW
 ```
 
-Monitor runners without SSH until complete. Expected redacted evidence:
+Before the commerce dispatch, use `gh run list/view/watch` to require the
+existing `deploy.yml` `workflow_run` for PR 4's merged main SHA to succeed. Poll
+GitHub runner state and compute-core capacity APIs only; no SSH. The
+product-owned preflight waits up to 30 minutes for one matching idle worker,
+zero active matching leases, and zero queued matching tasks before submission.
+
+Expected redacted evidence:
 - capture task/proof accepted; exact candidate digest; title/image/price present;
 - two distinct `pi_` + contributor/contribution IDs; partial then funded states;
 - one `ic_`, `livemode=false`, then canceled by abort/reaper;

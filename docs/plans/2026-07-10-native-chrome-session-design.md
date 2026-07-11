@@ -124,8 +124,10 @@ not this provider library.
 
 ## Infrastructure Impact
 
-- No database, Terraform, DigitalOcean, Cloudflare, or workflow-compute API
-  changes.
+- No database, Terraform, DigitalOcean, or durable Cloudflare resources.
+- `workflow-plugin-compute-core` gains generic read-only agent/lease/artifact
+  client methods. Workflow-compute enforces existing provider `artifact_specs`
+  at agent and server upload boundaries and removes product-specific proof code.
 - The existing runtime image already installs Google Chrome, Xvfb, and xauth;
   image startup preflight verifies all three before promotion.
 - Release produces the existing amd64 provider image and component artifact.
@@ -212,6 +214,7 @@ not this provider library.
 | integration | class | owner | proof |
 |---|---|---|---|
 | Chrome + Playwright CDP | runtime-integrated | this repo | candidate image diagnostic + lifecycle smoke |
+| Compute-core proof client | runtime-integrated | workflow-plugin-compute-core | agent/lease preflight + bounded artifact download against real staging API |
 | Product provider + workflow-compute | runtime-integrated | product plugin + workflow-compute staging | submitted runtime ref propagated with accepted task proof/artifact |
 | Amazon anonymous browse | runtime-integrated external | BMW staging proof | real URL returns title/image/price; challenges remain external |
 | BMW wishlist/capture callback | runtime-integrated | BuyMyWishlist | existing staging commerce workflow/test |
@@ -249,3 +252,15 @@ anonymous profile. Re-promote the last accepted provider component/image
 (`v0.1.59`). If its Chrome cannot open the profile, remove the anonymous profile
 and start clean; no credentials are lost. Rerun the accepted diagnostic proof
 before BMW traffic resumes. No schema or application-data migration is needed.
+
+### Backport 2026-07-11: Bounded proof ownership
+
+Cause: plan review showed the original design did not fully specify the user's
+requirement to stop sending OCI/runtime images as product proof data.
+
+Change: product-capture owns the staging proof; compute-core exposes narrow
+read-only client APIs; provider result uploads must match declared artifact name,
+content type, and byte limit; workflow-compute product-specific packaging and
+proof orchestration are removed only after the replacement succeeds.
+
+Scope: pre-lock manifest expands from three to four PRs; no production deploy.
