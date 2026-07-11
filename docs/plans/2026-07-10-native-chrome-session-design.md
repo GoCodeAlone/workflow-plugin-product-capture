@@ -1,6 +1,6 @@
 # Native Chrome Product-Capture Session Design
 
-**Status:** Approved
+**Status:** Approved; adversarial review cycle 1 revisions applied
 **Date:** 2026-07-10
 **Decision:** See `decisions/0001-attach-to-native-chrome.md`.
 
@@ -30,8 +30,9 @@ capture/diagnostic contracts.
 ## Architecture
 
 1. Go starts the Node script under Xvfb when headed mode lacks `DISPLAY`.
-2. Headed mode is the provider default. Missing Xvfb/display is an explicit
-   runtime error; `PRODUCT_CAPTURE_BROWSER_HEADLESS=true` remains an opt-in.
+2. The published image sets `PRODUCT_CAPTURE_BROWSER_HEADLESS=false`; the
+   standalone binary preserves its current headless default. Missing
+   Xvfb/display in requested headed mode is an explicit preflight error.
 3. Node starts installed `google-chrome` with the selected profile directory,
    `--remote-debugging-port=0`, a 1920x1080 default window, container-required
    sandbox/dev-shm flags, and no automation/identity flags.
@@ -42,8 +43,25 @@ capture/diagnostic contracts.
    viewport, locale, timezone, or graphics renderer.
 6. The existing Amazon same-origin homepage warmup and document
    `window.location.assign` navigation remain unchanged.
-7. Browser close is bounded. Normal close, startup failure, timeout, and signal
-   paths terminate the child process and remove only ephemeral profile state.
+7. Browser close is bounded. Go owns a process group containing Xvfb, Node,
+   Chrome, and Chrome children; cancellation sends bounded TERM then KILL and
+   reaps the group. The task container/cgroup is the parent-death boundary.
+8. Normal close, startup failure, timeout, and signal paths remove only
+   ephemeral profile state. Stable-profile lock failures never trigger unsafe
+   lock-file deletion.
+
+## Diagnostic Boundary
+
+- Dynamic browser diagnostics require an exact HTTPS origin in
+  `PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS`; unset means disabled.
+- Dynamic diagnostics always use an ephemeral profile, even when capture uses a
+  stable anonymous profile; diagnostic tasks cannot read retained cookies.
+- The requested origin and every top-level redirect must match the allowlist.
+  Initial DNS resolution must contain no loopback, link-local, or private IP.
+- The diagnostic browser blocks cross-origin HTTP(S) requests. It posts only
+  bounded browser signals to the same allowed origin and never emits cookies.
+- The operator-managed endpoint stores structured headers/signals only, redacts
+  network identifiers from shared artifacts, and uses short-lived logs.
 
 ## Session State
 
@@ -57,7 +75,8 @@ capture/diagnostic contracts.
 ## Error Handling
 
 - Chrome executable failure, early exit, malformed `DevToolsActivePort`, CDP
-  timeout, profile lock, and unavailable headed display produce bounded errors.
+  timeout, profile lock, unavailable headed display, and process-group cleanup
+  failure produce bounded errors.
 - No fallback reinstalls identity patches or silently changes headed mode.
 - Existing browser-target crash retries may restart Chrome within the remaining
   workload deadline; cleanup precedes retry.
@@ -67,6 +86,8 @@ capture/diagnostic contracts.
 
 - CDP binds through Chrome's ephemeral debugging port and is consumed only via
   `127.0.0.1`; no service port or public route is added.
+- Dynamic diagnostics are disabled without an explicit trusted-origin allowlist
+  and cannot navigate or post outside that origin.
 - Target URL validation and same-origin warmup validation remain unchanged.
 - Chrome receives no BMW, Stripe, or workflow-compute credentials.
 - Stable profiles are anonymous operator-managed state and must not be shared
@@ -76,21 +97,46 @@ capture/diagnostic contracts.
 
 - No database, Terraform, DigitalOcean, Cloudflare, or workflow-compute API
   changes.
-- The existing runtime image already installs Google Chrome, Xvfb, and xauth.
+- The existing runtime image already installs Google Chrome, Xvfb, and xauth;
+  image startup preflight verifies all three before promotion.
 - Release produces the existing amd64 provider image and component artifact.
-- Promotion changes only the product-capture provider component version/digest.
+- Release builds a local candidate image, records Chrome/Playwright/Xvfb
+  versions, runs the real diagnostic smoke, then pushes that same candidate.
+- Promotion uses the reported immutable digest and changes only the
+  product-capture provider component version/digest.
 
 ## Multi-Component Validation
 
 1. Unit/source tests prove the launcher uses native Chrome/CDP and contains none
    of the removed identity overrides.
 2. Build the real runtime image and run its browser diagnostic against a
-   controlled echo endpoint; compare headers and JS signals with a directly
-   launched Chrome baseline.
-3. Release/promote the image and retain an accepted workflow-compute staging
-   diagnostic proof.
-4. Run BuyMyWishlist staging commerce proof with a real Amazon URL; require
-   returned title, image, and price before Stripe funding proceeds.
+   controlled allowlisted echo endpoint. Record Chrome, Playwright, and Xvfb
+   versions and compare direct versus CDP-attached sessions across request
+   headers/order, client hints, JS navigator values, display metrics, WebGL,
+   request sequence, cookies, and checked automation globals. Differences are
+   diagnostic evidence, never a site-control bypass target.
+3. Kill the real image during startup, navigation timeout, SIGTERM, and parent
+   exit; assert no Chrome/Xvfb process or profile lock survives the container.
+4. Release/promote the tested candidate digest and retain an accepted
+   workflow-compute staging diagnostic proof plus its bounded JSON artifact.
+5. Dispatch BuyMyWishlist
+   `.github/workflows/staging-commerce-product-capture-proof.yml`, which owns
+   `e2e/tests/staging-product-capture-commerce.spec.ts`, with a real Amazon URL.
+   Require title, image, positive price, task/proof IDs, contributor-one partial
+   funding, contributor-two completion, two distinct PaymentIntent IDs, funded
+   item/wishlist state, fulfillment claim, and one Stripe Issuing `ic_` card.
+
+## Integration Matrix
+
+| integration | class | owner | proof |
+|---|---|---|---|
+| Chrome + Playwright CDP | runtime-integrated | this repo | candidate image diagnostic + lifecycle smoke |
+| Product provider + workflow-compute | runtime-integrated | workflow-compute staging | accepted task proof/artifact using promoted digest |
+| Amazon anonymous browse | runtime-integrated external | BMW staging proof | real URL returns title/image/price; challenges remain external |
+| BMW wishlist/capture callback | runtime-integrated | BuyMyWishlist | existing staging commerce workflow/test |
+| Stripe Payments + webhooks | runtime-integrated | BuyMyWishlist | two users, partial then funded, distinct PaymentIntents |
+| Stripe Issuing | runtime-integrated | BuyMyWishlist | claimed item creates one real staging `ic_` card |
+| Production promotion | deferred | operator | staging evidence is required first; no production change in scope |
 
 ## Assumptions
 
@@ -98,7 +144,7 @@ capture/diagnostic contracts.
 |---|---|---|---|
 | A1 | Runtime image contains `google-chrome`, Xvfb, and xauth | Image drift breaks startup | Dockerfile contract test + runtime image smoke |
 | A2 | Chrome writes `DevToolsActivePort` for `--remote-debugging-port=0` | Startup may hang | Bounded poll + child-exit detection |
-| A3 | CDP attachment does not expose checked Playwright globals | Future Playwright/Chrome may change | Diagnostic comparison gates promotion |
+| A3 | CDP attachment retains the measured native baseline within the declared matrix | Future Playwright/Chrome may change | Versioned comparison gates promotion; no non-detection claim |
 | A4 | A stable profile is used by at most one capture at a time | Concurrent workers can lock it | Fail bounded; operator assigns worker-local profile |
 | A5 | Amazon permits anonymous product browsing from staging egress | External challenge may persist | Preserve proof as external block; do not add spoofing |
 
@@ -106,13 +152,15 @@ capture/diagnostic contracts.
 
 - A plain Playwright launch is less code, but it fails the requirement that the
   browser session follow a native launch contract.
-- CDP lifecycle code is the highest-risk addition; readiness and cleanup need
-  direct tests plus a real image launch test.
-- Default headed operation depends on Xvfb outside the published image; fail
-  clearly rather than hide environmental drift.
+- CDP lifecycle code is the highest-risk addition; process-group and real image
+  kill tests cover readiness, timeout, parent death, and cleanup.
+- Headed operation is an image-level default, not a standalone-binary breaking
+  default; image preflight catches missing Xvfb before promotion.
 
 ## Rollback
 
-Re-promote the last accepted provider component/image (`v0.1.59`) and rerun the
-accepted diagnostic proof. No schema or stored-data migration is required.
-Stable anonymous Chrome profiles may be retained or deleted to reset state.
+Drain the retained worker, stop all capture containers, and archive the
+anonymous profile. Re-promote the last accepted provider component/image
+(`v0.1.59`). If its Chrome cannot open the profile, remove the anonymous profile
+and start clean; no credentials are lost. Rerun the accepted diagnostic proof
+before BMW traffic resumes. No schema or application-data migration is needed.

@@ -27,7 +27,8 @@ security maintenance burden, and does not address the measured differences.
 ## Consequences
 
 The browser exposes Chrome's native request and JavaScript signals. Runtime code
-must own Chrome startup, CDP readiness, termination, and profile lock failures.
-The supported image must provide Chrome and Xvfb for default headed operation.
-Rollback is a provider image/version change; stored anonymous profile data is
-compatible because Chrome still owns the profile.
+must own Chrome startup, CDP readiness, process-tree termination, and profile
+lock failures. The supported image must provide Chrome and Xvfb for headed
+operation. Rollback is a provider image/version change, but Chrome profile
+downgrade compatibility is not assumed; operators drain the worker and reset
+anonymous profile state when the prior Chrome cannot open it.
