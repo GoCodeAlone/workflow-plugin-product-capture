@@ -726,6 +726,21 @@ func cleanupBrowserCommandAfterError(_ context.Context, cmd *exec.Cmd) error {
 	return nil
 }
 
+func runBoundedBrowserCleanupCommand(timeout time.Duration, name string, args ...string) error {
+	if timeout <= 0 {
+		timeout = 500 * time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = timeout
+	err := cmd.Run()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("browser cleanup command %q timed out after %s: %w", name, timeout, ctxErr)
+	}
+	return err
+}
+
 func resolveBrowserDiagnosticTarget(ctx context.Context, rawURL, allowedOrigins string, lookup browserDiagnosticLookup) (browserDiagnosticTarget, error) {
 	if strings.TrimSpace(allowedOrigins) == "" {
 		return browserDiagnosticTarget{}, errors.New("browser diagnostics are disabled; PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS is unset")

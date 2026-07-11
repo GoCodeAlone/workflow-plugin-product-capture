@@ -955,7 +955,7 @@ func TestBrowserProcessPolicyHasPlatformOwnershipAndBoundedTermination(t *testin
 		"//go:build !linux",
 		"os.FindProcess(pid)",
 		"runtime.GOOS == \"windows\"",
-		"exec.Command(\"taskkill\", \"/PID\"",
+		"runBoundedBrowserCleanupCommand(grace, \"taskkill\", \"/PID\"",
 		"\"/T\", \"/F\"",
 		"process.Signal(syscall.Signal(0))",
 		"cmd.Process.Signal(os.Interrupt)",
@@ -968,6 +968,22 @@ func TestBrowserProcessPolicyHasPlatformOwnershipAndBoundedTermination(t *testin
 	}
 	if strings.Contains(string(otherSource), "return interruptErr") {
 		t.Error("non-Linux browser process policy must still kill when graceful interrupt is unsupported")
+	}
+}
+
+func TestBoundedBrowserCleanupCommandTimesOut(t *testing.T) {
+	if os.Getenv("PRODUCT_CAPTURE_TEST_BLOCK_CLEANUP_COMMAND") == "1" {
+		time.Sleep(500 * time.Millisecond)
+		return
+	}
+	t.Setenv("PRODUCT_CAPTURE_TEST_BLOCK_CLEANUP_COMMAND", "1")
+	started := time.Now()
+	err := runBoundedBrowserCleanupCommand(50*time.Millisecond, os.Args[0], "-test.run=^TestBoundedBrowserCleanupCommandTimesOut$")
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("bounded cleanup error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("bounded cleanup command ran for %s", elapsed)
 	}
 }
 

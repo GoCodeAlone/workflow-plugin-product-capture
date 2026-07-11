@@ -40,7 +40,7 @@ func (otherBrowserProcessPolicy) TerminateGroup(cmd *exec.Cmd, grace time.Durati
 		return nil
 	}
 	if runtime.GOOS == "windows" {
-		if err := exec.Command("taskkill", "/PID", strconv.Itoa(cmd.Process.Pid), "/T", "/F").Run(); err == nil {
+		if err := runBoundedBrowserCleanupCommand(grace, "taskkill", "/PID", strconv.Itoa(cmd.Process.Pid), "/T", "/F"); err == nil {
 			return nil
 		}
 		killErr := cmd.Process.Kill()
