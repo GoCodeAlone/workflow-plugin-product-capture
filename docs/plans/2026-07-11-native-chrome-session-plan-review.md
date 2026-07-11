@@ -264,3 +264,49 @@ P16 is resolved.
 | Compile validity | Clean | Planned shapes plausible |
 
 **Verdict:** P17 requires immutable proof-source/deployment provenance.
+
+## Cycle 6
+
+**Status:** PASS
+
+P17 is resolved; no P18+ findings.
+
+**Design-class scan:**
+
+| class | result | note |
+|---|---|---|
+| Project guidance | Clean | Product/compute/BMW ownership coherent |
+| Assumptions | Clean | Runtime assumptions have bounded gates/fallbacks |
+| Repo precedent | Clean | Existing deploy/runner/webhook/runtime patterns used |
+| Artifact precedent | Clean | Canonical refs and enforcement exact |
+| YAGNI | Clean | No spoofing, profiles, forks, or image upload |
+| Failure modes | Clean | SHA, webhook, congestion, cleanup handled |
+| Security/privacy | Clean | Least-privilege token and redacted evidence |
+| Infrastructure | Clean | Ensure/deploy/revision/delay executable |
+| Multi-component | Clean | All boundaries connected by gates |
+| Integration proof | Clean | Real capture through funded card retained |
+| UI rendering | Clean | No UI route |
+| Rollback | Clean | Image/config/card reversal specified |
+| Simpler alternative | Clean | Fail-closed SHA retry avoids mutable refs |
+| User intent | Clean | Full requested E2E and browser constraints intact |
+| Runtime validity | Clean | Commands/refs/triggers/timing match contracts |
+
+**Plan-class scan:**
+
+| class | result | note |
+|---|---|---|
+| Decomposition | Clean | Corrections fit unchanged manifest |
+| Verification match | Clean | Unit/workflow/infra/staging/E2E match risk |
+| Auth chain | Clean | Actions and BMW authorization explicit |
+| Serial dependencies | Clean | Release/deploy/proof sequence ordered |
+| Rollback wiring | Clean | Each staging task reversible |
+| Integration proof | Clean | Source/deploy/image/task/funding/card bound |
+| Integration matrix | Clean | Every integration has owner/proof |
+| UI route proof | Clean | No UI route |
+| Infrastructure verification | Clean | Run IDs/order/revision/SHA checks explicit |
+| Plugin layout | Clean | Generic compute-wasm imports retained |
+| Config schema | Clean | Specs/app/infra/workflow inputs coherent |
+| Naming match | Clean | Refs/workflows/inputs identifiers exact |
+| Compile validity | Clean | Planned APIs/config/tests plausible |
+
+**Verdict:** PASS; proceed to structural alignment.
