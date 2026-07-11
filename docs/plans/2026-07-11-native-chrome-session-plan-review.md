@@ -164,3 +164,53 @@ P9-P12 are resolved.
 | Compile validity | Finding P13 | Parser would target nonexistent route |
 
 **Verdict:** P13-P15 require executable ref, deploy, and fulfillment revisions.
+
+## Cycle 4
+
+**Status:** FAIL
+
+P13-P15 are resolved.
+
+| id | sev | class | finding | resolution |
+|---|---|---|---|---|
+| P16 | Important | Actions authorization | Run-ID metadata gate lacks `actions: read` and a token in the target workflow | Grant `actions: read`; use step-scoped `${{ github.token }}`; test exact workflow/event/conclusion/SHA/order checks |
+
+**Design-class scan:**
+
+| class | result | note |
+|---|---|---|
+| Project guidance | Clean | Ownership/no-OCI boundary correct |
+| Assumptions | Finding P16 | Assumes Actions metadata readable without permission |
+| Repo precedent | Clean | Existing deploy/webhook workflows used |
+| Artifact precedent | Clean | Canonical bounded route exact |
+| YAGNI | Clean | No spoofing, credentials, or runtime upload |
+| Failure modes | Finding P16 | Metadata preflight lacks auth setup |
+| Security/privacy | Clean | Secret bindings checked without values |
+| Infrastructure | Finding P16 | Actions API authorization omitted |
+| Multi-component | Finding P16 | Run-ID proof cannot execute |
+| Integration proof | Finding P16 | Deploy provenance gate not runnable |
+| UI rendering | Clean | No UI route |
+| Rollback | Clean | Image/redeploy/card cleanup defined |
+| Simpler alternative | Clean | Run-ID gate appropriate once authorized |
+| User intent | Clean | Full requested E2E remains covered |
+| Runtime validity | Finding P16 | Workflow token contract invalid |
+
+**Plan-class scan:**
+
+| class | result | note |
+|---|---|---|
+| Decomposition | Clean | Prerequisites explicit |
+| Verification match | Finding P16 | actionlint cannot prove API auth |
+| Auth chain | Finding P16 | GitHub token permission incomplete |
+| Serial dependencies | Clean | Ensure/deploy/proof ordered |
+| Rollback wiring | Clean | Task rollback sufficient |
+| Integration proof | Finding P16 | Metadata gate not runnable |
+| Integration matrix | Clean | All integrations represented |
+| UI route proof | Clean | No UI route |
+| Infrastructure verification | Finding P16 | API access not granted |
+| Plugin layout | Clean | Generic compute-wasm retained |
+| Config schema | Clean | Refs/config/delay coherent |
+| Naming match | Clean | Canonical ref exact |
+| Compile validity | Clean | Planned code shapes plausible |
+
+**Verdict:** P16 requires explicit Actions read authorization and contract proof.

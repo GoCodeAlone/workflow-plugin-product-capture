@@ -283,3 +283,13 @@ environment-backed delay: seven days by default/production and zero only in
 staging, while the proof still exercises the real cron/dispatcher path.
 
 Scope: no manifest change; Tasks 1, 7, and 9 absorb the corrected prerequisites.
+
+### Backport 2026-07-11: Actions provenance authorization
+
+Cause: the commerce workflow's default token cannot read Actions run metadata
+under its current `contents: read` permission.
+
+Change: grant `actions: read`; expose `${{ github.token }}` only to the metadata
+preflight step; validate exact workflow, event, conclusion, SHA, and run ordering.
+
+Scope: no manifest change; Task 9 owns the workflow permission and contract test.

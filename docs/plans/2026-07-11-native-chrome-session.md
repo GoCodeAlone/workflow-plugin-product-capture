@@ -665,6 +665,7 @@ Rollback: revert pipelines/steps and redeploy staging; run a one-time test-card 
 - Modify: `infra.yaml`
 - Modify: `bmwplugin/integration_admin_test.go`
 - Modify: `bmwplugin/integration_cron_test.go`
+- Create: `scripts/staging_commerce_workflow_test.go`
 
 **Step 1: Write failing E2E contract assertions**
 
@@ -698,14 +699,20 @@ contributions unless staging publishable/secret key modes are test, both
 pre-deploy webhook `ensure` run IDs succeeded, and the active deployment started
 after them with both secret env keys. Add required workflow inputs for the two
 webhook run IDs, deploy run ID, and expected deployed SHA; query Actions run
-metadata to enforce success and timestamps rather than trusting caller booleans.
-Pass candidate ref and proof run ID; upload only redacted IDs/booleans.
+metadata to enforce exact workflow name, `workflow_dispatch` event for webhook
+runs, success conclusion, deploy SHA, and completion/start ordering rather than
+trusting caller booleans. Grant workflow `actions: read`; expose
+`GH_TOKEN: ${{ github.token }}` only to this metadata-preflight step. Add a Go
+workflow contract test for permissions, token scope, exact-ID queries, and
+negative metadata cases. Pass candidate ref and proof run ID; upload only
+redacted IDs/booleans.
 
 **Step 4: Local verification**
 
 Run:
 ```bash
 go test ./bmwplugin -run 'Admin.*Contribution|Issuing|ProductCapture|Cron.*Dispatch' -count=1
+go test ./scripts -run 'StagingCommerce.*(Permissions|RunProvenance)' -count=1
 cd e2e && npm ci && npx playwright test tests/staging-product-capture-commerce.spec.ts --project api --list
 actionlint .github/workflows/staging-commerce-product-capture-proof.yml
 wfctl infra plan --env staging -c infra.yaml --output /tmp/bmw-staging-plan.json
@@ -719,7 +726,7 @@ env contains `FULFILLMENT_DISPATCH_DELAY_SECONDS=0` and prod contains `604800`.
 **Step 5: Commit and publish PR 5**
 
 ```bash
-git add app.yaml infra.yaml bmwplugin e2e .github/workflows
+git add app.yaml infra.yaml bmwplugin scripts e2e .github/workflows
 git commit -m "test: prove staging capture commerce round trip"
 ```
 
