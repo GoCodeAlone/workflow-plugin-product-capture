@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -506,7 +507,7 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	}
 }
 
-func TestRunBrowserDiagnosticAcceptsSuccessfulOutputWithNonzeroTeardown(t *testing.T) {
+func TestRunBrowserDiagnosticRejectsSuccessfulOutputWithNonzeroTeardown(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake node executable uses a POSIX shell script")
 	}
@@ -537,8 +538,12 @@ exit 1
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
 
 	var stdout bytes.Buffer
-	if err := runBrowserDiagnostic("https://93.184.216.34/", &stdout); err != nil {
-		t.Fatalf("runBrowserDiagnostic should accept complete successful output: %v", err)
+	err := runBrowserDiagnostic("https://93.184.216.34/", &stdout)
+	if err == nil {
+		t.Fatal("runBrowserDiagnostic accepted a nonzero teardown exit")
+	}
+	if !strings.Contains(err.Error(), "browser diagnostic failed") {
+		t.Fatalf("error = %v", err)
 	}
 	if !strings.Contains(stdout.String(), `"posted_to_origin": true`) {
 		t.Fatalf("diagnostic output was not preserved: %s", stdout.String())
@@ -625,6 +630,211 @@ func TestBrowserProcessScriptTerminatesChromeChildOnSignals(t *testing.T) {
 		if strings.Contains(playwrightBrowserPrelude, forbidden) {
 			t.Errorf("browser signal cleanup uses broad process killing %q", forbidden)
 		}
+	}
+}
+
+func TestBrowserScriptCleansUpAfterPostLaunchSetupFailure(t *testing.T) {
+	t.Run("capture page", func(t *testing.T) {
+		fakePlaywright := `
+exports.chromium = {
+  connectOverCDP: async () => ({
+    contexts: () => [{
+      newPage: async () => { throw new Error('capture page setup failed'); },
+    }],
+    close: async () => { console.error('capture browser close called'); },
+  }),
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`
+		_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+		assertBrowserSetupFailureCleanup(t, stderr, err, "capture page setup failed", "capture browser close called")
+	})
+
+	t.Run("diagnostic route", func(t *testing.T) {
+		fakePlaywright := `
+exports.chromium = {
+  connectOverCDP: async () => ({
+    contexts: () => [{
+      route: async () => { throw new Error('diagnostic route setup failed'); },
+      newPage: async () => { throw new Error('diagnostic page should not be created'); },
+    }],
+    close: async () => { console.error('diagnostic route browser close called'); },
+  }),
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`
+		_, stderr, err := runBrowserDiagnosticScriptWithFake(t, fakePlaywright)
+		assertBrowserSetupFailureCleanup(t, stderr, err, "diagnostic route setup failed", "diagnostic route browser close called")
+	})
+
+	t.Run("diagnostic page", func(t *testing.T) {
+		fakePlaywright := `
+exports.chromium = {
+  connectOverCDP: async () => ({
+    contexts: () => [{
+      route: async () => {},
+      newPage: async () => { throw new Error('diagnostic page setup failed'); },
+    }],
+    close: async () => { console.error('diagnostic page browser close called'); },
+  }),
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`
+		_, stderr, err := runBrowserDiagnosticScriptWithFake(t, fakePlaywright)
+		assertBrowserSetupFailureCleanup(t, stderr, err, "diagnostic page setup failed", "diagnostic page browser close called")
+	})
+}
+
+func assertBrowserSetupFailureCleanup(t *testing.T, stderr bytes.Buffer, err error, setupError, closeEvent string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("browser setup unexpectedly succeeded")
+	}
+	for _, want := range []string{setupError, closeEvent} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q after setup failure:\n%s", want, stderr.String())
+		}
+	}
+}
+
+func TestBrowserScriptCleanupAttemptsTerminationAndPropagatesFailures(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const events = [];
+  const session = {
+    browser: {
+      close: async () => {
+        events.push('close');
+        throw new Error('playwright close failed');
+      },
+    },
+    chrome: {
+      pid: 123,
+      chromeExit: null,
+      exited: Promise.resolve(),
+      kill: (signal) => {
+        events.push(signal);
+        throw new Error('chrome termination failed');
+      },
+    },
+  };
+  let cleanupError = null;
+  try {
+    await closeCaptureBrowser(session);
+  } catch (err) {
+    cleanupError = err;
+  }
+  if (!cleanupError) throw new Error('browser cleanup unexpectedly succeeded');
+  if (events.join(',') !== 'close,SIGTERM') {
+    throw new Error('cleanup events: ' + events.join(','));
+  }
+  const errors = Array.from(cleanupError.errors || [cleanupError]);
+  const messages = errors.map((err) => String(err && err.message || err));
+  if (!messages.includes('playwright close failed') || !messages.includes('chrome termination failed')) {
+    throw new Error('cleanup errors: ' + messages.join(','));
+  }
+  if (!cleanupError.message.includes('playwright close failed') || !cleanupError.message.includes('chrome termination failed')) {
+    throw new Error('cleanup message: ' + cleanupError.message);
+  }
+  process.stdout.write('cleanup propagated');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil {
+		t.Fatalf("cleanup contract failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if stdout.String() != "cleanup propagated" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestBrowserScriptCleanupPreservesPrimaryOperationFailure(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const events = [];
+  let resolveExit;
+  const chrome = {
+    pid: 123,
+    chromeExit: null,
+    exited: new Promise((resolve) => { resolveExit = resolve; }),
+    kill: (signal) => {
+      events.push(signal);
+      chrome.chromeExit = { code: 0, signal };
+      resolveExit();
+    },
+  };
+  const session = {
+    browser: {
+      close: async () => {
+        events.push('close');
+        throw new Error('playwright close failed');
+      },
+    },
+    chrome,
+  };
+  const operationError = new Error('capture setup failed');
+  let combinedError = null;
+  try {
+    await closeCaptureBrowserAfterOperation(session, operationError);
+  } catch (err) {
+    combinedError = err;
+  }
+  if (!(combinedError instanceof AggregateError)) {
+    throw new Error('cleanup did not preserve the primary operation failure');
+  }
+  const messages = Array.from(combinedError.errors || []).map((err) => String(err && err.message || err));
+  if (messages.join(',') !== 'capture setup failed,playwright close failed') {
+    throw new Error('combined errors: ' + messages.join(','));
+  }
+  if (!combinedError.message.includes('capture setup failed') || !combinedError.message.includes('playwright close failed')) {
+    throw new Error('combined message: ' + combinedError.message);
+  }
+  if (combinedError.cause !== operationError) throw new Error('primary operation error is not the cause');
+  if (events.join(',') !== 'close,SIGTERM') throw new Error('cleanup events: ' + events.join(','));
+  process.stdout.write('primary preserved');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil {
+		t.Fatalf("combined cleanup contract failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if stdout.String() != "primary preserved" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestBrowserScriptCleanupClearsCloseTimeout(t *testing.T) {
+	started := time.Now()
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const chrome = {
+    pid: 123,
+    chromeExit: { code: 0, signal: null },
+    exited: Promise.resolve(),
+    kill: () => { throw new Error('already-exited Chrome should not be signaled'); },
+  };
+  await closeCaptureBrowser({
+    browser: { close: async () => {} },
+    chrome,
+  });
+  process.stdout.write('cleanup complete');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil {
+		t.Fatalf("cleanup timeout contract failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if elapsed := time.Since(started); elapsed >= 1500*time.Millisecond {
+		t.Fatalf("successful cleanup retained close timeout for %s", elapsed)
+	}
+	if stdout.String() != "cleanup complete" {
+		t.Fatalf("stdout = %q", stdout.String())
 	}
 }
 
@@ -938,6 +1148,122 @@ func TestBrowserProcessTerminatesAndReapsProcessGroup(t *testing.T) {
 	if _, err := os.Stat(filepath.Join("/proc", strconv.Itoa(childPID))); !os.IsNotExist(err) {
 		t.Fatalf("browser child %d still exists after group termination: %v", childPID, err)
 	}
+}
+
+func TestBrowserProcessCommandContextErrorStillCleansReapedGroup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake browser command uses a POSIX shell")
+	}
+	cmd := exec.Command("sh", "-c", "exit 17")
+	if err := cmd.Run(); err == nil {
+		t.Fatal("browser command unexpectedly succeeded")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	policy := &recordingBrowserProcessPolicy{terminateErr: errors.New("timeout group cleanup failed")}
+	previousPolicy := browserProcesses
+	browserProcesses = policy
+	t.Cleanup(func() { browserProcesses = previousPolicy })
+
+	err := cleanupBrowserCommandAfterError(ctx, cmd)
+	if policy.terminateCalls != 1 {
+		t.Fatalf("TerminateGroup calls = %d, want 1", policy.terminateCalls)
+	}
+	if policy.terminated == nil || policy.terminated.ProcessState == nil || !policy.terminated.ProcessState.Exited() {
+		t.Fatalf("browser command was not reaped before group cleanup: %+v", policy.terminated)
+	}
+	if err == nil || !strings.Contains(err.Error(), "timeout group cleanup failed") {
+		t.Fatalf("cleanup error = %v", err)
+	}
+}
+
+func TestBrowserProcessCommandErrorTerminatesGroupAfterReap(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\nexit 17\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
+
+	policy := &recordingBrowserProcessPolicy{}
+	previousPolicy := browserProcesses
+	browserProcesses = policy
+	t.Cleanup(func() { browserProcesses = previousPolicy })
+
+	_, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err == nil {
+		t.Fatal("browser command unexpectedly succeeded")
+	}
+	if policy.terminateCalls != 1 {
+		t.Fatalf("TerminateGroup calls = %d, want 1", policy.terminateCalls)
+	}
+	if policy.terminated == nil || policy.terminated.ProcessState == nil || !policy.terminated.ProcessState.Exited() {
+		t.Fatalf("browser command was not reaped before group cleanup: %+v", policy.terminated)
+	}
+	if policy.grace <= 0 {
+		t.Fatalf("termination grace = %s", policy.grace)
+	}
+}
+
+func TestBrowserProcessCommandCleanupFailureIsReturned(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\necho 'node operation failed' >&2\nexit 17\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
+
+	policy := &recordingBrowserProcessPolicy{terminateErr: errors.New("group cleanup failed")}
+	previousPolicy := browserProcesses
+	browserProcesses = policy
+	t.Cleanup(func() { browserProcesses = previousPolicy })
+
+	_, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err == nil {
+		t.Fatal("browser command unexpectedly succeeded")
+	}
+	for _, want := range []string{"node operation failed", "group cleanup failed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error = %v, want %q", err, want)
+		}
+	}
+}
+
+type recordingBrowserProcessPolicy struct {
+	terminateCalls int
+	terminated     *exec.Cmd
+	grace          time.Duration
+	terminateErr   error
+}
+
+func (*recordingBrowserProcessPolicy) Configure(*exec.Cmd) {}
+
+func (*recordingBrowserProcessPolicy) OwnsListeningPort(int, int) bool { return false }
+
+func (p *recordingBrowserProcessPolicy) TerminateGroup(cmd *exec.Cmd, grace time.Duration) error {
+	p.terminateCalls++
+	p.terminated = cmd
+	p.grace = grace
+	return p.terminateErr
 }
 
 func TestBrowserScriptSupportsConfiguredHeadlessMode(t *testing.T) {
@@ -5677,6 +6003,68 @@ func runPlaywrightScriptWithFakeURLTimeoutAndCommandTimeout(t *testing.T, fakePl
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err = cmd.Run()
+	return stdout, stderr, err
+}
+
+func runBrowserDiagnosticScriptWithFake(t *testing.T, fakePlaywright string) (bytes.Buffer, bytes.Buffer, error) {
+	t.Helper()
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skipf("node not installed; CI provisions Node for generated browser script regressions: %v", err)
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "diagnostic.js")
+	if err := os.WriteFile(script, []byte(playwrightBrowserDiagnosticScript), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	moduleDir := filepath.Join(dir, "node_modules", "playwright")
+	if err := os.MkdirAll(moduleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(fakePlaywright+fakeConnectOverCDPAdapter), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	installFakeGoogleChrome(t, dir)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	const targetURL = "https://93.184.216.34/"
+	cmd := exec.CommandContext(ctx, "node", script, targetURL)
+	cmd.Env = withoutNodeOverrides(os.Environ())
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(dir, "chrome-profile"))
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", "https://93.184.216.34")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", "MAP 93.184.216.34 93.184.216.34")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout, stderr, err
+}
+
+func runBrowserPreludeSnippet(t *testing.T, snippet string) (bytes.Buffer, bytes.Buffer, error) {
+	t.Helper()
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skipf("node not installed; CI provisions Node for generated browser script regressions: %v", err)
+	}
+	dir := t.TempDir()
+	script := filepath.Join(dir, "prelude-test.js")
+	if err := os.WriteFile(script, []byte(playwrightBrowserPrelude+snippet), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	moduleDir := filepath.Join(dir, "node_modules", "playwright")
+	if err := os.MkdirAll(moduleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(`
+exports.chromium = {};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("node", script)
+	cmd.Env = withoutNodeOverrides(os.Environ())
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
 	return stdout, stderr, err
 }
 

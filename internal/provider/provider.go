@@ -615,21 +615,22 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		cleanupErr := cleanupBrowserCommandAfterError(ctx, cmd)
 		if stdout.err != nil {
-			return "", fmt.Errorf("browser capture failed: %w", stdout.err)
+			return "", errors.Join(fmt.Errorf("browser capture failed: %w", stdout.err), cleanupErr)
 		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			msg := strings.TrimSpace(stderr.String())
 			if msg != "" {
-				return "", fmt.Errorf("browser capture timed out after %s; last browser stderr: %s", timeout, msg)
+				return "", errors.Join(fmt.Errorf("browser capture timed out after %s; last browser stderr: %s", timeout, msg), cleanupErr)
 			}
-			return "", fmt.Errorf("browser capture timed out after %s", timeout)
+			return "", errors.Join(fmt.Errorf("browser capture timed out after %s", timeout), cleanupErr)
 		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", fmt.Errorf("browser capture failed: %s", msg)
+		return "", errors.Join(fmt.Errorf("browser capture failed: %s", msg), cleanupErr)
 	}
 	if stdout.err != nil {
 		return "", fmt.Errorf("browser capture failed: %w", stdout.err)
@@ -704,19 +705,23 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", target.allowedOrigin)
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", target.resolverRules)
-	var stderr, out bytes.Buffer
-	cmd.Stdout = io.MultiWriter(stdout, &out)
+	var stderr bytes.Buffer
+	cmd.Stdout = stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && browserDiagnosticOutputSucceeded(out.Bytes()) {
-			return nil
-		}
+		cleanupErr := cleanupBrowserCommandAfterError(ctx, cmd)
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
-		return fmt.Errorf("browser diagnostic failed: %s", msg)
+		return errors.Join(fmt.Errorf("browser diagnostic failed: %s", msg), cleanupErr)
+	}
+	return nil
+}
+
+func cleanupBrowserCommandAfterError(_ context.Context, cmd *exec.Cmd) error {
+	if err := browserProcesses.TerminateGroup(cmd, 500*time.Millisecond); err != nil {
+		return fmt.Errorf("terminate browser process group after command error: %w", err)
 	}
 	return nil
 }
@@ -827,18 +832,6 @@ func isPublicDiagnosticIP(address netip.Addr) bool {
 		}
 	}
 	return true
-}
-
-func browserDiagnosticOutputSucceeded(data []byte) bool {
-	var result struct {
-		FinalURL       string `json:"final_url"`
-		PostedToOrigin bool   `json:"posted_to_origin"`
-		PostError      string `json:"post_error"`
-	}
-	if err := json.Unmarshal(data, &result); err != nil {
-		return false
-	}
-	return result.FinalURL != "" && result.PostedToOrigin && strings.TrimSpace(result.PostError) == ""
 }
 
 func writeBrowserDiagnosticScript() (string, error) {
@@ -1216,23 +1209,63 @@ async function newCapturePage(browser) {
   return await browser.newPage();
 }
 
+function boundedBrowserErrorMessage(err) {
+  const message = err && err.message ? err.message : err;
+  return String(message || 'unknown error').replace(/\s+/g, ' ').slice(0, 400);
+}
+
+function browserErrorSummary(errors) {
+  return Array.from(errors || []).map(boundedBrowserErrorMessage).join('; ').slice(0, 800);
+}
+
 async function closeCaptureBrowser(browser) {
-  let closeError = null;
+  const cleanupErrors = [];
+  let closeTimer;
   try {
     await Promise.race([
       browser.browser.close(),
-      delay(2000).then(() => { throw new Error('browser close timed out'); }),
+      new Promise((_, reject) => {
+        closeTimer = setTimeout(() => reject(new Error('browser close timed out')), 2000);
+      }),
     ]);
   } catch (err) {
-    closeError = err;
+    cleanupErrors.push(err);
+  } finally {
+    if (closeTimer) clearTimeout(closeTimer);
   }
   try {
     await terminateChromeChild(browser.chrome, 1000);
   } catch (err) {
-    if (!closeError) closeError = err;
+    cleanupErrors.push(err);
+  } finally {
+    if (activeChromeChild === browser.chrome) activeChromeChild = null;
   }
-  if (activeChromeChild === browser.chrome) activeChromeChild = null;
-  if (closeError) console.error('browser close warning: ' + errorMessage(closeError));
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(
+      cleanupErrors,
+      'browser cleanup failed: ' + browserErrorSummary(cleanupErrors),
+      { cause: cleanupErrors[0] },
+    );
+  }
+}
+
+async function closeCaptureBrowserAfterOperation(browser, operationError) {
+  try {
+    await closeCaptureBrowser(browser);
+  } catch (cleanupError) {
+    if (!operationError) throw cleanupError;
+    const cleanupErrors = cleanupError instanceof AggregateError && cleanupError.errors
+      ? Array.from(cleanupError.errors)
+      : [cleanupError];
+    throw new AggregateError(
+      [operationError, ...cleanupErrors],
+      (
+        'browser operation failed: ' + boundedBrowserErrorMessage(operationError) +
+        '; browser cleanup failed: ' + browserErrorSummary(cleanupErrors)
+      ).slice(0, 1200),
+      { cause: operationError },
+    );
+  }
 }
 
 function configuredWarmupURL(targetURL) {
@@ -1974,9 +2007,10 @@ async function main() {
 }
 
 async function captureMain(url, deadline) {
+  let operationError = null;
   const browser = await launchChromeBrowser();
-  const page = await newCapturePage(browser);
   try {
+    const page = await newCapturePage(browser);
     await gotoTargetWithOptionalWarmup(page, url, deadline);
     if (await hasAmazonInterstitial(page, url, deadline)) {
       throw await amazonManualReviewError(page, url);
@@ -2031,8 +2065,11 @@ async function captureMain(url, deadline) {
     }
     await clearAmazonContinuationMarkers(page);
     process.stdout.write(await page.content());
+  } catch (err) {
+    operationError = err;
+    throw err;
   } finally {
-    await closeCaptureBrowser(browser);
+    await closeCaptureBrowserAfterOperation(browser, operationError);
   }
 }
 
@@ -2075,17 +2112,18 @@ async function main() {
   if (!allowedOrigin || new URL(url).origin !== allowedOrigin) {
     throw new Error('diagnostic target does not match the configured allowed origin');
   }
+  let operationError = null;
   const browser = await launchChromeBrowser();
-  await browser.context.route('**/*', async (route) => {
-    const requestURL = new URL(route.request().url());
-    if ((requestURL.protocol === 'http:' || requestURL.protocol === 'https:') && requestURL.origin !== allowedOrigin) {
-      await route.abort('blockedbyclient');
-      return;
-    }
-    await route.continue();
-  });
-  const page = await newCapturePage(browser);
   try {
+    await browser.context.route('**/*', async (route) => {
+      const requestURL = new URL(route.request().url());
+      if ((requestURL.protocol === 'http:' || requestURL.protocol === 'https:') && requestURL.origin !== allowedOrigin) {
+        await route.abort('blockedbyclient');
+        return;
+      }
+      await route.continue();
+    });
+    const page = await newCapturePage(browser);
     await gotoTargetWithOptionalWarmup(page, url, Date.now() + 30000);
     const result = await page.evaluate(async (diagnosticOptions) => {
       const diagnosticErrorMessage = (err) => err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
@@ -2228,8 +2266,11 @@ async function main() {
       post_error: result.post_error,
       browser_signals: result.browser_signals,
     }, null, 2) + '\n');
+  } catch (err) {
+    operationError = err;
+    throw err;
   } finally {
-    await closeCaptureBrowser(browser);
+    await closeCaptureBrowserAfterOperation(browser, operationError);
   }
 }
 
