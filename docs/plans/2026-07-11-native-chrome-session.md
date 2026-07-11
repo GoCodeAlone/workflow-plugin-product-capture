@@ -44,8 +44,10 @@
    server/agent enforcement with valid and rejected artifact probes.
 4. Run the product-owned staging proof after its API capacity preflight succeeds.
 5. Merge/deploy PR 4 only after step 4 succeeds, so proof ownership never has a gap.
-6. Set BMW staging image-ref variable before PR 5 merge; merge PR 5; let its
-   existing CI `workflow_run` deploy exact main SHA; run Task 9.
+6. Run and require both staging Stripe webhook `ensure` workflows; then set the
+   BMW staging image-ref before PR 5 merge. Merge PR 5 with its staging-only
+   zero dispatch delay; let the existing CI `workflow_run` deploy the exact main
+   SHA and fresh webhook secrets; run Task 9.
 
 ### Task 1: Generic Bounded Staging-Proof Client APIs
 
@@ -82,11 +84,14 @@ Expected: FAIL because methods/types are absent.
 **Step 2: Implement narrow APIs against existing endpoints**
 
 Use existing `/v1/agents`, `/v1/leases`, and `/v1/tasks/{id}/artifacts`
-contracts. Download accepts only the returned
-`artifact://<pool>/tasks/<task>/proofs/<proof>/<name>` ref, validates/escapes all
-segments, and calls the existing proof-scoped download route. Do not expose
-generic arbitrary-path requests. Download rejects nonpositive limits and reads
-at most `maxBytes+1`. Strictly decode the lease's normalized artifact specs.
+contracts. Download accepts only the returned canonical
+`artifact://<pool>/tasks/<task>/proofs/<proof>/artifacts/<name>` ref,
+validates/escapes each fixed and name segment (including safe multi-segment
+artifact names), and calls the existing proof-scoped download route. Do not
+expose generic arbitrary-path requests. Download rejects nonpositive limits and
+reads at most `maxBytes+1`. Strictly decode the lease's normalized artifact
+specs. Add a server-fixture round trip from `ListTaskArtifacts` to
+`DownloadTaskArtifact` so the parser and real route cannot drift.
 
 **Step 3: Prepare and verify `v0.8.4`**
 
@@ -550,12 +555,15 @@ to protected staging workflow environment and redact it to digest-only summary.
 
 **Step 3: Bind staging deployment**
 
-Before PR 5 is admin-merged, set the GitHub staging environment variable
-`PRODUCT_CAPTURE_COMPUTE_IMAGE_REF=<candidate@sha256:...>`. Merge only after the
-variable readback is the exact ref. The merge's existing CI success triggers
-`deploy.yml` through `workflow_run`; monitor that run and require its main SHA,
-deploy summary, and DigitalOcean runtime env inspection to equal the candidate.
-If PR 5 does not merge, restore the prior variable.
+Before PR 5 is admin-merged, dispatch both existing webhook workflows with
+`environment=staging,mode=ensure`; resolve each new run ID and require
+`gh run watch <id> --exit-status` success. Only then set GitHub staging variables
+`PRODUCT_CAPTURE_COMPUTE_IMAGE_REF=<candidate@sha256:...>`. Merge only after
+variable readback is exact. The merge's existing CI success triggers `deploy.yml` through
+`workflow_run`; monitor it and require its main SHA, start time after both
+webhook runs, deploy summary, and DigitalOcean active-revision env keys/ref to
+show both webhook secret bindings, zero dispatch delay, and the candidate ref.
+If PR 5 does not merge, restore the prior image-ref variable.
 
 **Step 4: Verify**
 
@@ -653,8 +661,10 @@ Rollback: revert pipelines/steps and redeploy staging; run a one-time test-card 
 **Files:**
 - Modify: `e2e/tests/staging-product-capture-commerce.spec.ts`
 - Modify: `.github/workflows/staging-commerce-product-capture-proof.yml`
-- Modify: `app.yaml` admin contribution projection
+- Modify: `app.yaml` admin contribution projection and readiness delay
+- Modify: `infra.yaml`
 - Modify: `bmwplugin/integration_admin_test.go`
+- Modify: `bmwplugin/integration_cron_test.go`
 
 **Step 1: Write failing E2E contract assertions**
 
@@ -662,8 +672,9 @@ Require, in order: owner/wishlist/item; real Amazon title/image/positive price;
 accepted task/proof/artifact + exact candidate runtime; contributor one partial;
 contributor two completes; admin projection proves two distinct contributor IDs,
 contribution IDs, and PaymentIntent IDs; item and wishlist funded; fulfillment
-claim; test-mode `ic_` + `livemode=false`; abort in `finally`; no submit call.
-Sensitive endpoint failures log status/request ID only.
+created by the real readiness cron/dispatcher and claimed; test-mode `ic_` +
+`livemode=false`; abort in `finally`; no submit call. Sensitive endpoint
+failures log status/request ID only.
 
 Run: `cd e2e && npx playwright test tests/staging-product-capture-commerce.spec.ts --project api --list`
 
@@ -674,43 +685,61 @@ Expected before implementation: static/Go contract tests fail on missing fields/
 Add `contributor_id` to the authenticated admin item-contributions projection;
 keep public contribution responses unchanged. Add authz/integration assertions.
 
-**Step 3: Harden workflow gates**
+**Step 3: Make staging dispatch and webhook gates executable**
 
-Fail before contributions unless staging publishable/secret key modes are test;
-ensure Stripe Payments and Issuing webhooks with the existing `mode=ensure`
-workflows; pass candidate ref and proof run ID; upload only redacted IDs/booleans.
+Add `fulfillment.dispatch_delay_seconds`/
+`FULFILLMENT_DISPATCH_DELAY_SECONDS` with default `604800`. Parameterize the
+readiness query using `make_interval(secs => $1::int)` and a bound config value;
+set only staging infra to `0`, keep production/default at seven days, and test
+both values plus the real cron-to-dispatcher transition. Render staging and
+production infra plans and assert their app env values are `0` and `604800`
+respectively. Fail the proof before
+contributions unless staging publishable/secret key modes are test, both
+pre-deploy webhook `ensure` run IDs succeeded, and the active deployment started
+after them with both secret env keys. Add required workflow inputs for the two
+webhook run IDs, deploy run ID, and expected deployed SHA; query Actions run
+metadata to enforce success and timestamps rather than trusting caller booleans.
+Pass candidate ref and proof run ID; upload only redacted IDs/booleans.
 
 **Step 4: Local verification**
 
 Run:
 ```bash
-go test ./bmwplugin -run 'Admin.*Contribution|Issuing|ProductCapture' -count=1
+go test ./bmwplugin -run 'Admin.*Contribution|Issuing|ProductCapture|Cron.*Dispatch' -count=1
 cd e2e && npm ci && npx playwright test tests/staging-product-capture-commerce.spec.ts --project api --list
 actionlint .github/workflows/staging-commerce-product-capture-proof.yml
+wfctl infra plan --env staging -c infra.yaml --output /tmp/bmw-staging-plan.json
+wfctl infra plan --env prod -c infra.yaml --output /tmp/bmw-prod-plan.json
 golangci-lint run --new-from-rev=origin/main
 ```
 
-Expected: tests/actionlint/lint PASS; one E2E test listed.
+Expected: tests/actionlint/lint PASS; one E2E test listed; rendered staging app
+env contains `FULFILLMENT_DISPATCH_DELAY_SECONDS=0` and prod contains `604800`.
 
 **Step 5: Commit and publish PR 5**
 
 ```bash
-git add app.yaml bmwplugin e2e .github/workflows
+git add app.yaml infra.yaml bmwplugin e2e .github/workflows
 git commit -m "test: prove staging capture commerce round trip"
 ```
 
 **Step 6: Deploy and run real staging proof**
 
-After PRs are green/merged and `v0.1.60` is published:
+After PRs are green/merged, `v0.1.60` is published, both pre-deploy webhook runs
+succeeded, and the later PR 5 deployment is active:
 ```bash
-gh workflow run provision-stripe-payments-webhook.yml -f environment=staging -f mode=ensure
-gh workflow run provision-stripe-issuing-webhook.yml -f environment=staging -f mode=ensure
-gh workflow run staging-commerce-product-capture-proof.yml -f product_url=https://www.amazon.com/dp/B08N5WRWNW
+gh workflow run staging-commerce-product-capture-proof.yml \
+  -f product_url=https://www.amazon.com/dp/B08N5WRWNW \
+  -f payments_webhook_run_id="$PAYMENTS_WEBHOOK_RUN_ID" \
+  -f issuing_webhook_run_id="$ISSUING_WEBHOOK_RUN_ID" \
+  -f deploy_run_id="$DEPLOY_RUN_ID" \
+  -f expected_sha="$DEPLOYED_MAIN_SHA"
 ```
 
 Before the commerce dispatch, use `gh run list/view/watch` to require the
-existing `deploy.yml` `workflow_run` for PR 5's merged main SHA to succeed. Poll
-GitHub runner state and compute-core capacity APIs only; no SSH. The
+existing `deploy.yml` `workflow_run` for PR 5's merged main SHA to succeed and
+to have started after both successful webhook runs. Poll GitHub runner state and
+compute-core capacity APIs only; no SSH. The
 product-owned preflight waits up to 30 minutes for one matching idle worker,
 zero active matching leases, and zero queued matching tasks before submission.
 

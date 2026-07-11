@@ -112,3 +112,55 @@ by P9-P11.
 
 **Verdict:** Three Important findings require version/order/ownership revision;
 P12 is a concrete responsibility-boundary cleanup included in the same revision.
+
+## Cycle 3
+
+**Status:** FAIL
+
+P9-P12 are resolved.
+
+| id | sev | class | finding | resolution |
+|---|---|---|---|---|
+| P13 | Important | artifact/runtime validity | Task 1 omitted canonical `/artifacts/` in returned refs | Correct grammar; safely parse name segments; add list-to-download server-fixture round trip |
+| P14 | Important | deploy ordering | Webhook `ensure` after deploy can persist a signing secret absent from the active revision | Require both ensures before PR 5 deploy; watch success; verify later active revision bindings |
+| P15 | Important | integration reachability | BMW readiness cron waits seven days, so the claim/card proof cannot execute | Add environment-backed delay, seven-day default/production and staging zero; exercise real cron/dispatcher |
+
+**Design-class scan:**
+
+| class | result | note |
+|---|---|---|
+| Project guidance | Clean | Ownership split is correct |
+| Assumptions | Finding P13/P15 | Ref shape and immediate fulfillment conflict with code |
+| Repo precedent | Clean | Generic provider/runtime retention matches compute |
+| Artifact precedent | Finding P13 | Proposed ref grammar differs from stored refs |
+| YAGNI | Clean | No spoofing, profile credentials, fork, or OCI upload |
+| Failure modes | Finding P14/P15 | Secret drift and seven-day gate unhandled |
+| Security/privacy | Finding P14 | Active app may verify with stale signing secret |
+| Infrastructure | Finding P14 | Provision/deploy order invalid |
+| Multi-component | Finding P13/P14/P15 | Download, webhook, claim boundaries cannot complete |
+| Integration proof | Finding P15 | Funded-to-claim path blocked by runtime policy |
+| UI rendering | Clean | No contributed UI |
+| Rollback | Clean | Existing rollback paths remain defined |
+| Simpler alternative | Clean | Digest runtime and bounded JSON remain appropriate |
+| User intent | Finding P15 | Required fulfillment/card proof is unreachable |
+| Runtime validity | Finding P13/P14/P15 | Real refs, secrets, and timing invalidate run |
+
+**Plan-class scan:**
+
+| class | result | note |
+|---|---|---|
+| Decomposition | Finding P14/P15 | Secret activation and delay need explicit steps |
+| Verification match | Finding P13/P15 | Static checks cannot prove ref/claim runtime |
+| Auth chain | Clean | Protected projection/abort auth specified |
+| Serial dependencies | Finding P14 | Provision must precede consuming deploy |
+| Rollback wiring | Clean | Revert/redeploy/reconciliation present |
+| Integration proof | Finding P13/P15 | Download and claim paths cannot run as written |
+| Integration matrix | Clean | All declared integrations represented |
+| UI route proof | Clean | No new UI route |
+| Infrastructure verification | Finding P14 | No watch or post-secret deployment proof |
+| Plugin layout | Clean | Generic compute-wasm imports retained |
+| Config schema | Clean | Existing app/schema targets are valid |
+| Naming match | Finding P13 | Canonical artifact ref identifier wrong |
+| Compile validity | Finding P13 | Parser would target nonexistent route |
+
+**Verdict:** P13-P15 require executable ref, deploy, and fulfillment revisions.

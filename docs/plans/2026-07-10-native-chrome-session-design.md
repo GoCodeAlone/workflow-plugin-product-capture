@@ -268,3 +268,18 @@ removes its product-specific packaging/proof orchestration and legacy
 retaining the generic `WorkloadProvider` path.
 
 Scope: pre-lock manifest expands from three to five PRs; no production deploy.
+
+### Backport 2026-07-11: Executable staging prerequisites
+
+Cause: plan review found the bounded client omitted the canonical `/artifacts/`
+ref segment, webhook `ensure` could rotate a secret after deployment, and BMW's
+real readiness cron delays funded items for seven days.
+
+Change: bounded downloads round-trip canonical
+`artifact://<pool>/tasks/<task>/proofs/<proof>/artifacts/<name>` refs. Stripe
+Payments and Issuing `ensure` runs must succeed before the BMW deployment that
+consumes their environment secrets. Fulfillment readiness uses an
+environment-backed delay: seven days by default/production and zero only in
+staging, while the proof still exercises the real cron/dispatcher path.
+
+Scope: no manifest change; Tasks 1, 7, and 9 absorb the corrected prerequisites.
