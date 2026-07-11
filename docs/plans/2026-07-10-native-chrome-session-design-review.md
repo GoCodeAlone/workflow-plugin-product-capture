@@ -124,3 +124,44 @@ the repository ownership boundary and the endpoint itself is trusted.
 
 **Verdict reasoning:** D15-D16 require revision. D14 is an explicit residual
 risk with bounded staging-only impact and a named runtime owner.
+
+## Cycle 4
+
+**Status:** FAIL
+
+**D1-D16:** Resolved or explicitly accepted at design level.
+
+| id | sev | class | finding | resolution |
+|---|---|---|---|---|
+| D17 | Important | Stripe failure | Card could orphan between Stripe create and DB persistence | Reserve cleanup first; deterministic idempotency + Stripe metadata; metadata reconciler cancels orphans |
+| D18 | Important | provenance | BMW proof was not bound to promoted runtime digest | Update/deploy BMW staging env; propagate submitted runtime ref; persist and assert exact candidate |
+| D19 | Important | comparison validity | Native baseline lacked schema/tolerances/rejection rules | Define no-Playwright self-reporting baseline, stable fields, tolerances, informational fields |
+| D20 | Important | CDP ownership | Stale endpoint could attach to surviving foreign Chrome | Require fresh file, live child, procfs listener-to-process-tree ownership; test stale/survivor cases |
+| D21 | Important | Stripe evidence | `livemode` source/redaction unspecified | Server-side SDK booleans; protected IDs/booleans only; prohibit secret/raw-body artifacts |
+| D22 | Minor | artifact hygiene | Status named only cycle 1 | Update status through cycle 4 |
+
+**Bug-class scan transcript:**
+
+| class | result | note |
+|---|---|---|
+| Project-guidance conflicts | Clean | Ownership remains aligned |
+| Assumptions under attack | Finding D19/D20 | Baseline and endpoint ownership underspecified |
+| Repo-precedent conflicts | Clean | Existing provider boundary retained |
+| Artifact-class precedent | Clean | BMW workflow remains proof owner |
+| YAGNI violations | Clean | No spoofing/fork added |
+| Missing failure modes | Finding D17/D20 | Orphan card and stale endpoint gaps |
+| Security/privacy | Finding D17/D20/D21 | Card, endpoint, evidence constraints needed |
+| Infrastructure impact | Finding D18 | Staging digest deploy transition absent |
+| Multi-component validation | Finding D18/D21 | Runtime and Stripe evidence unbound |
+| Declared integration proof | Finding D18 | Candidate provenance absent |
+| Contributed UI rendering proof | Clean | No UI contribution |
+| Rollback story | Clean | Existing rollback complete |
+| Simpler alternative | Clean | Prior alternatives sufficient |
+| User-intent drift | Finding D19 | Native comparison was ambiguous |
+| Existence/runtime validity | Finding D18/D20 | Deploy binding and endpoint freshness absent |
+
+**Options incorporated:** runtime provenance output, Stripe metadata reconciliation,
+and a dedicated no-Playwright native baseline contract.
+
+**Verdict reasoning:** D17-D21 require design revision; D22 is corrected with
+the same revision.

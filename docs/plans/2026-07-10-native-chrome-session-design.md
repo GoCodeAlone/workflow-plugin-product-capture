@@ -1,6 +1,6 @@
 # Native Chrome Product-Capture Session Design
 
-**Status:** Approved; adversarial review cycle 1 revisions applied
+**Status:** Approved; adversarial review cycle 4 revisions applied
 **Date:** 2026-07-10
 **Decision:** See `decisions/0001-attach-to-native-chrome.md`.
 
@@ -36,8 +36,11 @@ capture/diagnostic contracts.
 3. Node starts installed `google-chrome` with the selected profile directory,
    `--remote-debugging-port=0`, a 1920x1080 default window, container-required
    sandbox/dev-shm flags, and no automation/identity flags.
-4. Node reads Chrome's profile-local `DevToolsActivePort`, validates the loopback
-   port, and calls `chromium.connectOverCDP`.
+4. Before launch, Node rejects an active profile lock and removes only a stale
+   `DevToolsActivePort`. After launch it accepts a newly created endpoint file
+   only when its mtime is newer than the child start, the child is alive, and
+   Linux procfs maps the listening socket to the launched process tree. It then
+   calls `chromium.connectOverCDP`.
 5. Capture and diagnostics use the attached default context/page. They do not
    call `addInitScript`, `Network.setUserAgentOverride`, or set a Playwright
    viewport, locale, timezone, or graphics renderer.
@@ -95,6 +98,8 @@ not this provider library.
 - Existing browser-target crash retries may restart Chrome within the remaining
   workload deadline; cleanup precedes retry.
 - Browser diagnostics continue to emit cookie presence/length only, never values.
+- A stale endpoint file, a listener outside the launched process group, or a
+  surviving profile owner fails closed before CDP attachment.
 
 ## Security Review
 
@@ -112,6 +117,10 @@ not this provider library.
 - Staging deploy/proof gates require `sk_test_`/`pk_test_` keys without logging
   them. PaymentIntent and Issuing-card responses expose `livemode`; the proof
   asserts `false`, and staging fails closed on live credentials.
+- Stripe mode is asserted server-side from SDK responses. Protected proof output
+  contains only `pi_`/`ic_` object IDs and `livemode` booleans; client secrets,
+  ephemeral-key secrets, PAN/CVC, and raw sensitive response bodies are excluded
+  from logs and artifacts.
 
 ## Infrastructure Impact
 
@@ -126,6 +135,39 @@ not this provider library.
   that exact local image; the workflow never invokes a second build.
 - Promotion uses the reported immutable digest and changes only the
   product-capture provider component version/digest.
+- BMW staging owns runtime selection: set its environment-scoped
+  `PRODUCT_CAPTURE_COMPUTE_IMAGE_REF` to the candidate `@sha256:` reference and
+  run the staging deploy before commerce proof. Production configuration remains
+  unchanged.
+
+## Native Baseline Contract
+
+- The controlled endpoint serves a versioned, self-collecting JavaScript page.
+  A direct headed Chrome process from the candidate image visits it without
+  Playwright, CDP, init scripts, or protocol overrides and posts schema `v1`.
+- The attached run uses the same image, Chrome flags, Xvfb display, endpoint,
+  run correlation, and schema. Chrome/Playwright/Xvfb versions are evidence.
+- Stable promotion fields: `navigator.webdriver`, UA, UA client-hint brand set
+  and platform, language set, platform, checked Playwright globals, request UA,
+  request client hints, `Sec-Fetch-*`, and first top-level navigation origin.
+- Reject when attached and direct stable fields differ, an automation global is
+  present, or the attached run adds an identity override. Display dimensions may
+  differ by 2 px for window chrome. Header order, timings/sequence, WebGL,
+  hardware/memory, cookie length, and graphics renderer are informational only.
+- The comparison diagnoses unintended differences; it does not optimize against
+  retailer controls or claim that a site cannot identify automation.
+
+## Candidate Provenance
+
+1. Release reports the tested candidate image ref and digest.
+2. BMW staging environment variable `PRODUCT_CAPTURE_COMPUTE_IMAGE_REF` is set
+   to that exact ref and BMW is redeployed through its staging deploy workflow.
+3. `step.product_capture` returns its submitted provider image/component ref and
+   digest with task/proof output; BMW persists the value on the product import.
+4. The BMW staging test receives the expected candidate ref from its protected
+   workflow environment and rejects any captured item whose persisted runtime
+   ref/digest differs. Task ID, accepted proof ID, artifact hash, and runtime
+   digest must all refer to the same import before commerce proceeds.
 
 ## Multi-Component Validation
 
@@ -134,17 +176,19 @@ not this provider library.
 2. Build the real runtime image and run its browser diagnostic against a
    controlled allowlisted echo endpoint. Record Chrome, Playwright, and Xvfb
    versions and compare direct versus CDP-attached sessions across request
-   headers/order, client hints, JS navigator values, display metrics, WebGL,
-   request sequence, cookies, and checked automation globals. Differences are
-   diagnostic evidence, never a site-control bypass target.
+   the versioned Native Baseline Contract. Only stable-field mismatches reject;
+   volatile headers/order, display metrics, WebGL, request sequence, and cookies
+   remain diagnostic evidence.
 3. Kill the real image during startup, navigation timeout, SIGTERM, and parent
    exit; assert no Chrome/Xvfb process or profile lock survives the container.
-4. Release/promote the tested candidate digest and retain an accepted
-   workflow-compute staging diagnostic proof plus its bounded JSON artifact.
+4. Release/promote the tested candidate digest, update/deploy BMW staging to its
+   exact `PRODUCT_CAPTURE_COMPUTE_IMAGE_REF`, and retain an accepted
+   workflow-compute diagnostic proof plus its bounded JSON artifact.
 5. Dispatch BuyMyWishlist
    `.github/workflows/staging-commerce-product-capture-proof.yml`, which owns
    `e2e/tests/staging-product-capture-commerce.spec.ts`, with a real Amazon URL.
-   Require title, image, positive price, task/proof IDs, contributor-one partial
+   Require title, image, positive price, task/proof IDs, exact candidate runtime,
+   contributor-one partial
    funding, contributor-two completion, two distinct PaymentIntent IDs, funded
    item/wishlist state, fulfillment claim, and one Stripe Issuing `ic_` card.
 6. The BMW proof verifies final contribution rows map to two distinct user IDs,
@@ -152,10 +196,14 @@ not this provider library.
    a fabricated retailer order. A `finally` block calls an admin abort-purchase
    endpoint that cancels the `ic_` card, clears it from the awaiting fulfillment,
    and returns the canceled card ID; cleanup failure fails the proof.
-7. `begin-purchase` records a staging proof run ID and cleanup deadline in the
-   existing fulfillment `evidence` JSON. A BMW scheduler cancels overdue proof
-   cards and clears their references, covering runner loss/SIGKILL; the card's
-   all-time spending limit remains bounded to the funded item amount.
+7. Before Stripe card creation, `begin-purchase` durably reserves a staging proof
+   run ID, deterministic idempotency key, and cleanup deadline in existing
+   fulfillment `evidence`. Card creation uses that key and writes proof run plus
+   fulfillment IDs into Stripe metadata. A BMW scheduler cancels overdue cards,
+   clears references, and reconciles recent active test cards discoverable by
+   metadata even when card-reference persistence failed. This covers failures
+   between Stripe creation and DB update plus runner loss/SIGKILL; the card's
+   all-time spending limit remains the funded item amount.
 8. Before creating contributions, the workflow verifies staging key prefixes.
    Each PaymentIntent and the Issuing card must report `livemode=false`.
 
@@ -164,7 +212,7 @@ not this provider library.
 | integration | class | owner | proof |
 |---|---|---|---|
 | Chrome + Playwright CDP | runtime-integrated | this repo | candidate image diagnostic + lifecycle smoke |
-| Product provider + workflow-compute | runtime-integrated | workflow-compute staging | accepted task proof/artifact using promoted digest |
+| Product provider + workflow-compute | runtime-integrated | product plugin + workflow-compute staging | submitted runtime ref propagated with accepted task proof/artifact |
 | Amazon anonymous browse | runtime-integrated external | BMW staging proof | real URL returns title/image/price; challenges remain external |
 | BMW wishlist/capture callback | runtime-integrated | BuyMyWishlist | existing staging commerce workflow/test |
 | Stripe Payments + webhooks | runtime-integrated | BuyMyWishlist | test-mode objects; two users, partial then funded, distinct PaymentIntents |
@@ -182,6 +230,8 @@ not this provider library.
 | A5 | Amazon permits anonymous product browsing from staging egress | External challenge may persist | Preserve proof as external block; do not add spoofing |
 | A6 | BMW contribution rows expose contributor and PaymentIntent linkage to the owner/admin proof | Existing response may omit fields | Add the narrow authenticated proof projection before staging run |
 | A7 | BMW scheduler can identify abandoned proof cards without schema change | Fulfillment evidence may be occupied | Merge proof keys into existing JSON; never overwrite fulfillment evidence |
+| A8 | Linux procfs exposes the Chrome listener/process relationship in the published image | Runtime hardening could hide process FDs | Fail closed in image; standalone non-Linux keeps fresh-file + child-liveness checks |
+| A9 | BMW staging deploy consumes its environment-scoped image-ref variable | Workflow drift could use app default | Deploy summary + persisted task runtime ref must equal candidate |
 
 ## Self-Challenge
 
