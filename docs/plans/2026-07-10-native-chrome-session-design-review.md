@@ -42,3 +42,45 @@ digest; application-owned BMW proof. All are incorporated in the revision.
 
 **Verdict reasoning:** Critical/Important findings require design revision and a
 second adversarial review cycle.
+
+## Cycle 2
+
+**Status:** FAIL
+
+**D1-D8:** Resolved by cycle 1 revision; implementation unverified.
+
+| id | sev | class | finding | resolution |
+|---|---|---|---|---|
+| D9 | Important | security/privacy | Initial DNS validation allowed later rebinding | Pin allowlisted host to validated public IP for diagnostic Chrome process |
+| D10 | Important | user intent/failure | Existing BMW proof submits fake order and lacks card cleanup | Add admin abort-purchase path; cancel card in test `finally`; never submit fake order |
+| D11 | Important | integration proof | Final rows did not prove distinct users/contributions/PaymentIntents | Assert all three identity linkages in funded state |
+| D12 | Important | runtime validity | Candidate preservation between smoke and push unspecified | Build once into Docker content store, smoke image ID/tag, push without rebuild |
+| D13 | Minor | profile trust | Operator profile path could reference an authenticated mount | Accepted: unprivileged dedicated container; path is trusted operator config, not workload input |
+
+**Bug-class scan transcript:**
+
+| class | result | note |
+|---|---|---|
+| Project-guidance conflicts | Clean | Ownership boundaries now match repo guidance |
+| Assumptions under attack | Finding D9/D13 | DNS and operator profile trust challenged |
+| Repo-precedent conflicts | Clean | Provider/compute/BMW boundaries preserved |
+| Artifact-class precedent | Clean | Existing BMW scenario owns commerce proof |
+| YAGNI violations | Clean | No identity-tuning/fork additions |
+| Missing failure modes | Finding D10 | Active-card cleanup absent |
+| Security/privacy | Finding D9/D13 | DNS rebinding and operator mount trust |
+| Infrastructure impact | Finding D12 | Same candidate bytes not guaranteed |
+| Multi-component validation | Finding D11 | Contributor attribution incomplete |
+| Declared integration proof | Finding D11 | Stripe row linkage incomplete |
+| Contributed UI rendering proof | Clean | No UI contribution |
+| Rollback story | Clean | Drain/reset/repromote proof defined |
+| Simpler alternative | Clean | Plain Playwright launch already rejected |
+| User-intent drift | Finding D10 | Fake fulfillment exceeded requested proof |
+| Existence/runtime validity | Finding D12 | One-build publish path unspecified |
+
+**Options incorporated:** pinned diagnostic host; card-generation-only proof with
+abort cleanup; single-build local candidate publication.
+
+**Verdict reasoning:** Four Important findings require a second revision and
+third review cycle. D13 is accepted because only a trusted runtime operator can
+set the profile env/mount and the dedicated unprivileged image has no user login
+profile to protect.

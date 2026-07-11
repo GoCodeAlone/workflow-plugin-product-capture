@@ -58,6 +58,9 @@ capture/diagnostic contracts.
   stable anonymous profile; diagnostic tasks cannot read retained cookies.
 - The requested origin and every top-level redirect must match the allowlist.
   Initial DNS resolution must contain no loopback, link-local, or private IP.
+- Go selects one validated public address and passes a diagnostic-only Chrome
+  host-resolver rule that pins the allowed hostname to that address. Chrome
+  cannot re-resolve the host to a private address during the operation.
 - The diagnostic browser blocks cross-origin HTTP(S) requests. It posts only
   bounded browser signals to the same allowed origin and never emits cookies.
 - The operator-managed endpoint stores structured headers/signals only, redacts
@@ -71,6 +74,10 @@ capture/diagnostic contracts.
   captures on that retained worker.
 - Credentialed profiles remain forbidden. Profile lock contention fails with a
   bounded diagnostic; the provider does not clone or merge profile state.
+- The image runs as unprivileged `node` with dedicated `HOME`; profile paths are
+  operator runtime configuration, never workload input. An operator able to
+  inject arbitrary mounts/environment already controls the provider container,
+  so no additional path-root policy is treated as an auth boundary.
 
 ## Error Handling
 
@@ -92,6 +99,9 @@ capture/diagnostic contracts.
 - Chrome receives no BMW, Stripe, or workflow-compute credentials.
 - Stable profiles are anonymous operator-managed state and must not be shared
   with interactive or authenticated Chrome sessions.
+- BMW abort-purchase is server-side authenticated with fulfillment-management
+  authorization, acts only on the claimed awaiting fulfillment, and cancels the
+  stored card before clearing its reference.
 
 ## Infrastructure Impact
 
@@ -100,8 +110,10 @@ capture/diagnostic contracts.
 - The existing runtime image already installs Google Chrome, Xvfb, and xauth;
   image startup preflight verifies all three before promotion.
 - Release produces the existing amd64 provider image and component artifact.
-- Release builds a local candidate image, records Chrome/Playwright/Xvfb
-  versions, runs the real diagnostic smoke, then pushes that same candidate.
+- Release builds once with `load: true` into the runner's Docker content store,
+  records the image ID plus Chrome/Playwright/Xvfb versions, and runs the real
+  diagnostic smoke against that local tag. On success `docker push` publishes
+  that exact local image; the workflow never invokes a second build.
 - Promotion uses the reported immutable digest and changes only the
   product-capture provider component version/digest.
 
@@ -125,6 +137,11 @@ capture/diagnostic contracts.
    Require title, image, positive price, task/proof IDs, contributor-one partial
    funding, contributor-two completion, two distinct PaymentIntent IDs, funded
    item/wishlist state, fulfillment claim, and one Stripe Issuing `ic_` card.
+6. The BMW proof verifies final contribution rows map to two distinct user IDs,
+   contribution IDs, and the two recorded PaymentIntent IDs. It does not submit
+   a fabricated retailer order. A `finally` block calls an admin abort-purchase
+   endpoint that cancels the `ic_` card, clears it from the awaiting fulfillment,
+   and returns the canceled card ID; cleanup failure fails the proof.
 
 ## Integration Matrix
 
@@ -135,7 +152,7 @@ capture/diagnostic contracts.
 | Amazon anonymous browse | runtime-integrated external | BMW staging proof | real URL returns title/image/price; challenges remain external |
 | BMW wishlist/capture callback | runtime-integrated | BuyMyWishlist | existing staging commerce workflow/test |
 | Stripe Payments + webhooks | runtime-integrated | BuyMyWishlist | two users, partial then funded, distinct PaymentIntents |
-| Stripe Issuing | runtime-integrated | BuyMyWishlist | claimed item creates one real staging `ic_` card |
+| Stripe Issuing | runtime-integrated | BuyMyWishlist | create one real staging `ic_` card, then abort/cancel it |
 | Production promotion | deferred | operator | staging evidence is required first; no production change in scope |
 
 ## Assumptions
@@ -147,6 +164,7 @@ capture/diagnostic contracts.
 | A3 | CDP attachment retains the measured native baseline within the declared matrix | Future Playwright/Chrome may change | Versioned comparison gates promotion; no non-detection claim |
 | A4 | A stable profile is used by at most one capture at a time | Concurrent workers can lock it | Fail bounded; operator assigns worker-local profile |
 | A5 | Amazon permits anonymous product browsing from staging egress | External challenge may persist | Preserve proof as external block; do not add spoofing |
+| A6 | BMW contribution rows expose contributor and PaymentIntent linkage to the owner/admin proof | Existing response may omit fields | Add the narrow authenticated proof projection before staging run |
 
 ## Self-Challenge
 
