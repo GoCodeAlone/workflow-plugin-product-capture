@@ -304,3 +304,19 @@ Change: fail unless current `main`, the proof run's `headSha`, workflow
 `--ref main`; a newer main requires redeploy and a fresh proof sequence.
 
 Scope: no manifest change; Task 9 owns the fail-closed SHA checks.
+
+### Backport 2026-07-11: Canonical artifact producer migration
+
+Cause: implementation review showed current workflow-compute stores/emits legacy
+`artifact://.../proofs/<proof>/<name>` refs, while the bounded core client
+requires the unambiguous `/artifacts/` marker. Lease artifact specs are also a
+planned producer field, not present in the current server.
+
+Change: Task 1 keeps the new canonical consumer contract and uses literal
+producer fixtures. Before product proof, Task 5 makes workflow-compute emit
+canonical refs from stored metadata (including nested names), accept existing
+legacy storage records during migration, derive lease specs, and prove a real
+handler list-to-download round trip through compute-core `v0.8.4`.
+
+Scope: no manifest change; this clarifies the existing Task 5 producer side of
+the core/client boundary.

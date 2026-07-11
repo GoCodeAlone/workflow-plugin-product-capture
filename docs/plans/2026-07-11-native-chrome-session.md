@@ -91,7 +91,11 @@ artifact names), and calls the existing proof-scoped download route. Do not
 expose generic arbitrary-path requests. Download rejects nonpositive limits and
 reads at most `maxBytes+1`. Strictly decode the lease's normalized artifact
 specs. Add a server-fixture round trip from `ListTaskArtifacts` to
-`DownloadTaskArtifact` so the parser and real route cannot drift.
+`DownloadTaskArtifact` so the parser and real route cannot drift. Fixtures must
+be literal workflow-compute JSON projections, not values marshaled from the
+consumer's own types. Mirror every currently emitted nested capability field,
+including runtime-backend reports, and make idle selection use normalized,
+enabled network profiles with the top-level org/pool as implicit default.
 
 **Step 3: Prepare and verify `v0.8.4`**
 
@@ -384,7 +388,10 @@ normalized `artifact_specs` into the lease. Agent tests reject undeclared names,
 wrong declared content type, size `max_bytes+1`, and invalid JSON before upload.
 Server tests repeat the same checks before storage so a modified/old agent cannot
 bypass policy. Generic JSON validity means syntactic JSON only; product output
-schema validation remains in product-capture Task 4.
+schema validation remains in product-capture Task 4. Add failing producer tests
+requiring canonical `artifact://<pool>/tasks/<task>/proofs/<proof>/artifacts/<name>`
+refs for simple and nested names, normalization of existing legacy stored refs,
+and a real workflow-compute handler round trip through the compute-core client.
 
 Run: `go test ./internal/agent ./internal/server -run 'Provider.*Artifact|TaskArtifact.*Policy' -count=1`
 
@@ -403,7 +410,11 @@ contract; ignore/reject any submitter attempt to supply policy. In the worker,
 bound `stat`/read before upload and set the declared content type/retention. In
 `handleTaskArtifactUpload`, resolve the same task/operation/spec, use a bounded
 reader, validate declared name/type/size and JSON syntax, then store. Keep
-`/v1/agent-artifacts/` update packages separate and unchanged.
+`/v1/agent-artifacts/` update packages separate and unchanged. Canonicalize
+public/listed refs from trusted task/proof/name metadata with the explicit
+`/artifacts/` marker; continue reading legacy stored metadata while emitting only
+canonical refs. Preserve nested artifact names by adding the route marker rather
+than treating a leading `artifacts/` name segment as the marker.
 
 **Step 4: Verify and deploy staging**
 
@@ -418,7 +429,9 @@ After merge, monitor the existing workflow-compute staging deploy for the merge
 SHA. Against staging, submit one valid bounded JSON result and adversarial
 wrong-name, wrong-type, invalid-JSON, and max+1-byte probes. Expected: valid
 artifact stored; rejects return bounded 4xx (413 for max+1) and storage listing
-contains no rejected artifact.
+contains no rejected artifact. The released compute-core client must list and
+download the accepted artifact through the real staging routes using the exact
+canonical ref returned by the server.
 
 **Step 5: Commit**
 
