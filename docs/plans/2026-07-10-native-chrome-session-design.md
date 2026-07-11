@@ -259,8 +259,12 @@ Cause: plan review showed the original design did not fully specify the user's
 requirement to stop sending OCI/runtime images as product proof data.
 
 Change: product-capture owns the staging proof; compute-core exposes narrow
-read-only client APIs; provider result uploads must match declared artifact name,
-content type, and byte limit; workflow-compute product-specific packaging and
-proof orchestration are removed only after the replacement succeeds.
+read-only client APIs; generic provider result uploads must match declared
+artifact name, content type, byte limit, and JSON syntax when applicable, while
+product-capture validates the product schema. Workflow-compute first deploys
+that generic enforcement. After the replacement proof succeeds, a separate PR
+removes its product-specific packaging/proof orchestration and legacy
+`WorkloadProductCapture`/`ProductCaptureBrowserProvider` runtime surface while
+retaining the generic `WorkloadProvider` path.
 
-Scope: pre-lock manifest expands from three to four PRs; no production deploy.
+Scope: pre-lock manifest expands from three to five PRs; no production deploy.

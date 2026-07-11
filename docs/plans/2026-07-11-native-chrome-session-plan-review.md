@@ -57,3 +57,58 @@
 | Compile validity | Finding P3/P8 | Missing methods/file |
 
 **Verdict:** Eight findings require plan revision and a second review cycle.
+
+## Cycle 2
+
+**Status:** FAIL
+
+| id | sev | class | finding | resolution |
+|---|---|---|---|---|
+| P9 | Important | version/runtime validity | Plan proposed core `v0.5.1`, but mainline latest is `v0.8.3`; consumers already use `v0.5.0`/`v0.7.0` | Release additive APIs as `v0.8.4`; upgrade product-capture and workflow-compute to that exact version |
+| P10 | Important | serial dependency | Replacement product proof preceded generic artifact enforcement, leaving acceptance semantics unproven at cutover | Split workflow-compute into enforcement PR 3 and removal PR 4; deploy enforcement before proof, remove old path only after accepted replacement |
+| P11 | Important | user-intent drift | Plan removed proof scripts but retained product-specific production runtime (`WorkloadProductCapture`, `ProductCaptureBrowserProvider`, compute-wasm adapter branches) | Remove legacy workload/executor/capability surface and migrate retained callers to generic `WorkloadProvider`/`DynamicProvider` |
+| P12 | Minor | artifact policy | Generic enforcement vaguely required OCI-shaped JSON rejection, mixing product schema with transport policy | Generic layer enforces declared name/type/max and JSON syntax; product-capture validates product schema |
+
+**Prior-finding check:** P2/P4/P6/P8 resolved; P1/P3/P5/P7 partial and replaced
+by P9-P11.
+
+**Design-class scan:**
+
+| class | result | note |
+|---|---|---|
+| Project guidance | Finding P11 | Product-specific runtime remains outside its owner |
+| Assumptions | Finding P9/P10 | Obsolete release line and undeployed artifact semantics |
+| Repo precedent | Finding P11 | Legacy executor path omitted from removal |
+| Artifact precedent | Finding P10/P12 | Existing specs need ordered rollout and precise semantics |
+| YAGNI | Clean | No spoofing, credentialed profile, or browser fork |
+| Failure modes | Finding P10 | Proof can precede enforcement |
+| Security/privacy | Finding P12 | Ambiguous archive-shaped JSON is not defensible generic policy |
+| Infrastructure | Finding P9/P10 | Dependency and staging order are not executable |
+| Multi-component | Finding P10 | Real proof precedes required server capability |
+| Integration proof | Finding P9 | Core/server/product versions are not aligned |
+| UI rendering | Clean | No contributed UI |
+| Rollback | Clean | Image, profile, staging, and card rollback remain defined |
+| Simpler alternative | Clean | Digest image plus bounded result artifacts is appropriate |
+| User intent | Finding P11 | Product-specific compute move is incomplete |
+| Runtime validity | Finding P9/P10 | Version and deployed-consumer prerequisites invalid |
+
+**Plan-class scan:**
+
+| class | result | note |
+|---|---|---|
+| Decomposition | Finding P10/P11 | Enforcement and removal need separate prerequisite work |
+| Verification match | Finding P10/P12 | Proof order and archive classification are invalid |
+| Auth chain | Clean | Server-side fulfillment auth and denial proof specified |
+| Serial dependencies | Finding P9/P10 | Core release, compute deploy, contract, proof are serial |
+| Rollback wiring | Clean | Task-level rollback present |
+| Integration proof | Finding P10 | No enforcement proof before product cutover |
+| Integration matrix | Clean | Core, compute, product, BMW, Stripe, Chrome represented |
+| UI route proof | Clean | No new UI route |
+| Infrastructure verification | Finding P9/P10 | Mainline dependency/deploy gate missing |
+| Plugin layout | Clean | Existing lock/install host layout applies |
+| Config schema | Clean | Corrected artifact specs and wfctl validation |
+| Naming match | Finding P11 | Legacy ProductCapture identifiers omitted |
+| Compile validity | Clean | Embedded interfaces compile-plausible |
+
+**Verdict:** Three Important findings require version/order/ownership revision;
+P12 is a concrete responsibility-boundary cleanup included in the same revision.
