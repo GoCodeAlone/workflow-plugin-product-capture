@@ -34,7 +34,7 @@
 | 4 | Remove workflow-compute product-specific proof/runtime | Task 6 | `codex/product-capture-proof-ownership-20260711` |
 | 5 | Bind BMW staging commerce proof to tested runtime | Task 7, Task 8, Task 9 | `codex/staging-commerce-runtime-proof-20260711` |
 
-**Status:** Draft
+**Status:** Locked 2026-07-11T06:57:35Z
 
 ## Delivery Order
 
