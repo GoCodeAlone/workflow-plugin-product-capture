@@ -84,3 +84,43 @@ abort cleanup; single-build local candidate publication.
 third review cycle. D13 is accepted because only a trusted runtime operator can
 set the profile env/mount and the dedicated unprivileged image has no user login
 profile to protect.
+
+## Cycle 3
+
+**Status:** FAIL
+
+**D1-D13:** Resolved or explicitly accepted at design level.
+
+| id | sev | class | finding | resolution |
+|---|---|---|---|---|
+| D14 | Important | security/privacy | Diagnostic did not firewall WS/WSS/WebTransport egress | Accepted: exact trusted origin, ephemeral no-secret profile, staging-only; all-protocol network policy belongs runtime |
+| D15 | Important | failure modes | CI `finally` cannot cancel card after runner loss | Mark proof card/deadline in fulfillment evidence; server scheduler reaps overdue cards |
+| D16 | Important | Stripe safety | Proof did not require test mode or `livemode=false` | Gate test key prefixes and assert false on PaymentIntent/card objects |
+
+**Bug-class scan transcript:**
+
+| class | result | note |
+|---|---|---|
+| Project-guidance conflicts | Clean | Ownership remains aligned |
+| Assumptions under attack | Finding D15/D16 | Cleanup and Stripe mode assumptions removed |
+| Repo-precedent conflicts | Clean | Provider/BMW responsibilities preserved |
+| Artifact-class precedent | Clean | BMW workflow remains proof owner |
+| YAGNI violations | Clean | No spoofing or browser fork |
+| Missing failure modes | Finding D15 | Runner-loss cleanup absent |
+| Security/privacy | Finding D14/D16 | Protocol egress accepted; live-mode guard added |
+| Infrastructure impact | Finding D16 | Staging secret mode needed fail-closed validation |
+| Multi-component validation | Finding D16 | Stripe mode not proven |
+| Declared integration proof | Finding D16 | Stripe rows lacked mode invariant |
+| Contributed UI rendering proof | Clean | No UI contribution |
+| Rollback story | Clean | Existing rollback complete |
+| Simpler alternative | Clean | Prior alternatives sufficient |
+| User-intent drift | Clean | Full requested outcome covered |
+| Existence/runtime validity | Clean | Existing/new artifacts accurately identified |
+
+**Options:** runtime egress namespace; server-side proof-card reaper; direct
+Stripe `livemode` checks. Reaper and mode checks are incorporated. D14 is
+accepted because expanding provider scope into worker network policy violates
+the repository ownership boundary and the endpoint itself is trusted.
+
+**Verdict reasoning:** D15-D16 require revision. D14 is an explicit residual
+risk with bounded staging-only impact and a named runtime owner.

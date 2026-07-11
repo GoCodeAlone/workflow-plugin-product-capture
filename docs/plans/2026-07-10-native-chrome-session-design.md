@@ -66,6 +66,13 @@ capture/diagnostic contracts.
 - The operator-managed endpoint stores structured headers/signals only, redacts
   network identifiers from shared artifacts, and uses short-lived logs.
 
+Accepted risk D14: the provider does not create network namespaces or worker
+firewall rules for WebSocket/WebTransport. The exact allowlist is trusted
+operator configuration, diagnostics use an ephemeral profile with no application
+secrets, cross-origin HTTP(S) is blocked, and diagnostics are disabled outside
+the staging proof. Enforcing all-protocol egress belongs to the container runtime,
+not this provider library.
+
 ## Session State
 
 - Unset `PRODUCT_CAPTURE_BROWSER_PROFILE_DIR`: Go creates a per-operation
@@ -102,6 +109,9 @@ capture/diagnostic contracts.
 - BMW abort-purchase is server-side authenticated with fulfillment-management
   authorization, acts only on the claimed awaiting fulfillment, and cancels the
   stored card before clearing its reference.
+- Staging deploy/proof gates require `sk_test_`/`pk_test_` keys without logging
+  them. PaymentIntent and Issuing-card responses expose `livemode`; the proof
+  asserts `false`, and staging fails closed on live credentials.
 
 ## Infrastructure Impact
 
@@ -142,6 +152,12 @@ capture/diagnostic contracts.
    a fabricated retailer order. A `finally` block calls an admin abort-purchase
    endpoint that cancels the `ic_` card, clears it from the awaiting fulfillment,
    and returns the canceled card ID; cleanup failure fails the proof.
+7. `begin-purchase` records a staging proof run ID and cleanup deadline in the
+   existing fulfillment `evidence` JSON. A BMW scheduler cancels overdue proof
+   cards and clears their references, covering runner loss/SIGKILL; the card's
+   all-time spending limit remains bounded to the funded item amount.
+8. Before creating contributions, the workflow verifies staging key prefixes.
+   Each PaymentIntent and the Issuing card must report `livemode=false`.
 
 ## Integration Matrix
 
@@ -151,8 +167,8 @@ capture/diagnostic contracts.
 | Product provider + workflow-compute | runtime-integrated | workflow-compute staging | accepted task proof/artifact using promoted digest |
 | Amazon anonymous browse | runtime-integrated external | BMW staging proof | real URL returns title/image/price; challenges remain external |
 | BMW wishlist/capture callback | runtime-integrated | BuyMyWishlist | existing staging commerce workflow/test |
-| Stripe Payments + webhooks | runtime-integrated | BuyMyWishlist | two users, partial then funded, distinct PaymentIntents |
-| Stripe Issuing | runtime-integrated | BuyMyWishlist | create one real staging `ic_` card, then abort/cancel it |
+| Stripe Payments + webhooks | runtime-integrated | BuyMyWishlist | test-mode objects; two users, partial then funded, distinct PaymentIntents |
+| Stripe Issuing | runtime-integrated | BuyMyWishlist | test-mode `ic_` card; abort or server-side reap cancels it |
 | Production promotion | deferred | operator | staging evidence is required first; no production change in scope |
 
 ## Assumptions
@@ -165,6 +181,7 @@ capture/diagnostic contracts.
 | A4 | A stable profile is used by at most one capture at a time | Concurrent workers can lock it | Fail bounded; operator assigns worker-local profile |
 | A5 | Amazon permits anonymous product browsing from staging egress | External challenge may persist | Preserve proof as external block; do not add spoofing |
 | A6 | BMW contribution rows expose contributor and PaymentIntent linkage to the owner/admin proof | Existing response may omit fields | Add the narrow authenticated proof projection before staging run |
+| A7 | BMW scheduler can identify abandoned proof cards without schema change | Fulfillment evidence may be occupied | Merge proof keys into existing JSON; never overwrite fulfillment evidence |
 
 ## Self-Challenge
 
