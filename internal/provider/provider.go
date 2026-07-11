@@ -1001,6 +1001,30 @@ function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+async function waitForChromeExit(chrome, timeoutMilliseconds) {
+  let timer;
+  try {
+    await Promise.race([
+      chrome.exited,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, timeoutMilliseconds);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function fileSystemEntryExists(entryPath) {
+  try {
+    fs.lstatSync(entryPath);
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
 let activeChromeChild = null;
 let browserShutdownStarted = false;
 
@@ -1114,10 +1138,10 @@ async function waitForChromeEndpoint(chrome, endpointPath, chromeStartedAt) {
 async function terminateChromeChild(chrome, graceMilliseconds) {
   if (!chrome || chrome.chromeExit !== null) return;
   if (chrome.pid) chrome.kill('SIGTERM');
-  await Promise.race([chrome.exited, delay(graceMilliseconds)]);
+  await waitForChromeExit(chrome, graceMilliseconds);
   if (chrome.chromeExit === null && chrome.pid) {
     chrome.kill('SIGKILL');
-    await Promise.race([chrome.exited, delay(graceMilliseconds)]);
+    await waitForChromeExit(chrome, graceMilliseconds);
   }
   if (chrome.chromeExit === null) throw new Error('google-chrome did not exit after SIGKILL');
 }
@@ -1142,7 +1166,7 @@ async function launchChromeBrowser() {
   if (!profileDir) throw new Error('PRODUCT_CAPTURE_BROWSER_PROFILE_DIR is required');
   fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
   for (const lockName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-    if (fs.existsSync(path.join(profileDir, lockName))) {
+    if (fileSystemEntryExists(path.join(profileDir, lockName))) {
       throw new Error('Chrome profile is already active: ' + lockName);
     }
   }
@@ -1198,9 +1222,10 @@ async function launchChromeBrowser() {
       newPage: () => context.newPage(),
     };
   } catch (err) {
-    if (browser) await browser.close().catch(() => {});
-    await terminateChromeChild(chrome, 1000).catch(() => {});
-    if (activeChromeChild === chrome) activeChromeChild = null;
+    await closeCaptureBrowserAfterOperation({
+      browser: browser || { close: async () => {} },
+      chrome,
+    }, err);
     throw err;
   }
 }

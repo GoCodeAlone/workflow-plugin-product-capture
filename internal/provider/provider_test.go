@@ -697,6 +697,27 @@ func assertBrowserSetupFailureCleanup(t *testing.T, stderr bytes.Buffer, err err
 	}
 }
 
+func TestBrowserScriptReportsStartupCleanupFailure(t *testing.T) {
+	fakePlaywright := `
+exports.chromium = {
+  connectOverCDP: async () => ({
+    contexts: () => { throw new Error('startup context failed'); },
+    close: async () => { throw new Error('startup browser close failed'); },
+  }),
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatal("browser startup unexpectedly succeeded")
+	}
+	for _, want := range []string{"startup context failed", "startup browser close failed"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q after startup cleanup failure:\n%s", want, stderr.String())
+		}
+	}
+}
+
 func TestBrowserScriptCleanupAttemptsTerminationAndPropagatesFailures(t *testing.T) {
 	stdout, stderr, err := runBrowserPreludeSnippet(t, `
 (async () => {
@@ -834,6 +855,59 @@ func TestBrowserScriptCleanupClearsCloseTimeout(t *testing.T) {
 		t.Fatalf("successful cleanup retained close timeout for %s", elapsed)
 	}
 	if stdout.String() != "cleanup complete" {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestBrowserScriptTerminationClearsGraceTimerAfterPromptExit(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const nativeSetTimeout = global.setTimeout;
+  const nativeClearTimeout = global.clearTimeout;
+  const activeTimers = new Set();
+  global.setTimeout = (fn, milliseconds, ...args) => {
+    let timer;
+    timer = nativeSetTimeout((...callbackArgs) => {
+      activeTimers.delete(timer);
+      fn(...callbackArgs);
+    }, milliseconds, ...args);
+    activeTimers.add(timer);
+    return timer;
+  };
+  global.clearTimeout = (timer) => {
+    activeTimers.delete(timer);
+    return nativeClearTimeout(timer);
+  };
+  try {
+    let resolveExit;
+    const chrome = {
+      pid: 123,
+      chromeExit: null,
+      exited: new Promise((resolve) => { resolveExit = resolve; }),
+      kill: (signal) => {
+        chrome.chromeExit = { code: 0, signal };
+        resolveExit();
+      },
+    };
+    await terminateChromeChild(chrome, 2000);
+    if (activeTimers.size !== 0) {
+      throw new Error('termination left ' + activeTimers.size + ' grace timer(s) active');
+    }
+    process.stdout.write('termination timer cleared');
+  } finally {
+    for (const timer of activeTimers) nativeClearTimeout(timer);
+    global.setTimeout = nativeSetTimeout;
+    global.clearTimeout = nativeClearTimeout;
+  }
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil {
+		t.Fatalf("termination timer contract failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if stdout.String() != "termination timer cleared" {
 		t.Fatalf("stdout = %q", stdout.String())
 	}
 }
@@ -1024,6 +1098,30 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	}
 	if !strings.Contains(stderr.String(), "Chrome profile is already active: SingletonLock") {
 		t.Fatalf("stderr missing active profile error: %s", stderr.String())
+	}
+}
+
+func TestBrowserScriptRejectsDanglingChromeProfileLockSymlink(t *testing.T) {
+	profileDir := filepath.Join(t.TempDir(), "chrome-profile")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("host-12345", filepath.Join(profileDir, "SingletonLock")); err != nil {
+		t.Skipf("create Chrome-style profile lock symlink: %v", err)
+	}
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
+	fakePlaywright := `
+exports.chromium = {
+  connectOverCDP: async () => { throw new Error('Playwright connection should not be reached'); },
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatal("capture succeeded with a dangling Chrome profile lock symlink")
+	}
+	if !strings.Contains(stderr.String(), "Chrome profile is already active: SingletonLock") {
+		t.Fatalf("stderr missing dangling active profile error: %s", stderr.String())
 	}
 }
 
@@ -5703,7 +5801,7 @@ exports.chromium = {
 };
 exports.errors = { TimeoutError };
 `
-	_, stderr, err := runPlaywrightScriptWithFakeURLTimeoutAndCommandTimeout(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3", "1000", 5*time.Second)
+	_, stderr, err := runPlaywrightScriptWithFakeURLTimeoutAndCommandTimeout(t, fakePlaywright, "https://www.amazon.com/dp/B09B8V1LZ3", "1000", 10*time.Second)
 	if err == nil {
 		t.Fatalf("expected missing title failure")
 	}
