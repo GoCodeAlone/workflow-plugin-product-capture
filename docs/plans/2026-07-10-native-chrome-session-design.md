@@ -293,3 +293,14 @@ Change: grant `actions: read`; expose `${{ github.token }}` only to the metadata
 preflight step; validate exact workflow, event, conclusion, SHA, and run ordering.
 
 Scope: no manifest change; Task 9 owns the workflow permission and contract test.
+
+### Backport 2026-07-11: Proof source provenance
+
+Cause: an unpinned `workflow_dispatch` could run newer main-branch proof code
+against the older deployed PR 5 SHA while prerequisite run IDs remained valid.
+
+Change: fail unless current `main`, the proof run's `headSha`, workflow
+`github.sha`, expected SHA input, and deployed SHA are identical. Dispatch with
+`--ref main`; a newer main requires redeploy and a fresh proof sequence.
+
+Scope: no manifest change; Task 9 owns the fail-closed SHA checks.

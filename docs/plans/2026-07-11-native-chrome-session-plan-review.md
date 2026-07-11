@@ -214,3 +214,53 @@ P13-P15 are resolved.
 | Compile validity | Clean | Planned code shapes plausible |
 
 **Verdict:** P16 requires explicit Actions read authorization and contract proof.
+
+## Cycle 5
+
+**Status:** FAIL
+
+P16 is resolved.
+
+| id | sev | class | finding | resolution |
+|---|---|---|---|---|
+| P17 | Important | source provenance | Final dispatch omits `--ref` and does not bind proof run `headSha` to deployed SHA | Require main/deploy/expected/workflow/proof-run SHA equality; dispatch `--ref main`; redeploy on advance |
+
+**Design-class scan:**
+
+| class | result | note |
+|---|---|---|
+| Project guidance | Clean | Ownership/no-OCI boundaries align |
+| Assumptions | Finding P17 | Dispatch revision assumed, not enforced |
+| Repo precedent | Clean | Existing runner/deploy pattern used |
+| Artifact precedent | Clean | Canonical bounded refs exact |
+| YAGNI | Clean | No spoofing, profiles, fork, or image upload |
+| Failure modes | Finding P17 | Main advance unhandled |
+| Security/privacy | Clean | Metadata token is least privilege |
+| Infrastructure | Finding P17 | Dispatch revision unpinned |
+| Multi-component | Finding P17 | E2E code can differ from deployment |
+| Integration proof | Finding P17 | Exact source provenance incomplete |
+| UI rendering | Clean | No UI route |
+| Rollback | Clean | Restore/redeploy/card cleanup defined |
+| Simpler alternative | Clean | SHA equality simpler than temporary refs |
+| User intent | Finding P17 | Exact staging proof may use another revision |
+| Runtime validity | Finding P17 | Dispatch defaults to current default branch |
+
+**Plan-class scan:**
+
+| class | result | note |
+|---|---|---|
+| Decomposition | Clean | P17 fits Task 9 |
+| Verification match | Finding P17 | Prerequisite runs checked, proof SHA is not |
+| Auth chain | Clean | P16 authorization complete |
+| Serial dependencies | Finding P17 | Dispatch must match deployed main |
+| Rollback wiring | Clean | Existing paths sufficient |
+| Integration proof | Finding P17 | Source-to-deployment binding absent |
+| Integration matrix | Clean | All integrations represented |
+| UI route proof | Clean | No UI route |
+| Infrastructure verification | Finding P17 | Dispatch ref behavior unenforced |
+| Plugin layout | Clean | Generic compute-wasm retained |
+| Config schema | Clean | Delay/environment checks coherent |
+| Naming match | Clean | Identifiers consistent |
+| Compile validity | Clean | Planned shapes plausible |
+
+**Verdict:** P17 requires immutable proof-source/deployment provenance.

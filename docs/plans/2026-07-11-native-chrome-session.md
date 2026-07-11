@@ -704,7 +704,8 @@ runs, success conclusion, deploy SHA, and completion/start ordering rather than
 trusting caller booleans. Grant workflow `actions: read`; expose
 `GH_TOKEN: ${{ github.token }}` only to this metadata-preflight step. Add a Go
 workflow contract test for permissions, token scope, exact-ID queries, and
-negative metadata cases. Pass candidate ref and proof run ID; upload only
+negative metadata cases. The preflight also requires `${{ github.sha }}` to equal
+the expected/deployed SHA. Pass candidate ref and proof run ID; upload only
 redacted IDs/booleans.
 
 **Step 4: Local verification**
@@ -735,7 +736,10 @@ git commit -m "test: prove staging capture commerce round trip"
 After PRs are green/merged, `v0.1.60` is published, both pre-deploy webhook runs
 succeeded, and the later PR 5 deployment is active:
 ```bash
+git fetch origin main
+test "$(git rev-parse origin/main)" = "$DEPLOYED_MAIN_SHA"
 gh workflow run staging-commerce-product-capture-proof.yml \
+  --ref main \
   -f product_url=https://www.amazon.com/dp/B08N5WRWNW \
   -f payments_webhook_run_id="$PAYMENTS_WEBHOOK_RUN_ID" \
   -f issuing_webhook_run_id="$ISSUING_WEBHOOK_RUN_ID" \
@@ -749,6 +753,11 @@ to have started after both successful webhook runs. Poll GitHub runner state and
 compute-core capacity APIs only; no SSH. The
 product-owned preflight waits up to 30 minutes for one matching idle worker,
 zero active matching leases, and zero queued matching tasks before submission.
+Immediately before dispatch, fetch `origin/main` and require its SHA to equal
+`DEPLOYED_MAIN_SHA`; after dispatch, resolve the new commerce-proof run ID and
+require its `headSha` to equal the same value before accepting evidence. If main
+advanced, fail closed, deploy that main SHA, and restart the prerequisite/proof
+sequence.
 
 Expected redacted evidence:
 - capture task/proof accepted; exact candidate digest; title/image/price present;
