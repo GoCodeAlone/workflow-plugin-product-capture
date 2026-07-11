@@ -1,6 +1,6 @@
 # Native Chrome Product-Capture Session Design
 
-**Status:** Approved; adversarial review cycle 4 revisions applied
+**Status:** Approved; adversarial review Cycle 5 PASS
 **Date:** 2026-07-10
 **Decision:** See `decisions/0001-attach-to-native-chrome.md`.
 

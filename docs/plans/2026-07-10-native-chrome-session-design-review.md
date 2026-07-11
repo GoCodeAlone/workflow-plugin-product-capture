@@ -165,3 +165,40 @@ and a dedicated no-Playwright native baseline contract.
 
 **Verdict reasoning:** D17-D21 require design revision; D22 is corrected with
 the same revision.
+
+## Cycle 5
+
+**Revision:** `4e86a7c`
+**Status:** PASS
+
+**D1-D22:** Resolved or explicitly accepted. D13 remains a trusted-operator
+profile boundary. D14 remains a bounded staging-only runtime-network residual
+with its follow-up recorded in workspace `docs/FOLLOWUPS.md`.
+
+**Findings:** No Critical, Important, or Minor findings.
+
+**Bug-class scan transcript:**
+
+| class | result | note |
+|---|---|---|
+| Project-guidance conflicts | Clean | Provider/compute/BMW ownership preserved |
+| Assumptions under attack | Clean | A1-A9 have failure conditions and fallbacks |
+| Repo-precedent conflicts | Clean | Existing Go/Node/application boundaries retained |
+| Artifact-class precedent | Clean | Existing BMW workflow/test owns commerce proof |
+| YAGNI violations | Clean | No fork, spoofing, credentialed profile, or provider network namespace |
+| Missing failure modes | Clean | Process, endpoint, profile, runner, Stripe, and Amazon failures covered |
+| Security/privacy | Clean | Loopback/process-owned CDP, constrained diagnostics, redacted Stripe proof |
+| Infrastructure impact | Clean | Candidate push, staging deploy, provenance, rollback defined |
+| Multi-component validation | Clean | Real image/compute/BMW/Stripe/Issuing boundaries exercised |
+| Declared integration proof | Clean | Matrix and exact candidate provenance complete |
+| Contributed UI rendering proof | Clean | No UI contribution |
+| Rollback story | Clean | Drain/reset/re-promote/re-diagnose explicit |
+| Simpler alternative | Clean | Plain Playwright launch and fork rejected |
+| User-intent drift | Clean | Natural browser and full BMW/Stripe outcome covered |
+| Existence/runtime validity | Clean | Existing consumers named; new fields/routes have hosts |
+
+**Option deferred:** component-backed BMW staging can replace the compatibility
+image-ref variable after BMW adopts provider component campaigns.
+
+**Verdict reasoning:** Cycle 5 closes D17-D21 and finds no new tangible issue;
+the design passes.
