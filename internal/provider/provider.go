@@ -41,7 +41,6 @@ var Version = "0.1.0"
 
 type browserProcessPolicy interface {
 	Configure(*exec.Cmd)
-	OwnsListeningPort(pid, port int) bool
 	TerminateGroup(*exec.Cmd, time.Duration) error
 }
 
@@ -958,6 +957,8 @@ func supportedHosts() []string {
 const playwrightBrowserPrelude = `
 const { chromium, errors } = require('playwright');
 const fs = require('fs');
+const http = require('http');
+const net = require('net');
 const path = require('path');
 const { spawn } = require('child_process');
 
@@ -1045,31 +1046,55 @@ let browserShutdownStarted = false;
 
 function chromeProcessAlive(chrome) {
   if (!chrome || !chrome.pid || chrome.chromeExit !== null) return false;
-  try {
-    process.kill(chrome.pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
+  return processIsRunning(chrome.pid);
 }
 
-function chromeProcessTree(rootPID) {
-  const processIDs = new Set([rootPID]);
-  const queue = [rootPID];
-  while (queue.length > 0) {
-    const current = queue.shift();
-    try {
-      const children = fs.readFileSync('/proc/' + current + '/task/' + current + '/children', 'utf8');
-      for (const value of children.trim().split(/\s+/)) {
-        if (!value) continue;
-        const child = Number(value);
-        if (!Number.isInteger(child) || child <= 0 || processIDs.has(child)) continue;
-        processIDs.add(child);
-        queue.push(child);
-      }
-    } catch {}
+function processIsRunning(processID) {
+  try {
+    process.kill(processID, 0);
+  } catch (err) {
+    if (err && err.code === 'ESRCH') return false;
+    throw err;
   }
-  return processIDs;
+  if (process.platform === 'linux') {
+    const stat = linuxProcessStat(processID);
+    if (!stat || stat.state === 'Z') return false;
+  }
+  return true;
+}
+
+function linuxProcessStat(processID) {
+  let stat;
+  try {
+    stat = fs.readFileSync('/proc/' + processID + '/stat', 'utf8');
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return null;
+    throw err;
+  }
+  const close = stat.lastIndexOf(')');
+  if (close < 0) throw new Error('malformed procfs stat for PID ' + processID);
+  const fields = stat.slice(close + 2).trim().split(/\s+/);
+  const processGroupID = Number(fields[2]);
+  if (!fields[0] || !Number.isInteger(processGroupID) || processGroupID <= 0) {
+    throw new Error('malformed procfs process group for PID ' + processID);
+  }
+  return { state: fields[0], processGroupID };
+}
+
+function linuxProcessGroupMembers(processGroupID) {
+  const members = new Map();
+  for (const entry of fs.readdirSync('/proc')) {
+    const processID = Number(entry);
+    if (!Number.isInteger(processID) || processID <= 0) continue;
+    try {
+      const stat = linuxProcessStat(processID);
+      if (stat && stat.processGroupID === processGroupID) members.set(processID, stat.state);
+    } catch (err) {
+      if (err && err.code === 'ENOENT') continue;
+      throw err;
+    }
+  }
+  return members;
 }
 
 function listeningSocketInodes(port) {
@@ -1091,10 +1116,10 @@ function listeningSocketInodes(port) {
 }
 
 function ownsChromeListeningPort(rootPID, port) {
-  if (process.platform !== 'linux') return true;
+  if (process.platform !== 'linux') return null;
   const inodes = listeningSocketInodes(port);
   if (inodes.size === 0) return false;
-  for (const processID of chromeProcessTree(rootPID)) {
+  for (const processID of linuxProcessGroupMembers(rootPID).keys()) {
     let descriptors = [];
     try {
       descriptors = fs.readdirSync('/proc/' + processID + '/fd');
@@ -1112,50 +1137,177 @@ function ownsChromeListeningPort(rootPID, port) {
   return false;
 }
 
-function parseDevToolsActivePort(contents) {
-  const lines = String(contents || '').trim().split(/\r?\n/);
-  const port = Number(lines[0]);
+async function selectLoopbackPort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  const port = address && typeof address === 'object' ? address.port : 0;
+  await new Promise((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
-    throw new Error('Chrome DevToolsActivePort contains an invalid port');
-  }
-  if (!lines[1] || !lines[1].startsWith('/devtools/browser/')) {
-    throw new Error('Chrome DevToolsActivePort contains an invalid browser endpoint');
+    throw new Error('failed to select Chrome CDP loopback port');
   }
   return port;
 }
 
-async function waitForChromeEndpoint(chrome, endpointPath, chromeStartedAt) {
+function chromeEndpointReady(port, absoluteDeadline) {
+  const remaining = Math.max(0, Number(absoluteDeadline || 0) - Date.now());
+  if (remaining <= 0) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    let absoluteTimer;
+    const finish = (ready) => {
+      if (settled) return;
+      settled = true;
+      if (absoluteTimer) clearTimeout(absoluteTimer);
+      resolve(ready);
+    };
+    const request = http.get({ host: '127.0.0.1', port, path: '/json/version' }, (response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 65536) request.destroy(new Error('Chrome version response is too large'));
+      });
+      response.on('end', () => {
+        if (response.statusCode !== 200) return finish(false);
+        try {
+          const version = JSON.parse(body);
+          const endpoint = new URL(String(version.webSocketDebuggerUrl || ''));
+          finish(
+            endpoint.protocol === 'ws:' &&
+            ['127.0.0.1', 'localhost'].includes(endpoint.hostname) &&
+            Number(endpoint.port) === port &&
+            endpoint.pathname.startsWith('/devtools/browser/')
+          );
+        } catch {
+          finish(false);
+        }
+      });
+    });
+    absoluteTimer = setTimeout(
+      () => request.destroy(new Error('Chrome version request timed out')),
+      Math.max(1, Math.min(500, remaining)),
+    );
+    request.on('error', () => finish(false));
+  });
+}
+
+async function waitForChromeEndpoint(chrome, cdpPort) {
   const deadline = Date.now() + 15000;
   while (Date.now() < deadline) {
     if (chrome.startError) throw chrome.startError;
     if (chrome.chromeExit !== null) {
-      throw new Error('google-chrome exited before creating DevToolsActivePort');
+      throw new Error('google-chrome exited before opening its CDP listener');
     }
-    try {
-      const endpointStat = fs.statSync(endpointPath);
-      if (endpointStat.mtimeMs < chromeStartedAt) {
-        throw new Error('Chrome DevToolsActivePort is stale');
-      }
-      const port = parseDevToolsActivePort(fs.readFileSync(endpointPath, 'utf8'));
-      if (!chromeProcessAlive(chrome)) throw new Error('google-chrome exited before CDP attach');
-      if (!ownsChromeListeningPort(chrome.pid, port)) {
-        throw new Error('google-chrome process tree does not own its CDP listener');
-      }
-      return 'http://127.0.0.1:' + port;
-    } catch (err) {
-      if (String(err && err.message || err).includes('stale')) throw err;
+    const ownsListener = ownsChromeListeningPort(chrome.pid, cdpPort);
+    if (
+      chromeProcessAlive(chrome) &&
+      (process.platform !== 'linux' || ownsListener) &&
+      await chromeEndpointReady(cdpPort, deadline)
+    ) {
+      return 'http://127.0.0.1:' + cdpPort;
     }
     await delay(25);
   }
-  throw new Error('timed out waiting for google-chrome DevToolsActivePort');
+  throw new Error('timed out waiting for google-chrome CDP listener ownership');
+}
+
+async function verifyAttachedBrowserProcess(browser, chrome) {
+  if (!chromeProcessAlive(chrome)) throw new Error('spawned Chrome child exited before CDP identity verification');
+  const session = await boundedBrowserStartupPromise(
+    browser.newBrowserCDPSession(),
+    1000,
+    'CDP identity session creation timed out',
+  );
+  try {
+    const result = await boundedBrowserStartupPromise(
+      session.send('SystemInfo.getProcessInfo'),
+      1000,
+      'CDP identity verification timed out',
+    );
+    const processes = Array.isArray(result && result.processInfo) ? result.processInfo : [];
+    const browserProcesses = processes.filter((entry) => entry.type === 'browser');
+    if (browserProcesses.length !== 1 || Number(browserProcesses[0].id) !== chrome.pid) {
+      throw new Error('attached CDP browser is not the spawned Chrome child');
+    }
+  } finally {
+    await boundedBrowserStartupPromise(session.detach(), 1000, 'CDP identity session detach timed out');
+  }
+  if (!chromeProcessAlive(chrome)) throw new Error('spawned Chrome child exited during CDP identity verification');
+}
+
+async function boundedBrowserStartupPromise(promise, timeoutMilliseconds, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), timeoutMilliseconds);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function chromeProcessBoundaryAlive(chrome) {
+  if (process.platform !== 'linux') return chromeProcessAlive(chrome);
+  if (!chrome || !Number.isInteger(chrome.pid) || chrome.pid <= 0) return false;
+  try {
+    process.kill(-chrome.pid, 0);
+  } catch (err) {
+    if (err && err.code === 'ESRCH') return false;
+    throw err;
+  }
+  for (const state of linuxProcessGroupMembers(chrome.pid).values()) {
+    if (state !== 'Z') return true;
+  }
+  return false;
+}
+
+function signalChromeProcessBoundary(chrome, signal) {
+  if (!chrome || !Number.isInteger(chrome.pid) || chrome.pid <= 0) return false;
+  if (process.platform !== 'linux') return chrome.kill(signal);
+  const target = -chrome.pid;
+  try {
+    process.kill(target, signal);
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ESRCH') return false;
+    throw err;
+  }
+}
+
+async function waitForChromeProcessBoundaryExit(chrome, graceMilliseconds) {
+  const deadline = Date.now() + Math.max(0, graceMilliseconds);
+  while (Date.now() < deadline) {
+    if (!chromeProcessBoundaryAlive(chrome)) return true;
+    await delay(25);
+  }
+  return !chromeProcessBoundaryAlive(chrome);
 }
 
 async function terminateChromeChild(chrome, graceMilliseconds) {
-  if (!chrome || chrome.chromeExit !== null) return;
-  if (chrome.pid) chrome.kill('SIGTERM');
-  await waitForChromeExit(chrome, graceMilliseconds);
+  if (!chrome) return;
+  if (process.platform === 'linux') {
+    if (chromeProcessBoundaryAlive(chrome)) signalChromeProcessBoundary(chrome, 'SIGTERM');
+    if (!await waitForChromeProcessBoundaryExit(chrome, graceMilliseconds)) {
+      signalChromeProcessBoundary(chrome, 'SIGKILL');
+      if (!await waitForChromeProcessBoundaryExit(chrome, graceMilliseconds)) {
+        throw new Error('Chrome process group survived SIGKILL');
+      }
+    }
+    if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
+    if (chrome.chromeExit === null) throw new Error('google-chrome process-group leader was not reaped');
+    return;
+  }
+  if (chrome.chromeExit === null && chrome.pid) signalChromeProcessBoundary(chrome, 'SIGTERM');
+  if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
   if (chrome.chromeExit === null && chrome.pid) {
-    chrome.kill('SIGKILL');
+    signalChromeProcessBoundary(chrome, 'SIGKILL');
     await waitForChromeExit(chrome, graceMilliseconds);
   }
   if (chrome.chromeExit === null) throw new Error('google-chrome did not exit after SIGKILL');
@@ -1176,21 +1328,10 @@ async function shutdownBrowserProcess(exitCode) {
 process.once('SIGTERM', () => { void shutdownBrowserProcess(143); });
 process.once('SIGINT', () => { void shutdownBrowserProcess(130); });
 
-async function launchChromeBrowser() {
-  const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();
-  if (!profileDir) throw new Error('PRODUCT_CAPTURE_BROWSER_PROFILE_DIR is required');
-  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
-  for (const lockName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-    if (fileSystemEntryExists(path.join(profileDir, lockName))) {
-      throw new Error('Chrome profile is already active: ' + lockName);
-    }
-  }
-  const devToolsActivePortPath = path.join(profileDir, 'DevToolsActivePort');
-  if (fs.existsSync(devToolsActivePortPath)) fs.unlinkSync(devToolsActivePortPath);
-
-  const viewport = parseBrowserViewport();
+async function launchChromeBrowserAttempt(profileDir, viewport) {
+  const cdpPort = await selectLoopbackPort();
   const chromeArgs = [
-    '--remote-debugging-port=0',
+    '--remote-debugging-port=' + cdpPort,
     '--remote-debugging-address=127.0.0.1',
     '--user-data-dir=' + profileDir,
     '--window-size=' + viewport.width + ',' + viewport.height,
@@ -1206,14 +1347,17 @@ async function launchChromeBrowser() {
   chromeArgs.push('about:blank');
 
   const chromeExecutable = 'google-chrome';
-  const chromeStartedAt = Date.now();
-  const chrome = spawn(chromeExecutable, chromeArgs, { stdio: ['ignore', 'ignore', 'pipe'] });
+  const chrome = spawn(chromeExecutable, chromeArgs, {
+    detached: process.platform === 'linux',
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
   activeChromeChild = chrome;
   chrome.chromeExit = null;
   chrome.startError = null;
   chrome.exited = new Promise((resolve) => {
     chrome.once('error', (err) => {
-      chrome.startError = err;
+      chrome.startError = new Error('google-chrome failed to spawn: ' + boundedBrowserErrorMessage(err), { cause: err });
+      chrome.chromeExit = { code: null, signal: null, spawnError: true };
       resolve();
     });
     chrome.once('exit', (code, signal) => {
@@ -1225,16 +1369,22 @@ async function launchChromeBrowser() {
 
   let browser;
   try {
-    const cdpEndpoint = await waitForChromeEndpoint(chrome, devToolsActivePortPath, chromeStartedAt);
+    const cdpEndpoint = await waitForChromeEndpoint(chrome, cdpPort);
     browser = await chromium.connectOverCDP(cdpEndpoint, { timeout: 10000 });
     const contexts = browser.contexts();
     if (!contexts || contexts.length !== 1) throw new Error('native Chrome default context is unavailable');
     const context = contexts[0];
+    const pages = context.pages();
+    if (!pages || pages.length !== 1) throw new Error('native Chrome initial page is unavailable');
+    const initialPage = pages[0];
+    if (initialPage.url() !== 'about:blank') throw new Error('native Chrome initial page is not blank');
+    await verifyAttachedBrowserProcess(browser, chrome);
     return {
       browser,
       context,
       chrome,
-      newPage: () => context.newPage(),
+      initialPage,
+      initialPageConsumed: false,
     };
   } catch (err) {
     await closeCaptureBrowserAfterOperation({
@@ -1245,8 +1395,48 @@ async function launchChromeBrowser() {
   }
 }
 
+async function launchChromeBrowser() {
+  const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();
+  if (!profileDir) throw new Error('PRODUCT_CAPTURE_BROWSER_PROFILE_DIR is required');
+  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  for (const lockName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+    if (fileSystemEntryExists(path.join(profileDir, lockName))) {
+      throw new Error('Chrome profile is already active: ' + lockName);
+    }
+  }
+  const viewport = parseBrowserViewport();
+  const startupErrors = [];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await launchChromeBrowserAttempt(profileDir, viewport);
+    } catch (err) {
+      if (err && err.browserCleanupFailed) throw err;
+      if (activeChromeChild && chromeProcessAlive(activeChromeChild)) {
+        throw new AggregateError([err], 'native Chrome startup cleanup left a live child', { cause: err });
+      }
+      for (const lockName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+        if (fileSystemEntryExists(path.join(profileDir, lockName))) {
+          throw new AggregateError([err], 'native Chrome startup cleanup left profile lock ' + lockName, { cause: err });
+        }
+      }
+      startupErrors.push(err);
+      if (attempt < 2) await delay(50);
+    }
+  }
+  throw new AggregateError(
+    startupErrors,
+    'native Chrome startup failed after 3 attempts: ' + browserErrorSummary(startupErrors),
+    { cause: startupErrors[0] },
+  );
+}
+
 async function newCapturePage(browser) {
-  return await browser.newPage();
+  if (browser.initialPageConsumed) throw new Error('native Chrome initial page is already in use');
+  if (!browser.initialPage || browser.initialPage.url() !== 'about:blank') {
+    throw new Error('native Chrome initial page is unavailable');
+  }
+  browser.initialPageConsumed = true;
+  return browser.initialPage;
 }
 
 function boundedBrowserErrorMessage(err) {
@@ -1273,12 +1463,14 @@ async function closeCaptureBrowser(browser) {
   } finally {
     if (closeTimer) clearTimeout(closeTimer);
   }
+  let terminationComplete = false;
   try {
     await terminateChromeChild(browser.chrome, 1000);
+    terminationComplete = true;
   } catch (err) {
     cleanupErrors.push(err);
   } finally {
-    if (activeChromeChild === browser.chrome) activeChromeChild = null;
+    if (terminationComplete && activeChromeChild === browser.chrome) activeChromeChild = null;
   }
   if (cleanupErrors.length > 0) {
     throw new AggregateError(
@@ -1297,7 +1489,7 @@ async function closeCaptureBrowserAfterOperation(browser, operationError) {
     const cleanupErrors = cleanupError instanceof AggregateError && cleanupError.errors
       ? Array.from(cleanupError.errors)
       : [cleanupError];
-    throw new AggregateError(
+    const combinedError = new AggregateError(
       [operationError, ...cleanupErrors],
       (
         'browser operation failed: ' + boundedBrowserErrorMessage(operationError) +
@@ -1305,6 +1497,8 @@ async function closeCaptureBrowserAfterOperation(browser, operationError) {
       ).slice(0, 1200),
       { cause: operationError },
     );
+    combinedError.browserCleanupFailed = true;
+    throw combinedError;
   }
 }
 

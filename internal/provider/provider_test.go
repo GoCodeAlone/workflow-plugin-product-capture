@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -19,6 +21,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -558,7 +561,8 @@ func TestBrowserDiagnosticScriptSharesNativeChromeLaunchPath(t *testing.T) {
 		"spawn(chromeExecutable, chromeArgs",
 		"chromium.connectOverCDP",
 		"browser.contexts()",
-		"newPage: () => context.newPage()",
+		"context.pages()",
+		"initialPage.url() !== 'about:blank'",
 	} {
 		if !strings.Contains(playwrightBrowserDiagnosticScript, required) {
 			t.Fatalf("diagnostic script missing shared native browser behavior %q", required)
@@ -570,12 +574,13 @@ func TestNativeChromeScriptLaunchesInstalledChromeAndConnectsOverCDP(t *testing.
 	for _, required := range []string{
 		"const chromeExecutable = 'google-chrome';",
 		"spawn(chromeExecutable, chromeArgs",
-		"'--remote-debugging-port=0'",
+		"await selectLoopbackPort()",
+		"'--remote-debugging-port=' + cdpPort",
 		"'--remote-debugging-address=127.0.0.1'",
 		"'--window-size=' + viewport.width + ',' + viewport.height",
-		"DevToolsActivePort",
 		"chromium.connectOverCDP(cdpEndpoint",
 		"browser.contexts()",
+		"context.pages()",
 	} {
 		if !strings.Contains(playwrightBrowserPrelude, required) {
 			t.Errorf("native Chrome prelude missing %q", required)
@@ -583,6 +588,7 @@ func TestNativeChromeScriptLaunchesInstalledChromeAndConnectsOverCDP(t *testing.
 	}
 
 	for _, forbidden := range []string{
+		"'--remote-debugging-port=0'",
 		"chromium.launch(",
 		"chromium.launchPersistentContext(",
 		"addInitScript",
@@ -600,18 +606,443 @@ func TestNativeChromeScriptLaunchesInstalledChromeAndConnectsOverCDP(t *testing.
 	}
 }
 
-func TestBrowserScriptRequiresFreshOwnedChromeEndpoint(t *testing.T) {
+func TestBrowserScriptRequiresSelectedOwnedChromeEndpoint(t *testing.T) {
 	for _, required := range []string{
-		"fs.unlinkSync(devToolsActivePortPath)",
-		"endpointStat.mtimeMs < chromeStartedAt",
+		"net.createServer()",
+		"server.listen(0, '127.0.0.1'",
+		"const cdpPort = await selectLoopbackPort()",
+		"/json/version",
+		"await chromeEndpointReady(cdpPort, deadline)",
 		"chromeExit !== null",
-		"process.kill(chrome.pid, 0)",
-		"ownsChromeListeningPort(chrome.pid, port)",
-		"process.platform !== 'linux'",
+		"return processIsRunning(chrome.pid)",
+		"ownsChromeListeningPort(chrome.pid, cdpPort)",
+		"await verifyAttachedBrowserProcess(browser, chrome)",
+		"SystemInfo.getProcessInfo",
 	} {
 		if !strings.Contains(playwrightBrowserPrelude, required) {
 			t.Errorf("Chrome endpoint validation missing %q", required)
 		}
+	}
+	for _, forbidden := range []string{"DevToolsActivePort", "remote-debugging-port=0"} {
+		if strings.Contains(playwrightBrowserPrelude, forbidden) {
+			t.Errorf("Chrome endpoint validation retains automation-marked behavior %q", forbidden)
+		}
+	}
+}
+
+func TestNativeChromeScriptRetriesBoundedStartupFailures(t *testing.T) {
+	for _, required := range []string{
+		"async function launchChromeBrowserAttempt(",
+		"for (let attempt = 0; attempt < 3; attempt++)",
+		"await closeCaptureBrowserAfterOperation",
+		"native Chrome startup failed after 3 attempts",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Errorf("native Chrome startup retry missing %q", required)
+		}
+	}
+}
+
+func TestNativeChromeScriptFailsClosedWhenAttachedProcessOwnershipDiffers(t *testing.T) {
+	for _, required := range []string{
+		"if (!chromeProcessAlive(chrome))",
+		"processes.filter((entry) => entry.type === 'browser')",
+		"Number(browserProcesses[0].id) !== chrome.pid",
+		"attached CDP browser is not the spawned Chrome child",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Errorf("non-Linux CDP ownership verification missing %q", required)
+		}
+	}
+}
+
+func TestChromeEndpointReadyRejectsMalformedVersion(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"webSocketDebuggerUrl":"ws://127.0.0.1:1/not-a-browser"}`)
+	}))
+	defer server.Close()
+	_, portText, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err := runBrowserPreludeSnippet(t, fmt.Sprintf(`
+(async () => {
+  if (await chromeEndpointReady(%d, Date.now() + 1000)) throw new Error('malformed endpoint was accepted');
+  process.stdout.write('rejected');
+})().catch((err) => { console.error(err); process.exit(1); });
+`, port))
+	if err != nil || stdout.String() != "rejected" {
+		t.Fatalf("malformed endpoint check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if requests.Load() == 0 {
+		t.Fatal("malformed endpoint was not requested")
+	}
+}
+
+func TestChromeEndpointReadyHasAbsoluteDeadlineAgainstSlowDrip(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			_, _ = io.WriteString(w, " ")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}))
+	defer server.Close()
+	_, portText, err := net.SplitHostPort(strings.TrimPrefix(server.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(portText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := time.Now()
+	stdout, stderr, err := runBrowserPreludeSnippet(t, fmt.Sprintf(`
+(async () => {
+  if (await chromeEndpointReady(%d, Date.now() + 300)) throw new Error('slow endpoint was accepted');
+  process.stdout.write('bounded');
+})().catch((err) => { console.error(err); process.exit(1); });
+`, port))
+	if err != nil || stdout.String() != "bounded" {
+		t.Fatalf("slow endpoint check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("slow endpoint exceeded absolute deadline: %s", elapsed)
+	}
+}
+
+func TestProcessIsRunningPropagatesUnexpectedPermissionErrors(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeKill = process.kill;
+process.kill = () => { const err = new Error('permission denied'); err.code = 'EPERM'; throw err; };
+try {
+  processIsRunning(12345);
+  throw new Error('EPERM was swallowed');
+} catch (err) {
+  if (!err || err.code !== 'EPERM') throw err;
+} finally {
+  process.kill = nativeKill;
+}
+process.stdout.write('propagated');
+`)
+	if err != nil || stdout.String() != "propagated" {
+		t.Fatalf("process permission check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestLinuxProcessGroupMembersPropagatesUnexpectedProcfsErrors(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+const nativeReaddirSync = fs.readdirSync;
+fs.readdirSync = (path, ...args) => String(path) === '/proc' ? ['12345'] : nativeReaddirSync(path, ...args);
+fs.readFileSync = (path, ...args) => {
+  if (String(path) === '/proc/12345/stat') { const err = new Error('permission denied'); err.code = 'EACCES'; throw err; }
+  return nativeReadFileSync(path, ...args);
+};
+try {
+  linuxProcessGroupMembers(12345);
+  throw new Error('procfs permission error was swallowed');
+} catch (err) {
+  if (!err || err.code !== 'EACCES') throw err;
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+  fs.readdirSync = nativeReaddirSync;
+}
+process.stdout.write('propagated');
+`)
+	if err != nil || stdout.String() != "propagated" {
+		t.Fatalf("process-group permission check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestBrowserScriptRejectsForeignLinuxListener(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("procfs listener ownership is Linux-specific")
+	}
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = listener.Close() }()
+	port := listener.Addr().(*net.TCPAddr).Port
+	stdout, stderr, err := runBrowserPreludeSnippet(t, fmt.Sprintf(`
+if (ownsChromeListeningPort(process.pid, %d)) {
+  console.error('foreign listener was accepted');
+  process.exit(1);
+}
+process.stdout.write('rejected');
+`, port))
+	if err != nil || stdout.String() != "rejected" {
+		t.Fatalf("foreign listener check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestBrowserScriptBoundsCDPIdentityVerification(t *testing.T) {
+	fakePlaywright := `
+exports.chromium = {
+  connectOverCDP: async () => ({
+    contexts: () => [{
+      pages: () => [{ url: () => 'about:blank' }],
+      route: async () => { throw new Error('route must not run after identity timeout'); },
+    }],
+    newBrowserCDPSession: async () => ({
+      send: async () => await new Promise(() => {}),
+      detach: async () => {},
+    }),
+    close: async () => {},
+  }),
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`
+	started := time.Now()
+	_, stderr, err := runBrowserDiagnosticScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatal("browser diagnostic accepted an unresponsive CDP identity session")
+	}
+	if elapsed := time.Since(started); elapsed >= 6*time.Second {
+		t.Fatalf("CDP identity timeout was not locally bounded: %s", elapsed)
+	}
+	if !strings.Contains(stderr.String(), "CDP identity verification timed out") {
+		t.Fatalf("stderr missing identity timeout:\n%s", stderr.String())
+	}
+}
+
+func TestBrowserScriptTerminatesDedicatedChromeProcessGroupWithoutProcfsTree(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("dedicated Chrome process-group cleanup is Linux-specific")
+	}
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const parentProgram = "const { spawn } = require('child_process'); const child = spawn('/bin/sh', ['-c', \"trap '' TERM HUP; sleep 30 & wait\"], { stdio: 'ignore' }); process.stdout.write(String(child.pid) + '\\n'); setInterval(() => {}, 1000);";
+  const chrome = spawn(process.execPath, ['-e', parentProgram], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  chrome.chromeExit = null;
+  chrome.startError = null;
+  chrome.exited = new Promise((resolve) => {
+    chrome.once('error', (err) => { chrome.startError = err; chrome.chromeExit = { code: null, signal: null, spawnError: true }; resolve(); });
+    chrome.once('exit', (code, signal) => { chrome.chromeExit = { code, signal }; resolve(); });
+  });
+  const processGroupID = chrome.pid;
+  const nativeReadFileSync = fs.readFileSync;
+  const childPID = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('test child PID timed out')), 1000);
+    chrome.stdout.once('data', (chunk) => {
+      clearTimeout(timer);
+      resolve(Number(String(chunk).trim()));
+    });
+  });
+  const stat = nativeReadFileSync('/proc/' + childPID + '/stat', 'utf8');
+  const close = stat.lastIndexOf(')');
+  const fields = stat.slice(close + 2).trim().split(/\s+/);
+  if (Number(fields[2]) !== processGroupID) throw new Error('test child did not inherit dedicated process group');
+  fs.readFileSync = (path, ...args) => String(path).includes('/children') ? '' : nativeReadFileSync(path, ...args);
+  try {
+    await terminateChromeChild(chrome, 250);
+    if (processIsRunning(childPID)) throw new Error('dedicated Chrome child survived cleanup');
+    for (const state of linuxProcessGroupMembers(processGroupID).values()) {
+      if (state !== 'Z') throw new Error('live dedicated Chrome process-group member survived cleanup');
+    }
+  } finally {
+    fs.readFileSync = nativeReadFileSync;
+    try { process.kill(-processGroupID, 'SIGKILL'); } catch {}
+  }
+  process.stdout.write('group reaped');
+})().catch((err) => { console.error(err); process.exit(1); });
+`)
+	if err != nil || stdout.String() != "group reaped" {
+		t.Fatalf("dedicated process-group cleanup failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestBrowserScriptRetainsHandleWhenProcessGroupCleanupFails(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("dedicated Chrome process-group cleanup is Linux-specific")
+	}
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const chrome = {
+    pid: 999999,
+    chromeExit: { code: 0, signal: null },
+    exited: Promise.resolve(),
+    kill: () => { throw new Error('terminal root must not be signaled'); },
+  };
+  activeChromeChild = chrome;
+  const nativeKill = process.kill;
+  process.kill = (pid, signal) => {
+    if (pid === -chrome.pid) { const err = new Error('permission denied'); err.code = 'EPERM'; throw err; }
+    return nativeKill(pid, signal);
+  };
+  let cleanupError;
+  try {
+    await closeCaptureBrowser({ browser: { close: async () => {} }, chrome });
+  } catch (err) {
+    cleanupError = err;
+  } finally {
+    process.kill = nativeKill;
+  }
+  if (!cleanupError) throw new Error('process-group cleanup unexpectedly succeeded');
+  if (activeChromeChild !== chrome) throw new Error('process-group cleanup handle was cleared');
+  process.stdout.write('retained');
+})().catch((err) => { console.error(err); process.exit(1); });
+`)
+	if err != nil || stdout.String() != "retained" {
+		t.Fatalf("process-group handle retention failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestNativeChromeSpawnErrorIsTerminal(t *testing.T) {
+	for _, required := range []string{
+		"chrome.chromeExit = { code: null, signal: null, spawnError: true }",
+		"google-chrome failed to spawn",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Errorf("spawn error handling missing %q", required)
+		}
+	}
+}
+
+func TestBrowserScriptRejectsMismatchedCDPBrowserPIDOnLinux(t *testing.T) {
+	fakePlaywright := `
+exports.chromium = {
+  connectOverCDP: async () => ({
+    contexts: () => [{
+      pages: () => [{ url: () => 'about:blank' }],
+      route: async () => { throw new Error('route must not run after PID mismatch'); },
+    }],
+    newBrowserCDPSession: async () => ({
+      send: async () => ({ processInfo: [{ type: 'browser', id: 999999 }] }),
+      detach: async () => {},
+    }),
+    close: async () => { console.error('PID mismatch browser close called'); },
+  }),
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`
+	_, stderr, err := runBrowserDiagnosticScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatal("browser diagnostic accepted a mismatched Linux CDP browser PID")
+	}
+	for _, want := range []string{"attached CDP browser is not the spawned Chrome child", "PID mismatch browser close called"} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Fatalf("stderr missing %q after PID mismatch:\n%s", want, stderr.String())
+		}
+	}
+	if strings.Contains(stderr.String(), "route must not run") {
+		t.Fatalf("diagnostic continued after PID mismatch:\n%s", stderr.String())
+	}
+}
+
+func TestBrowserScriptDoesNotRetryAfterStartupCleanupFailure(t *testing.T) {
+	fakePlaywright := `
+let connectAttempts = 0;
+exports.chromium = {
+  connectOverCDP: async () => {
+    connectAttempts++;
+    console.error('cleanup-failure connect attempt ' + connectAttempts);
+    return {
+      contexts: () => { throw new Error('startup context failed'); },
+      close: async () => { throw new Error('startup browser cleanup failed'); },
+    };
+  },
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatal("browser startup unexpectedly succeeded")
+	}
+	if got := strings.Count(stderr.String(), "cleanup-failure connect attempt"); got != 1 {
+		t.Fatalf("connect attempts = %d, want 1 after cleanup failure:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "startup browser cleanup failed") {
+		t.Fatalf("stderr lost cleanup failure:\n%s", stderr.String())
+	}
+}
+
+func TestBrowserScriptRetriesCleanStartupFailureThreeTimes(t *testing.T) {
+	fakePlaywright := `
+let connectAttempts = 0;
+exports.chromium = {
+  connectOverCDP: async () => {
+    connectAttempts++;
+    console.error('clean-failure connect attempt ' + connectAttempts);
+    throw new Error('clean startup failure');
+  },
+};
+exports.errors = { TimeoutError: class TimeoutError extends Error {} };
+`
+	_, stderr, err := runPlaywrightScriptWithFake(t, fakePlaywright)
+	if err == nil {
+		t.Fatal("browser startup unexpectedly succeeded")
+	}
+	if got := strings.Count(stderr.String(), "clean-failure connect attempt"); got != 3 {
+		t.Fatalf("connect attempts = %d, want 3:\n%s", got, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "native Chrome startup failed after 3 attempts") {
+		t.Fatalf("stderr missing bounded retry failure:\n%s", stderr.String())
+	}
+}
+
+func TestNewCapturePageConsumesInitialPageOnce(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skipf("node not installed: %v", err)
+	}
+	dir := t.TempDir()
+	moduleDir := filepath.Join(dir, "node_modules", "playwright")
+	if err := os.MkdirAll(moduleDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(moduleDir, "index.js"), []byte(`exports.chromium = {}; exports.errors = {};`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "initial-page.js")
+	source := playwrightBrowserPrelude + `
+(async () => {
+  const initialPage = { url: () => 'about:blank' };
+  const browser = { initialPage, initialPageConsumed: false };
+  if (await newCapturePage(browser) !== initialPage) throw new Error('initial page was not returned');
+  try {
+    await newCapturePage(browser);
+    throw new Error('second initial-page use unexpectedly succeeded');
+  } catch (err) {
+    if (!String(err.message || err).includes('already in use')) throw err;
+  }
+})().catch((err) => { console.error(err); process.exitCode = 1; });
+`
+	if err := os.WriteFile(script, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("node", script)
+	cmd.Env = append(withoutNodeOverrides(os.Environ()), "NODE_PATH="+filepath.Join(dir, "node_modules"))
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("initial-page lifecycle failed: %v\n%s", err, output)
+	}
+}
+
+func TestNativeChromeScriptReusesInitialBlankPage(t *testing.T) {
+	for _, required := range []string{
+		"const pages = context.pages()",
+		"pages.length !== 1",
+		"const initialPage = pages[0]",
+		"initialPage.url() !== 'about:blank'",
+		"initialPageConsumed",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Errorf("native Chrome initial-page lifecycle missing %q", required)
+		}
+	}
+	if strings.Contains(playwrightBrowserPrelude, "newPage: () => context.newPage()") {
+		t.Fatal("native Chrome launcher creates a Playwright-sized replacement page")
 	}
 }
 
@@ -620,13 +1051,15 @@ func TestBrowserProcessScriptTerminatesChromeChildOnSignals(t *testing.T) {
 		"process.once('SIGTERM'",
 		"process.once('SIGINT'",
 		"await terminateChromeChild(activeChromeChild",
+		"detached: process.platform === 'linux'",
+		"process.kill(target, signal)",
 		"process.exit(exitCode)",
 	} {
 		if !strings.Contains(playwrightBrowserPrelude, required) {
 			t.Errorf("browser signal cleanup missing %q", required)
 		}
 	}
-	for _, forbidden := range []string{"pkill", "killall", "process.kill(-"} {
+	for _, forbidden := range []string{"pkill", "killall"} {
 		if strings.Contains(playwrightBrowserPrelude, forbidden) {
 			t.Errorf("browser signal cleanup uses broad process killing %q", forbidden)
 		}
@@ -639,7 +1072,7 @@ func TestBrowserScriptCleansUpAfterPostLaunchSetupFailure(t *testing.T) {
 exports.chromium = {
   connectOverCDP: async () => ({
     contexts: () => [{
-      newPage: async () => { throw new Error('capture page setup failed'); },
+      pages: () => { throw new Error('capture page setup failed'); },
     }],
     close: async () => { console.error('capture browser close called'); },
   }),
@@ -655,9 +1088,13 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 exports.chromium = {
   connectOverCDP: async () => ({
     contexts: () => [{
+      pages: () => [{ url: () => 'about:blank' }],
       route: async () => { throw new Error('diagnostic route setup failed'); },
-      newPage: async () => { throw new Error('diagnostic page should not be created'); },
     }],
+    newBrowserCDPSession: async () => ({
+      send: async () => ({ processInfo: [{ type: 'browser', id: Number(require('fs').readFileSync(require('path').join(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR, '.test-chrome-pid'), 'utf8')) }] }),
+      detach: async () => {},
+    }),
     close: async () => { console.error('diagnostic route browser close called'); },
   }),
 };
@@ -673,7 +1110,7 @@ exports.chromium = {
   connectOverCDP: async () => ({
     contexts: () => [{
       route: async () => {},
-      newPage: async () => { throw new Error('diagnostic page setup failed'); },
+      pages: () => { throw new Error('diagnostic page setup failed'); },
     }],
     close: async () => { console.error('diagnostic page browser close called'); },
   }),
@@ -722,7 +1159,12 @@ func TestBrowserScriptCleanupAttemptsTerminationAndPropagatesFailures(t *testing
 	stdout, stderr, err := runBrowserPreludeSnippet(t, `
 (async () => {
   const events = [];
-  const session = {
+	  chromeProcessBoundaryAlive = () => true;
+	  signalChromeProcessBoundary = (_chrome, signal) => {
+	    events.push(signal);
+	    throw new Error('chrome termination failed');
+	  };
+	  const session = {
     browser: {
       close: async () => {
         events.push('close');
@@ -733,12 +1175,10 @@ func TestBrowserScriptCleanupAttemptsTerminationAndPropagatesFailures(t *testing
       pid: 123,
       chromeExit: null,
       exited: Promise.resolve(),
-      kill: (signal) => {
-        events.push(signal);
-        throw new Error('chrome termination failed');
-      },
-    },
-  };
+	      kill: () => { throw new Error('root-only termination must not run'); },
+	    },
+	  };
+	  activeChromeChild = session.chrome;
   let cleanupError = null;
   try {
     await closeCaptureBrowser(session);
@@ -754,9 +1194,10 @@ func TestBrowserScriptCleanupAttemptsTerminationAndPropagatesFailures(t *testing
   if (!messages.includes('playwright close failed') || !messages.includes('chrome termination failed')) {
     throw new Error('cleanup errors: ' + messages.join(','));
   }
-  if (!cleanupError.message.includes('playwright close failed') || !cleanupError.message.includes('chrome termination failed')) {
-    throw new Error('cleanup message: ' + cleanupError.message);
-  }
+	  if (!cleanupError.message.includes('playwright close failed') || !cleanupError.message.includes('chrome termination failed')) {
+	    throw new Error('cleanup message: ' + cleanupError.message);
+	  }
+	  if (activeChromeChild !== session.chrome) throw new Error('live Chrome cleanup handle was cleared');
   process.stdout.write('cleanup propagated');
 })().catch((err) => {
   console.error(err && err.stack ? err.stack : String(err));
@@ -776,6 +1217,7 @@ func TestBrowserScriptCleanupPreservesPrimaryOperationFailure(t *testing.T) {
 (async () => {
   const events = [];
   let resolveExit;
+	  let boundaryAlive = true;
   const chrome = {
     pid: 123,
     chromeExit: null,
@@ -786,6 +1228,13 @@ func TestBrowserScriptCleanupPreservesPrimaryOperationFailure(t *testing.T) {
       resolveExit();
     },
   };
+	  chromeProcessBoundaryAlive = () => boundaryAlive;
+	  signalChromeProcessBoundary = (_chrome, signal) => {
+	    events.push(signal);
+	    boundaryAlive = false;
+	    chrome.chromeExit = { code: 0, signal };
+	    resolveExit();
+	  };
   const session = {
     browser: {
       close: async () => {
@@ -812,7 +1261,8 @@ func TestBrowserScriptCleanupPreservesPrimaryOperationFailure(t *testing.T) {
   if (!combinedError.message.includes('capture setup failed') || !combinedError.message.includes('playwright close failed')) {
     throw new Error('combined message: ' + combinedError.message);
   }
-  if (combinedError.cause !== operationError) throw new Error('primary operation error is not the cause');
+	  if (combinedError.cause !== operationError) throw new Error('primary operation error is not the cause');
+	  if (combinedError.browserCleanupFailed !== true) throw new Error('cleanup failure marker is missing');
   if (events.join(',') !== 'close,SIGTERM') throw new Error('cleanup events: ' + events.join(','));
   process.stdout.write('primary preserved');
 })().catch((err) => {
@@ -880,6 +1330,7 @@ func TestBrowserScriptTerminationClearsGraceTimerAfterPromptExit(t *testing.T) {
   };
   try {
     let resolveExit;
+	    let boundaryAlive = true;
     const chrome = {
       pid: 123,
       chromeExit: null,
@@ -889,6 +1340,12 @@ func TestBrowserScriptTerminationClearsGraceTimerAfterPromptExit(t *testing.T) {
         resolveExit();
       },
     };
+	    chromeProcessBoundaryAlive = () => boundaryAlive;
+	    signalChromeProcessBoundary = (_chrome, signal) => {
+	      boundaryAlive = false;
+	      chrome.chromeExit = { code: 0, signal };
+	      resolveExit();
+	    };
     await terminateChromeChild(chrome, 2000);
     if (activeTimers.size !== 0) {
       throw new Error('termination left ' + activeTimers.size + ' grace timer(s) active');
@@ -927,7 +1384,7 @@ func TestBrowserDiagnosticScriptEnforcesExactOriginAndEphemeralProfile(t *testin
 	}
 }
 
-func TestBrowserProcessPolicyHasPlatformOwnershipAndBoundedTermination(t *testing.T) {
+func TestBrowserProcessPolicyHasPlatformBoundedTermination(t *testing.T) {
 	linuxSource, err := os.ReadFile("browser_process_linux.go")
 	if err != nil {
 		t.Fatalf("read Linux browser process policy: %v", err)
@@ -939,10 +1396,6 @@ func TestBrowserProcessPolicyHasPlatformOwnershipAndBoundedTermination(t *testin
 
 	for _, required := range []string{
 		"Setpgid: true",
-		"/proc/net/tcp",
-		"/proc/net/tcp6",
-		"/task/",
-		"/children",
 		"syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)",
 		"syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)",
 		"if errors.Is(termErr, syscall.ESRCH)",
@@ -953,11 +1406,9 @@ func TestBrowserProcessPolicyHasPlatformOwnershipAndBoundedTermination(t *testin
 	}
 	for _, required := range []string{
 		"//go:build !linux",
-		"os.FindProcess(pid)",
 		"runtime.GOOS == \"windows\"",
 		"runBoundedBrowserCleanupCommand(grace, \"taskkill\", \"/PID\"",
 		"\"/T\", \"/F\"",
-		"process.Signal(syscall.Signal(0))",
 		"cmd.Process.Signal(os.Interrupt)",
 		"errors.Is(interruptErr, os.ErrProcessDone)",
 		"cmd.Process.Kill()",
@@ -1172,60 +1623,6 @@ printf '<html></html>'
 	}
 }
 
-func TestBrowserProcessOwnsListenerInChildTree(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("Linux procfs ownership contract")
-	}
-	cmd := exec.Command("sh", "-c", `PRODUCT_CAPTURE_TEST_BROWSER_LISTENER=1 "$1" -test.run=^TestBrowserProcessListenerHelper$`, "sh", os.Args[0])
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-	}()
-
-	line, err := bufio.NewReader(stdout).ReadString('\n')
-	if err != nil {
-		t.Fatalf("read listener port: %v", err)
-	}
-	port, err := strconv.Atoi(strings.TrimSpace(line))
-	if err != nil {
-		t.Fatalf("parse listener port %q: %v", line, err)
-	}
-	policy := newBrowserProcessPolicy()
-	deadline := time.Now().Add(2 * time.Second)
-	for !policy.OwnsListeningPort(cmd.Process.Pid, port) && time.Now().Before(deadline) {
-		time.Sleep(10 * time.Millisecond)
-	}
-	if !policy.OwnsListeningPort(cmd.Process.Pid, port) {
-		t.Fatalf("process tree rooted at %d does not own listener %d", cmd.Process.Pid, port)
-	}
-}
-
-func TestBrowserProcessListenerHelper(t *testing.T) {
-	if os.Getenv("PRODUCT_CAPTURE_TEST_BROWSER_LISTENER") != "1" {
-		return
-	}
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = listener.Close() }()
-	fmt.Println(listener.Addr().(*net.TCPAddr).Port)
-	for {
-		conn, acceptErr := listener.Accept()
-		if acceptErr != nil {
-			return
-		}
-		_ = conn.Close()
-	}
-}
-
 func TestBrowserProcessTerminatesAndReapsProcessGroup(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("Linux process-group contract")
@@ -1256,11 +1653,16 @@ func TestBrowserProcessTerminatesAndReapsProcessGroup(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 2*time.Second {
 		t.Fatalf("process-group termination took %s", elapsed)
 	}
-	if cmd.ProcessState == nil || !cmd.ProcessState.Exited() {
+	if cmd.ProcessState == nil {
 		t.Fatalf("browser command was not reaped: %+v", cmd.ProcessState)
 	}
-	if _, err := os.Stat(filepath.Join("/proc", strconv.Itoa(childPID))); !os.IsNotExist(err) {
-		t.Fatalf("browser child %d still exists after group termination: %v", childPID, err)
+	if stat, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(childPID), "stat")); err == nil {
+		close := bytes.LastIndexByte(stat, ')')
+		if close < 0 || !bytes.HasPrefix(stat[close+2:], []byte("Z ")) {
+			t.Fatalf("live browser child %d survived group termination: %s", childPID, stat)
+		}
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("inspect browser child %d after group termination: %v", childPID, err)
 	}
 }
 
@@ -1370,8 +1772,6 @@ type recordingBrowserProcessPolicy struct {
 }
 
 func (*recordingBrowserProcessPolicy) Configure(*exec.Cmd) {}
-
-func (*recordingBrowserProcessPolicy) OwnsListeningPort(int, int) bool { return false }
 
 func (p *recordingBrowserProcessPolicy) TerminateGroup(cmd *exec.Cmd, grace time.Duration) error {
 	p.terminateCalls++
@@ -6185,14 +6585,38 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 const fakeConnectOverCDPAdapter = `
 if (exports.chromium && typeof exports.chromium.connectOverCDP !== 'function') {
   const productCaptureFakeLaunch = exports.chromium.launch;
+  const productCaptureTestFS = require('fs');
+  const productCaptureTestPath = require('path');
   exports.chromium.connectOverCDP = async () => {
     const launched = await productCaptureFakeLaunch();
+    const initialPage = await launched.newPage();
+    const productCaptureFakeURL = typeof initialPage.url === 'function'
+      ? initialPage.url.bind(initialPage)
+      : () => global.location && global.location.href || 'about:blank';
+    const productCaptureFakeGoto = typeof initialPage.goto === 'function'
+      ? initialPage.goto.bind(initialPage)
+      : null;
+    let productCaptureInitialBlank = true;
+    initialPage.url = () => productCaptureInitialBlank ? 'about:blank' : productCaptureFakeURL();
+    if (productCaptureFakeGoto) {
+      initialPage.goto = async (...args) => {
+        productCaptureInitialBlank = false;
+        return await productCaptureFakeGoto(...args);
+      };
+    }
     const context = {
-      newPage: () => launched.newPage(),
+      pages: () => [initialPage],
       route: async () => {},
     };
     return {
       contexts: () => [context],
+      newBrowserCDPSession: async () => ({
+        send: async () => ({ processInfo: [{
+          type: 'browser',
+          id: Number(productCaptureTestFS.readFileSync(productCaptureTestPath.join(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR, '.test-chrome-pid'), 'utf8')),
+        }] }),
+        detach: async () => {},
+      }),
       close: () => launched.close(),
     };
   };
@@ -6219,10 +6643,13 @@ func TestNativeChromeHelper(t *testing.T) {
 		return
 	}
 	profileDir := ""
+	debugPort := 0
 	for _, arg := range os.Args {
 		if strings.HasPrefix(arg, "--user-data-dir=") {
 			profileDir = strings.TrimPrefix(arg, "--user-data-dir=")
-			break
+		}
+		if strings.HasPrefix(arg, "--remote-debugging-port=") {
+			debugPort, _ = strconv.Atoi(strings.TrimPrefix(arg, "--remote-debugging-port="))
 		}
 	}
 	if profileDir == "" {
@@ -6231,24 +6658,42 @@ func TestNativeChromeHelper(t *testing.T) {
 	if expected := os.Getenv("PRODUCT_CAPTURE_TEST_EXPECT_PROFILE_DIR"); expected != "" && profileDir != expected {
 		t.Fatalf("profile dir = %q, want %q", profileDir, expected)
 	}
-	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, ".test-chrome-pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if debugPort <= 0 || debugPort > 65535 {
+		t.Fatalf("invalid --remote-debugging-port: %d", debugPort)
+	}
+	listener, err := net.Listen("tcp4", fmt.Sprintf("127.0.0.1:%d", debugPort))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = listener.Close() }()
-	if err := os.MkdirAll(profileDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	port := listener.Addr().(*net.TCPAddr).Port
-	endpoint := fmt.Sprintf("%d\n/devtools/browser/product-capture-test\n", port)
-	if err := os.WriteFile(filepath.Join(profileDir, "DevToolsActivePort"), []byte(endpoint), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
+	server := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/json/version" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/browser/product-capture-test"}`, debugPort)
+	})}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- server.Serve(listener) }()
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGTERM, os.Interrupt)
 	defer signal.Stop(signals)
 	<-signals
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-serveDone; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		t.Fatal(err)
+	}
 }
 
 func withoutNodeOverrides(env []string) []string {

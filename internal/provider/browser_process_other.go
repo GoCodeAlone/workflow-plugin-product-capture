@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"runtime"
 	"strconv"
-	"syscall"
 	"time"
 )
 
@@ -19,21 +18,6 @@ func newBrowserProcessPolicy() browserProcessPolicy {
 }
 
 func (otherBrowserProcessPolicy) Configure(*exec.Cmd) {}
-
-func (otherBrowserProcessPolicy) OwnsListeningPort(pid, port int) bool {
-	if pid <= 0 || port <= 0 || port > 65535 {
-		return false
-	}
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = process.Release() }()
-	if runtime.GOOS == "windows" {
-		return true
-	}
-	return process.Signal(syscall.Signal(0)) == nil
-}
 
 func (otherBrowserProcessPolicy) TerminateGroup(cmd *exec.Cmd, grace time.Duration) error {
 	if cmd == nil || cmd.Process == nil {
