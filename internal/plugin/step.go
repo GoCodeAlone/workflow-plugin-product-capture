@@ -198,7 +198,7 @@ func (s *productCaptureStep) Execute(ctx context.Context, _ map[string]any, _ ma
 	if err != nil {
 		return errorResult(err.Error()), nil
 	}
-	output, err := s.waitForProductCapture(ctx, client, task.ID)
+	output, err := s.waitForProductCapture(ctx, client, task.ID, workload.Provider)
 	if err != nil {
 		return errorResult(err.Error()), nil
 	}
@@ -234,7 +234,7 @@ func (s *productCaptureStep) productCaptureProviderConfig() protocol.ProviderCon
 	return cfg
 }
 
-func (s *productCaptureStep) waitForProductCapture(ctx context.Context, client *protocol.Client, taskID string) (map[string]any, error) {
+func (s *productCaptureStep) waitForProductCapture(ctx context.Context, client *protocol.Client, taskID string, submittedProvider *protocol.ProviderWorkload) (map[string]any, error) {
 	pollInterval := durationOrDefault(s.config.PollInterval, time.Second)
 	timeout := durationOrDefault(s.config.WaitTimeout, 5*time.Minute)
 	waitCtx, cancel := context.WithTimeout(ctx, timeout)
@@ -250,6 +250,7 @@ func (s *productCaptureStep) waitForProductCapture(ctx context.Context, client *
 		actionableStalls := actionableStalls(stalls, s.requireProof())
 		if task.Status == protocol.TaskFailed || task.Status == protocol.TaskStalled || len(actionableStalls) > 0 {
 			output := taskOutput(task)
+			addProviderProvenance(output, submittedProvider)
 			if len(actionableStalls) > 0 {
 				addStallOutput(output, actionableStalls[0])
 			}
@@ -262,6 +263,7 @@ func (s *productCaptureStep) waitForProductCapture(ctx context.Context, client *
 				return nil, err
 			}
 			output := taskOutput(task)
+			addProviderProvenance(output, submittedProvider)
 			if hasProof {
 				addProofOutput(output, proof)
 			}
@@ -281,6 +283,15 @@ func (s *productCaptureStep) waitForProductCapture(ctx context.Context, client *
 		case <-timer.C:
 		}
 	}
+}
+
+func addProviderProvenance(output map[string]any, provider *protocol.ProviderWorkload) {
+	if provider == nil {
+		return
+	}
+	output["provider_image_ref"] = provider.ImageRef
+	output["provider_component_ref"] = provider.ComponentRef
+	output["provider_component_digest"] = provider.ComponentDigest
 }
 
 func (s *productCaptureStep) requireProof() bool {

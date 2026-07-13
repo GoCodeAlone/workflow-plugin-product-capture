@@ -34,21 +34,25 @@ capture/diagnostic contracts.
    standalone binary preserves its current headless default. Missing
    Xvfb/display in requested headed mode is an explicit preflight error.
 3. Node starts installed `google-chrome` with the selected profile directory,
-   `--remote-debugging-port=0`, a 1920x1080 default window, container-required
-   sandbox/dev-shm flags, and no automation/identity flags.
-4. Before launch, Node rejects an active profile lock and removes only a stale
-   `DevToolsActivePort`. After launch it accepts a newly created endpoint file
-   only when its mtime is newer than the child start, the child is alive, and
-   Linux procfs maps the listening socket to the launched process tree. It then
-   calls `chromium.connectOverCDP`.
+   a selected nonzero loopback debugging port, a 1920x1080 default window,
+   container-required sandbox/dev-shm flags, and no automation/identity flags.
+4. Before launch, Node rejects an active profile lock. After launch it requires
+   the child to remain alive, Linux procfs to map the listening socket to the
+   child's dedicated process group, and `/json/version` to expose the expected loopback
+   browser endpoint before `chromium.connectOverCDP`. Every platform verifies
+   the bounded CDP-reported browser PID equals the live spawned Chrome child
+   before any navigation; Linux additionally terminates the dedicated Chrome
+   process group and reaps its leader. Startup gets at most three fully cleaned
+   attempts.
 5. Capture and diagnostics use the attached default context/page. They do not
    call `addInitScript`, `Network.setUserAgentOverride`, or set a Playwright
    viewport, locale, timezone, or graphics renderer.
 6. The existing Amazon same-origin homepage warmup and document
    `window.location.assign` navigation remain unchanged.
-7. Browser close is bounded. Go owns a process group containing Xvfb, Node,
-   Chrome, and Chrome children; cancellation sends bounded TERM then KILL and
-   reaps the group. The task container/cgroup is the parent-death boundary.
+7. Browser close is bounded. Node gives each Linux Chrome attempt a dedicated
+   process group and sends bounded TERM then KILL before retrying. Go separately
+   owns the outer Xvfb/Node process group and terminates it on cancellation. The
+   task container/cgroup is the parent-death boundary.
 8. Normal close, startup failure, timeout, and signal paths remove only
    ephemeral profile state. Stable-profile lock failures never trigger unsafe
    lock-file deletion.
@@ -91,15 +95,23 @@ not this provider library.
 
 ## Error Handling
 
-- Chrome executable failure, early exit, malformed `DevToolsActivePort`, CDP
-  timeout, profile lock, unavailable headed display, and process-group cleanup
-  failure produce bounded errors.
+- Chrome executable failure, early exit, invalid/unready CDP endpoint, process
+  ownership mismatch, CDP timeout, profile lock, unavailable headed display,
+  and process-group cleanup failure produce bounded errors.
 - No fallback reinstalls identity patches or silently changes headed mode.
 - Existing browser-target crash retries may restart Chrome within the remaining
   workload deadline; cleanup precedes retry.
 - Browser diagnostics continue to emit cookie presence/length only, never values.
-- A stale endpoint file, a listener outside the launched process group, or a
-  surviving profile owner fails closed before CDP attachment.
+- A listener outside the launched process group, a CDP browser PID mismatch, or
+  a surviving profile owner fails closed before navigation.
+
+Execution backport 2026-07-13: Linux kernel documentation invalidated live
+`/proc/<pid>/task/<pid>/children` traversal as a complete cleanup authority.
+Each Chrome attempt is now a dedicated Linux process group. Listener ownership
+enumerates procfs members by process-group ID, and cleanup signals that group,
+requires no non-zombie member to remain, and requires the Chrome group leader's
+exit to be reaped before retry. Unexpected procfs and group-signal errors fail
+closed. This replaces captured-tree cleanup without changing the Scope Manifest.
 
 ## Security Review
 
@@ -227,13 +239,13 @@ not this provider library.
 | id | assumption | challenge | fallback |
 |---|---|---|---|
 | A1 | Runtime image contains `google-chrome`, Xvfb, and xauth | Image drift breaks startup | Dockerfile contract test + runtime image smoke |
-| A2 | Chrome writes `DevToolsActivePort` for `--remote-debugging-port=0` | Startup may hang | Bounded poll + child-exit detection |
+| A2 | Chrome binds a selected nonzero loopback CDP port without enabling `AutomationControlled` | Startup may race or hang | Owned-listener + `/json/version` readiness, PID check, bounded clean retry |
 | A3 | CDP attachment retains the measured native baseline within the declared matrix | Future Playwright/Chrome may change | Versioned comparison gates promotion; no non-detection claim |
 | A4 | A stable profile is used by at most one capture at a time | Concurrent workers can lock it | Fail bounded; operator assigns worker-local profile |
 | A5 | Amazon permits anonymous product browsing from staging egress | External challenge may persist | Preserve proof as external block; do not add spoofing |
 | A6 | BMW contribution rows expose contributor and PaymentIntent linkage to the owner/admin proof | Existing response may omit fields | Add the narrow authenticated proof projection before staging run |
 | A7 | BMW scheduler can identify abandoned proof cards without schema change | Fulfillment evidence may be occupied | Merge proof keys into existing JSON; never overwrite fulfillment evidence |
-| A8 | Linux procfs exposes the Chrome listener/process relationship in the published image | Runtime hardening could hide process FDs | Fail closed in image; standalone non-Linux keeps fresh-file + child-liveness checks |
+| A8 | Every platform's CDP reports the spawned browser PID; Linux also exposes listener/process-tree ownership | Runtime hardening could hide process identity | Fail closed before navigation and retry only after captured-tree cleanup |
 | A9 | BMW staging deploy consumes its environment-scoped image-ref variable | Workflow drift could use app default | Deploy summary + persisted task runtime ref must equal candidate |
 
 ## Self-Challenge
@@ -320,3 +332,39 @@ handler list-to-download round trip through compute-core `v0.8.4`.
 
 Scope: no manifest change; this clarifies the existing Task 5 producer side of
 the core/client boundary.
+
+### Backport 2026-07-11: Native debugger attachment baseline
+
+Cause: candidate conformance proved `--remote-debugging-port=0` enables
+Chromium `AutomationControlled`, and `context.newPage()` creates a 56 px taller
+content viewport than Chrome's initial headed tab.
+
+Change: select and release an OS-assigned nonzero loopback port, require Linux
+Chrome process-tree listener ownership plus endpoint readiness, verify the live
+CDP browser PID on every platform, attach with bounded clean retry, and reuse
+the single initial `about:blank` page. Never override `navigator.webdriver` or
+browser identity.
+
+Failed ownership/readiness attempts retry only after complete cleanup.
+
+Scope: no manifest change; Task 2 retains native Chrome/CDP lifecycle ownership.
+Evidence: fixed-port image probe -> initial `webdriver=false`, `1919x936`;
+`context.newPage()` -> `webdriver=false`, `1919x992`.
+
+### Backport 2026-07-13: Quick Tunnel activation retries
+
+Cause: six Quick Tunnels registered healthy Cloudflare connections while their
+generated hostnames remained unpublished in DNS for the full 45-second health
+window; the collector remained healthy on loopback and a separately issued
+hostname served the same origin once DNS propagated.
+
+Change: retry up to three fresh Quick Tunnel activations, each bounded to two
+minutes, with complete teardown between attempts. Correlation, origin-policy,
+and other non-timeout failures remain fail-closed and are never retried.
+The CLI default overall timeout is twelve minutes so all three activation
+windows and the candidate runtime checks remain bounded but reachable.
+
+Scope: no manifest change; Task 3 retains the accepted ADR 0002 transport and
+explicit-origin fallback.
+Evidence: default command -> deadline + clean teardown; explicit origin ->
+full candidate conformance PASS.

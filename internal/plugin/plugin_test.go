@@ -157,6 +157,12 @@ func TestProductCaptureStepDispatchesDynamicURLAndReturnsPreview(t *testing.T) {
 	if result.Output["error"] != nil {
 		t.Fatalf("preview error key should not be promoted: %+v", result.Output)
 	}
+	if result.Output["provider_image_ref"] != testProviderImageRef {
+		t.Fatalf("provider image provenance: %+v", result.Output)
+	}
+	if result.Output["provider_component_ref"] != "" || result.Output["provider_component_digest"] != "" {
+		t.Fatalf("unexpected component provenance: %+v", result.Output)
+	}
 }
 
 func TestProductCaptureStepDispatchesPromotedComponentRuntime(t *testing.T) {
@@ -221,6 +227,11 @@ func TestProductCaptureStepDispatchesPromotedComponentRuntime(t *testing.T) {
 	}
 	if submitted.Workload.Provider.ComponentDigest != testProviderComponentDigest {
 		t.Fatalf("component digest: %q", submitted.Workload.Provider.ComponentDigest)
+	}
+	if result.Output["provider_image_ref"] != "" ||
+		result.Output["provider_component_ref"] != testProviderComponentRef ||
+		result.Output["provider_component_digest"] != testProviderComponentDigest {
+		t.Fatalf("provider component provenance: %+v", result.Output)
 	}
 }
 

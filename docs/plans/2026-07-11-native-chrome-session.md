@@ -134,7 +134,8 @@ Add tests requiring:
 - direct `google-chrome` child + `chromium.connectOverCDP`;
 - no `chromium.launch`, `launchPersistentContext`, `addInitScript`, `Network.setUserAgentOverride`, `AutomationControlled`, forced UA/client hints/timezone/WebGL;
 - 1920x1080 Chrome window flag and image-controlled headed mode;
-- fresh `DevToolsActivePort`, live child, Linux listener/process-tree ownership;
+- selected nonzero loopback CDP port, live child, Linux listener/process-group
+  ownership, endpoint readiness, and all-platform CDP browser-PID verification;
 - exact HTTPS diagnostic allowlist, public DNS pin, same-origin redirect/request rules, and forced ephemeral diagnostic profile;
 - process-group TERM/KILL/reap on timeout.
 
@@ -149,15 +150,18 @@ Implement platform helpers with this contract:
 ```go
 type browserProcessPolicy interface {
     Configure(*exec.Cmd)
-    OwnsListeningPort(pid, port int) bool
     TerminateGroup(*exec.Cmd, time.Duration) error
 }
 ```
 
-Linux uses a process group and procfs socket ownership; other platforms require
-fresh endpoint + child liveness and bounded child termination. The embedded Node
-prelude spawns installed Chrome, polls a newly-created endpoint file, attaches
-to the default context, and closes/reaps on every exit path.
+Linux uses a dedicated per-attempt Chrome process group, procfs group-member
+socket ownership, and group cleanup;
+all platforms require child liveness plus CDP browser-PID equality and bounded
+child termination. The
+embedded Node prelude spawns installed Chrome on a selected nonzero loopback
+port, polls listener and `/json/version` readiness, attaches to the default
+context and initial page, and closes/reaps on every exit path. Startup gets at
+most three fully cleaned attempts.
 
 **Step 3: Implement diagnostic boundary**
 
@@ -172,6 +176,21 @@ presence/length only.
 Keep `PRODUCT_CAPTURE_BROWSER_PROFILE_DIR` opt-in for anonymous capture state,
 same-origin Amazon homepage warmup, `window.location.assign`, continuation
 handling, capture deadlines, and 1920x1080 default window selection.
+
+**Execution backport 2026-07-11:** Candidate conformance disproved the port-zero
+and new-page assumptions. Task 2 instead selects and releases an OS-assigned
+nonzero loopback CDP port,
+validates listener/readiness/PID ownership before navigation, retries startup
+with full cleanup, and reuses Chrome's initial `about:blank` page. This preserves
+the native browser baseline without identity overrides and does not change the
+Scope Manifest.
+
+**Execution backport 2026-07-13:** Captured child-tree traversal cannot prove
+complete cleanup for live processes. Linux Chrome attempts now lead dedicated
+process groups; listener ownership scans procfs by process-group ID, cleanup
+sends bounded TERM/KILL to the group, rejects surviving non-zombie members, and
+requires the Chrome leader to be reaped before retry. The Go policy retains only
+the outer Xvfb/Node group lifecycle. This does not change the Scope Manifest.
 
 **Step 5: Verify**
 
@@ -240,6 +259,12 @@ Reject any version/digest mismatch. The command owns a teardown trap, kills and
 reaps the tunnel on success/signal/failure, and verifies the generated HTTPS
 origin by fetching the run-correlated `/healthz` before launching Chrome. Tests
 use a fake tunnel process to prove endpoint rejection and cleanup.
+
+**Execution backport 2026-07-13:** Quick Tunnel hostname activation gets up to
+three fresh two-minute attempts with full teardown between attempts; the CLI's
+default overall timeout is twelve minutes so all attempts and runtime checks fit. Retry only
+deadline/transient activation failure; origin or run-correlation rejection
+remains fail-closed. This does not change the Scope Manifest.
 
 **Step 3: Add exact candidate runtime launch checks**
 

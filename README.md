@@ -116,6 +116,23 @@ The diagnostic endpoint should log request headers, TLS/client metadata, remote
 IP/ASN, and the POST body. Compare that output with a normal Chrome visit before
 changing capture behavior. Do not run it from a credentialed shopping profile.
 
+Release candidates use the repository-owned conformance command to compare a
+direct headed Chrome visit with the real provider diagnostic from the same
+loaded amd64 image:
+
+```sh
+go run ./cmd/browser-runtime-conformance \
+  --image product-capture:v0.1.60 \
+  --output /tmp/product-capture-conformance.json
+```
+
+The command serves a run-correlated, bounded self-reporting endpoint and uses
+the checksum-pinned ephemeral Quick Tunnel described in
+[`decisions/0002-use-ephemeral-diagnostic-tunnel.md`](decisions/0002-use-ephemeral-diagnostic-tunnel.md).
+Pass `--origin` and `--listen` together when an operator-managed HTTPS reverse
+proxy is available. Shared JSON contains only versions, stable comparisons,
+informational values, and the verdict; the run ID and endpoint host are redacted.
+
 ## Workflow step
 
 Use `step.product_capture` when a Workflow app needs to submit a product URL to
@@ -134,3 +151,8 @@ rejected.
 
 BuyMyWishlist live wiring details are in
 [`docs/buymywishlist-live-usage.md`](docs/buymywishlist-live-usage.md).
+
+Terminal step output includes `provider_image_ref`, `provider_component_ref`,
+and `provider_component_digest` copied from the submitted provider workload.
+Consumers should persist those fields with the task/proof identifiers and
+artifact hash so a captured item remains bound to the selected runtime.
