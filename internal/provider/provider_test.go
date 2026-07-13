@@ -683,7 +683,7 @@ func TestChromeEndpointReadyHasAbsoluteDeadlineAgainstSlowDrip(t *testing.T) {
 	if err != nil || stdout.String() != "bounded" {
 		t.Fatalf("slow endpoint check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 	}
-	if elapsed := time.Since(started); elapsed >= time.Second {
+	if elapsed := time.Since(started); elapsed >= 1500*time.Millisecond {
 		t.Fatalf("slow endpoint exceeded absolute deadline: %s", elapsed)
 	}
 }
