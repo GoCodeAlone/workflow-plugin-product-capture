@@ -674,7 +674,7 @@ func TestPinnedCloudflaredStopForceRemovesContainerAfterReapTimeout(t *testing.T
 		done:          done,
 		containerName: "product-capture-cloudflared-test",
 		tempDir:       tempDir,
-		reapTimeout:   10 * time.Millisecond,
+		reapTimeout:   250 * time.Millisecond,
 		docker: func(_ context.Context, args ...string) error {
 			calls = append(calls, strings.Join(args, " "))
 			if len(args) >= 2 && args[0] == "rm" && args[1] == "-f" {
