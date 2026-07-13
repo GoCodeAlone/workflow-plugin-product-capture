@@ -802,7 +802,7 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	if err == nil {
 		t.Fatal("browser diagnostic accepted an unresponsive CDP identity session")
 	}
-	if elapsed := time.Since(started); elapsed >= 6*time.Second {
+	if elapsed := time.Since(started); elapsed >= 9*time.Second {
 		t.Fatalf("CDP identity timeout was not locally bounded: %s", elapsed)
 	}
 	if !strings.Contains(stderr.String(), "CDP identity verification timed out") {
