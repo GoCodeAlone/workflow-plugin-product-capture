@@ -102,11 +102,208 @@ func TestProviderContractAlignsWithWorkflowComputeGenericProviderABI(t *testing.
 	if !strings.HasPrefix(diagnostic.InputSchemaDigest, "sha256:") || !strings.HasPrefix(diagnostic.OutputSchemaDigest, "sha256:") {
 		t.Fatalf("diagnostic operation schema digests missing: %+v", *diagnostic)
 	}
+	diagnosticInputSchemaData, err := os.ReadFile(filepath.Join("..", "..", "schemas", "browser-diagnostic-operation-input.schema.json"))
+	if err != nil {
+		t.Fatalf("read browser diagnostic input schema: %v", err)
+	}
+	var diagnosticInputSchemaDocument struct {
+		ID string `json:"$id"`
+	}
+	if err := json.Unmarshal(diagnosticInputSchemaData, &diagnosticInputSchemaDocument); err != nil {
+		t.Fatalf("decode browser diagnostic input schema: %v", err)
+	}
+	if diagnosticInputSchemaDocument.ID != diagnostic.InputSchemaRef {
+		t.Fatalf("diagnostic input schema id = %q, want contract ref %q", diagnosticInputSchemaDocument.ID, diagnostic.InputSchemaRef)
+	}
+	diagnosticInputSchemaSum := sha256.Sum256(diagnosticInputSchemaData)
+	if want := "sha256:" + hex.EncodeToString(diagnosticInputSchemaSum[:]); diagnostic.InputSchemaDigest != want {
+		t.Fatalf("diagnostic input schema digest = %q, want %q", diagnostic.InputSchemaDigest, want)
+	}
+	diagnosticSchemaData, err := os.ReadFile(filepath.Join("..", "..", "schemas", "browser-diagnostic-operation-output.schema.json"))
+	if err != nil {
+		t.Fatalf("read browser diagnostic schema: %v", err)
+	}
+	var diagnosticSchemaDocument struct {
+		ID string `json:"$id"`
+	}
+	if err := json.Unmarshal(diagnosticSchemaData, &diagnosticSchemaDocument); err != nil {
+		t.Fatalf("decode browser diagnostic schema: %v", err)
+	}
+	if diagnosticSchemaDocument.ID != diagnostic.OutputSchemaRef {
+		t.Fatalf("diagnostic output schema id = %q, want contract ref %q", diagnosticSchemaDocument.ID, diagnostic.OutputSchemaRef)
+	}
+	diagnosticSchemaSum := sha256.Sum256(diagnosticSchemaData)
+	if want := "sha256:" + hex.EncodeToString(diagnosticSchemaSum[:]); diagnostic.OutputSchemaDigest != want {
+		t.Fatalf("diagnostic output schema digest = %q, want %q", diagnostic.OutputSchemaDigest, want)
+	}
 	diagnosticSpecs := diagnostic.NormalizedArtifactSpecs()
 	if len(diagnosticSpecs) != 1 || diagnosticSpecs[0].Name != BrowserDiagnosticJSONArtifact ||
 		diagnosticSpecs[0].ContentType != "application/json" || diagnosticSpecs[0].MaxBytes != 1<<20 {
 		t.Fatalf("diagnostic artifact specs = %+v", diagnosticSpecs)
 	}
+}
+
+func TestBrowserDiagnosticInputSchemaMatchesProviderURLPolicy(t *testing.T) {
+	compiler := jsonschema.NewCompiler()
+	compiler.AssertFormat()
+	schemaPath := filepath.Join("..", "..", "schemas", "browser-diagnostic-operation-input.schema.json")
+	schema, err := compiler.Compile(schemaPath)
+	if err != nil {
+		t.Fatalf("compile browser diagnostic input schema: %v", err)
+	}
+	if err := schema.Validate(map[string]any{"url": "https://diagnostic.example/probe"}); err != nil {
+		t.Fatalf("valid HTTPS diagnostic URL rejected: %v", err)
+	}
+	for _, rawURL := range []string{
+		"http://diagnostic.example/probe",
+		"https://diagnostic.example/" + strings.Repeat("a", 2049),
+	} {
+		if err := schema.Validate(map[string]any{"url": rawURL}); err == nil {
+			t.Fatalf("diagnostic input schema accepted invalid URL length/scheme: %q", rawURL)
+		}
+	}
+}
+
+func TestBrowserDiagnosticURLLengthUsesSchemaCharacterSemantics(t *testing.T) {
+	rawURL := "https://93.184.216.34/" + strings.Repeat("é", 1100)
+	compiler := jsonschema.NewCompiler()
+	compiler.AssertFormat()
+	schemaPath := filepath.Join("..", "..", "schemas", "browser-diagnostic-operation-input.schema.json")
+	schema, err := compiler.Compile(schemaPath)
+	if err != nil {
+		t.Fatalf("compile browser diagnostic input schema: %v", err)
+	}
+	if err := schema.Validate(map[string]any{"url": rawURL}); err != nil {
+		t.Fatalf("public input schema rejected Unicode diagnostic URL: %v", err)
+	}
+	if _, err := resolveBrowserDiagnosticTarget(context.Background(), rawURL, "https://93.184.216.34", nil); err != nil {
+		t.Fatalf("provider rejected schema-valid Unicode diagnostic URL: %v", err)
+	}
+}
+
+func TestRunBrowserDiagnosticRejectsSchemaInvalidArtifact(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\ncat \"$PRODUCT_CAPTURE_TEST_DIAGNOSTIC_JSON_PATH\"\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
+
+	tests := map[string]func(map[string]any){
+		"target URL": func(artifact map[string]any) {
+			artifact["target_url"] = "https://93.184.216.34/" + strings.Repeat("a", 2049)
+		},
+		"post error": func(artifact map[string]any) {
+			artifact["post_error"] = strings.Repeat("e", 2049)
+		},
+		"plugin names": func(artifact map[string]any) {
+			navigator := artifact["browser_signals"].(map[string]any)["navigator"].(map[string]any)
+			navigator["plugins"].(map[string]any)["names"] = repeatedStrings("plugin", 65)
+		},
+		"MIME names": func(artifact map[string]any) {
+			navigator := artifact["browser_signals"].(map[string]any)["navigator"].(map[string]any)
+			navigator["mime_types"].(map[string]any)["names"] = repeatedStrings("type", 129)
+		},
+		"UA data brands": func(artifact map[string]any) {
+			navigator := artifact["browser_signals"].(map[string]any)["navigator"].(map[string]any)
+			brands := make([]any, 21)
+			for i := range brands {
+				brands[i] = map[string]any{"brand": "Chrome", "version": "140"}
+			}
+			navigator["user_agent_data"].(map[string]any)["brands"] = brands
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			artifact := validBrowserDiagnosticArtifact()
+			mutate(artifact)
+			data, err := json.Marshal(artifact)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture := filepath.Join(t.TempDir(), "diagnostic.json")
+			if err := os.WriteFile(fixture, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("PRODUCT_CAPTURE_TEST_DIAGNOSTIC_JSON_PATH", fixture)
+			var stdout bytes.Buffer
+			err = runBrowserDiagnostic("https://93.184.216.34/probe", &stdout)
+			if err == nil || !strings.Contains(err.Error(), "schema") {
+				t.Fatalf("runBrowserDiagnostic error = %v, want schema rejection", err)
+			}
+			if stdout.Len() != 0 {
+				t.Fatalf("schema-invalid artifact was written: %s", stdout.String())
+			}
+		})
+	}
+}
+
+func repeatedStrings(value string, count int) []any {
+	values := make([]any, count)
+	for i := range values {
+		values[i] = value
+	}
+	return values
+}
+
+func validBrowserDiagnosticArtifact() map[string]any {
+	return map[string]any{
+		"target_url":       "https://93.184.216.34/probe",
+		"final_url":        "https://93.184.216.34/probe",
+		"posted_to_origin": true,
+		"post_error":       "",
+		"browser_signals": map[string]any{
+			"navigator": map[string]any{
+				"webdriver":               false,
+				"user_agent":              "Mozilla/5.0 Chrome/140",
+				"user_agent_data":         map[string]any{"brands": []any{}, "mobile": false, "platform": "Linux"},
+				"user_agent_high_entropy": nil,
+				"language":                "en-US",
+				"languages":               []any{"en-US"},
+				"platform":                "Linux x86_64",
+				"hardware_concurrency":    nil,
+				"device_memory":           nil,
+				"max_touch_points":        nil,
+				"plugins":                 map[string]any{"length": 0, "names": []any{}},
+				"mime_types":              map[string]any{"length": 0, "names": []any{}},
+			},
+			"window": map[string]any{
+				"outer_width": nil, "outer_height": nil, "inner_width": nil, "inner_height": nil,
+				"device_pixel_ratio": nil, "chrome_runtime_present": true, "prefers_color_scheme_dark": nil,
+			},
+			"automation": map[string]any{"playwright_binding_present": false, "playwright_init_scripts_present": false},
+			"screen": map[string]any{
+				"width": nil, "height": nil, "avail_width": nil, "avail_height": nil, "color_depth": nil, "pixel_depth": nil,
+			},
+			"document": map[string]any{"cookie_present": false, "cookie_length": 0, "visibility_state": "visible", "has_focus": true},
+			"intl":     map[string]any{"timezone": "UTC"},
+			"webgl":    map[string]any{"available": false},
+		},
+	}
+}
+
+func writeValidBrowserDiagnosticFixture(t *testing.T, rawURL string, mutate ...func(map[string]any)) string {
+	t.Helper()
+	artifact := validBrowserDiagnosticArtifact()
+	artifact["target_url"] = rawURL
+	artifact["final_url"] = rawURL
+	for _, apply := range mutate {
+		apply(artifact)
+	}
+	data, err := json.Marshal(artifact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "browser-diagnostic.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func TestPluginManifestsExposeProviderContract(t *testing.T) {
@@ -284,6 +481,22 @@ func TestMainRunsBrowserDiagnosticWithFakePlaywright(t *testing.T) {
 global.navigator = {};
 Object.defineProperty(global.navigator, 'webdriver', { configurable: true, get: () => true });
 Object.defineProperty(global.navigator, 'userAgent', { configurable: true, get: () => 'Fake Chrome' });
+Object.defineProperty(global.navigator, 'userAgentData', { configurable: true, get: () => ({
+  brands: [{ brand: 'Chromium', version: '150' }, { brand: 'Google Chrome', version: '150' }],
+  mobile: false,
+  platform: 'Linux',
+  getHighEntropyValues: async () => ({
+    architecture: 'x86',
+    bitness: '64',
+    brands: [{ brand: 'Chromium', version: '150.0.0.0' }, { brand: 'Google Chrome', version: '150.0.7871.114' }],
+    mobile: false,
+    model: '',
+    platform: 'Linux',
+    platformVersion: '6.12.0',
+    uaFullVersion: '150.0.7871.114',
+    fullVersionList: [{ brand: 'Chromium', version: '150.0.7871.114' }, { brand: 'Google Chrome', version: '150.0.7871.114' }],
+  }),
+}) });
 Object.defineProperty(global.navigator, 'language', { configurable: true, get: () => 'en-US' });
 Object.defineProperty(global.navigator, 'languages', { configurable: true, get: () => ['en-US', 'en'] });
 Object.defineProperty(global.navigator, 'platform', { configurable: true, get: () => 'Linux x86_64' });
@@ -345,6 +558,20 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	code := Main([]string{"--browser-diagnostic-url", "https://93.184.216.34/capture"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("diagnostic failed with code %d stderr=%s", code, stderr.String())
+	}
+	compiler := jsonschema.NewCompiler()
+	compiler.AssertFormat()
+	schemaPath := filepath.Join("..", "..", "schemas", "browser-diagnostic-result.schema.json")
+	schema, err := compiler.Compile(schemaPath)
+	if err != nil {
+		t.Fatalf("compile browser diagnostic schema: %v", err)
+	}
+	var diagnosticArtifact any
+	if err := json.Unmarshal(stdout.Bytes(), &diagnosticArtifact); err != nil {
+		t.Fatalf("decode browser diagnostic artifact: %v", err)
+	}
+	if err := schema.Validate(diagnosticArtifact); err != nil {
+		t.Fatalf("provider browser diagnostic violates published artifact schema: %v\nstdout=%s", err, stdout.String())
 	}
 
 	var got struct {
@@ -514,8 +741,8 @@ exit 1
 	if !strings.Contains(err.Error(), "browser diagnostic failed") {
 		t.Fatalf("error = %v", err)
 	}
-	if !strings.Contains(stdout.String(), `"posted_to_origin": true`) {
-		t.Fatalf("diagnostic output was not preserved: %s", stdout.String())
+	if stdout.Len() != 0 {
+		t.Fatalf("nonzero browser teardown wrote a successful artifact: %s", stdout.String())
 	}
 }
 
@@ -572,6 +799,53 @@ func TestNativeChromeScriptLaunchesInstalledChromeAndConnectsOverCDP(t *testing.
 	}
 }
 
+func TestNativeChromeScriptUsesStableLinuxProcessGroupSupervisor(t *testing.T) {
+	for _, required := range []string{
+		"linuxChromeSupervisorScript",
+		`"trap '' TERM HUP"`,
+		"readLinuxChromeBrowserPID(chrome",
+		"captureChromeBrowserProcessIdentity(chrome)",
+		"stat.processGroupID !== chrome.pid",
+		"Number(browserProcesses[0].id) !== chrome.browserPID",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Errorf("Linux Chrome supervisor contract missing %q", required)
+		}
+	}
+}
+
+func TestLinuxChromeSupervisorRestoresChildSignalDefaults(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux process signal contract")
+	}
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const chrome = spawnChromeProcess('/bin/sleep', ['3600']);
+  chrome.chromeExit = null;
+  chrome.once('exit', (code, signal) => { chrome.chromeExit = { code, signal }; });
+  try {
+    captureChromeProcessIdentity(chrome);
+    chrome.browserPID = await readLinuxChromeBrowserPID(chrome, 1000);
+    captureChromeBrowserProcessIdentity(chrome);
+    process.kill(chrome.browserPID, 'SIGTERM');
+    const deadline = monotonicMilliseconds() + 1000;
+    while (chromeBrowserProcessAlive(chrome) && monotonicMilliseconds() < deadline) await delay(25);
+    if (chromeBrowserProcessAlive(chrome)) throw new Error('browser child inherited ignored SIGTERM');
+    if (!chromeProcessAlive(chrome)) throw new Error('stable supervisor exited with browser child');
+    process.stdout.write('child terminated; supervisor stable');
+  } finally {
+    try { process.kill(-chrome.pid, 'SIGKILL'); } catch (err) {
+      if (!err || err.code !== 'ESRCH') throw err;
+    }
+    await waitForChromeExit(chrome, 1000);
+  }
+})().catch((err) => { console.error(err); process.exit(1); });
+`)
+	if err != nil || stdout.String() != "child terminated; supervisor stable" {
+		t.Fatalf("child signal defaults were not restored: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
 func TestBrowserScriptRequiresSelectedOwnedChromeEndpoint(t *testing.T) {
 	for _, required := range []string{
 		"net.createServer()",
@@ -613,7 +887,7 @@ func TestNativeChromeScriptFailsClosedWhenAttachedProcessOwnershipDiffers(t *tes
 	for _, required := range []string{
 		"if (!chromeProcessAlive(chrome))",
 		"processes.filter((entry) => entry.type === 'browser')",
-		"Number(browserProcesses[0].id) !== chrome.pid",
+		"Number(browserProcesses[0].id) !== chrome.browserPID",
 		"attached CDP browser is not the spawned Chrome child",
 	} {
 		if !strings.Contains(playwrightBrowserPrelude, required) {
@@ -640,7 +914,7 @@ func TestChromeEndpointReadyRejectsMalformedVersion(t *testing.T) {
 	}
 	stdout, stderr, err := runBrowserPreludeSnippet(t, fmt.Sprintf(`
 (async () => {
-  if (await chromeEndpointReady(%d, Date.now() + 1000)) throw new Error('malformed endpoint was accepted');
+  if (await chromeEndpointReady(%d, monotonicMilliseconds() + 1000)) throw new Error('malformed endpoint was accepted');
   process.stdout.write('rejected');
 })().catch((err) => { console.error(err); process.exit(1); });
 `, port))
@@ -676,7 +950,7 @@ func TestChromeEndpointReadyHasAbsoluteDeadlineAgainstSlowDrip(t *testing.T) {
 	started := time.Now()
 	stdout, stderr, err := runBrowserPreludeSnippet(t, fmt.Sprintf(`
 (async () => {
-  if (await chromeEndpointReady(%d, Date.now() + 300)) throw new Error('slow endpoint was accepted');
+  if (await chromeEndpointReady(%d, monotonicMilliseconds() + 300)) throw new Error('slow endpoint was accepted');
   process.stdout.write('bounded');
 })().catch((err) => { console.error(err); process.exit(1); });
 `, port))
@@ -704,6 +978,18 @@ process.stdout.write('propagated');
 `)
 	if err != nil || stdout.String() != "propagated" {
 		t.Fatalf("process permission check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestBrowserPreludeDefinesSharedErrorFormatter(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+if (diagnosticErrorToken(new Error('diagnostic failed')) !== 'diagnostic_failed') {
+  throw new Error('shared diagnostic error formatter is unavailable');
+}
+process.stdout.write('formatted');
+`)
+	if err != nil || stdout.String() != "formatted" {
+		t.Fatalf("shared browser error formatter failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 	}
 }
 
@@ -738,8 +1024,8 @@ const nativeReadFileSync = fs.readFileSync;
 const nativeReaddirSync = fs.readdirSync;
 fs.readdirSync = (path, ...args) => String(path) === '/proc' ? ['10', '11'] : nativeReaddirSync(path, ...args);
 fs.readFileSync = (path, ...args) => {
-  if (String(path) === '/proc/10/stat') return '10 (runner) S 1 0 0 0 0';
-  if (String(path) === '/proc/11/stat') return '11 (chrome) S 1 54321 54321 0 0';
+  if (String(path) === '/proc/10/stat') return '10 (runner) S 1 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 100';
+  if (String(path) === '/proc/11/stat') return '11 (chrome) S 1 54321 54321 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 200';
   return nativeReadFileSync(path, ...args);
 };
 try {
@@ -755,6 +1041,386 @@ process.stdout.write('ignored');
 `)
 	if err != nil || stdout.String() != "ignored" {
 		t.Fatalf("namespace-relative process-group check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestLinuxProcessGroupMembersRetriesTransientMalformedStat(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+const nativeReaddirSync = fs.readdirSync;
+let reads = 0;
+fs.readdirSync = (path, ...args) => String(path) === '/proc' ? ['10'] : nativeReaddirSync(path, ...args);
+fs.readFileSync = (path, ...args) => {
+  if (String(path) !== '/proc/10/stat') return nativeReadFileSync(path, ...args);
+  reads++;
+  if (reads === 1) return '10 (chrome) S 1 543';
+  return '10 (chrome) S 1 54321 54321 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 200';
+};
+try {
+  const members = linuxProcessGroupMembers(54321);
+  if (reads !== 2 || members.size !== 1 || members.get(10) !== 'S') {
+    throw new Error('transient procfs stat was not retried');
+  }
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+  fs.readdirSync = nativeReaddirSync;
+}
+process.stdout.write('retried');
+`)
+	if err != nil || stdout.String() != "retried" {
+		t.Fatalf("transient malformed procfs stat check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestLinuxProcessGroupMembersRejectsPersistentlyMalformedStat(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+const nativeReaddirSync = fs.readdirSync;
+let reads = 0;
+fs.readdirSync = (path, ...args) => String(path) === '/proc' ? ['10'] : nativeReaddirSync(path, ...args);
+fs.readFileSync = (path, ...args) => {
+  if (String(path) !== '/proc/10/stat') return nativeReadFileSync(path, ...args);
+  reads++;
+  return '10 (chrome) S 1 543';
+};
+try {
+  linuxProcessGroupMembers(54321);
+  throw new Error('persistently malformed procfs stat was accepted');
+} catch (err) {
+  if (!String(err && err.message || err).includes('malformed procfs process group') || reads !== 3) throw err;
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+  fs.readdirSync = nativeReaddirSync;
+}
+process.stdout.write('rejected');
+`)
+	if err != nil || stdout.String() != "rejected" {
+		t.Fatalf("persistent malformed procfs stat check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestLinuxProcessStatTreatsDisappearanceAfterMalformedReadAsExited(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+let reads = 0;
+fs.readFileSync = (path, ...args) => {
+  if (String(path) !== '/proc/10/stat') return nativeReadFileSync(path, ...args);
+  reads++;
+  if (reads === 1) return '10 (chrome) S 1 10';
+  const err = new Error('gone');
+  err.code = 'ENOENT';
+  throw err;
+};
+try {
+  if (linuxProcessStat(10) !== null || reads !== 2) throw new Error('disappeared process was not treated as exited');
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+}
+process.stdout.write('exited');
+`)
+	if err != nil || stdout.String() != "exited" {
+		t.Fatalf("malformed-to-ENOENT procfs transition failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestLinuxProcessStatPropagatesPermissionErrorAfterMalformedRead(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+let reads = 0;
+fs.readFileSync = (path, ...args) => {
+  if (String(path) !== '/proc/10/stat') return nativeReadFileSync(path, ...args);
+  reads++;
+  if (reads === 1) return '10 (chrome) S 1 10';
+  const err = new Error('denied');
+  err.code = 'EACCES';
+  throw err;
+};
+try {
+  linuxProcessStat(10);
+  throw new Error('procfs permission error was swallowed');
+} catch (err) {
+  if (!err || err.code !== 'EACCES' || reads !== 2) throw err;
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+}
+process.stdout.write('propagated');
+`)
+	if err != nil || stdout.String() != "propagated" {
+		t.Fatalf("malformed-to-EACCES procfs transition failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestSignalChromeProcessBoundaryRejectsReusedLeaderPID(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+const nativeKill = process.kill;
+const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+let signals = 0;
+Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+fs.readFileSync = (path, ...args) => String(path) === '/proc/10/stat'
+  ? '10 (other) S 1 10 10 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 200'
+  : nativeReadFileSync(path, ...args);
+process.kill = () => { signals++; return true; };
+try {
+  signalChromeProcessBoundary({ pid: 10, chromeExit: { code: 0 }, linuxStartTime: '100' }, 'SIGKILL');
+  throw new Error('reused Chrome leader PID was signaled');
+} catch (err) {
+  if (!String(err && err.message || err).includes('Chrome process identity changed') || signals !== 0) throw err;
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+  process.kill = nativeKill;
+  Object.defineProperty(process, 'platform', nativePlatform);
+}
+process.stdout.write('rejected');
+`)
+	if err != nil || stdout.String() != "rejected" {
+		t.Fatalf("reused Chrome leader PID check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestSignalChromeProcessBoundaryRejectsMissingLinuxIdentity(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeKill = process.kill;
+const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+let signals = 0;
+Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+process.kill = () => { signals++; return true; };
+try {
+  signalChromeProcessBoundary({ pid: 10, chromeExit: null }, 'SIGKILL');
+  throw new Error('Chrome group without a captured identity was signaled');
+} catch (err) {
+  if (!String(err && err.message || err).includes('Chrome process identity is unavailable') || signals !== 0) throw err;
+} finally {
+  process.kill = nativeKill;
+  Object.defineProperty(process, 'platform', nativePlatform);
+}
+process.stdout.write('rejected');
+`)
+	if err != nil || stdout.String() != "rejected" {
+		t.Fatalf("missing Chrome identity check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestSignalChromeProcessBoundaryRejectsDisappearedCapturedLeader(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+const nativeKill = process.kill;
+const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+let signals = 0;
+Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+fs.readFileSync = (path, ...args) => {
+  if (String(path) === '/proc/10/stat') { const err = new Error('gone'); err.code = 'ENOENT'; throw err; }
+  return nativeReadFileSync(path, ...args);
+};
+process.kill = () => { signals++; return true; };
+try {
+  signalChromeProcessBoundary({ pid: 10, chromeExit: { code: 0 }, linuxStartTime: '100' }, 'SIGKILL');
+  throw new Error('Chrome group with a disappeared leader was signaled');
+} catch (err) {
+  if (!String(err && err.message || err).includes('Chrome process identity is unavailable') || signals !== 0) throw err;
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+  process.kill = nativeKill;
+  Object.defineProperty(process, 'platform', nativePlatform);
+}
+process.stdout.write('rejected');
+`)
+	if err != nil || stdout.String() != "rejected" {
+		t.Fatalf("disappeared Chrome leader check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestCaptureChromeProcessIdentityRecordsLinuxStartTime(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+fs.readFileSync = (path, ...args) => String(path) === '/proc/10/stat'
+  ? '10 (chrome) S 1 10 10 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 100'
+  : nativeReadFileSync(path, ...args);
+try {
+  const chrome = { pid: 10, chromeExit: null };
+  captureChromeProcessIdentity(chrome);
+  if (chrome.linuxStartTime !== '100') throw new Error('Linux Chrome start time was not captured');
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+  Object.defineProperty(process, 'platform', nativePlatform);
+}
+process.stdout.write('captured');
+`)
+	if err != nil || stdout.String() != "captured" {
+		t.Fatalf("Chrome process identity capture failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestCaptureChromeProcessIdentityRequiresDedicatedProcessGroup(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+fs.readFileSync = (path, ...args) => String(path) === '/proc/10/stat'
+  ? '10 (chrome) S 1 9 9 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 100'
+  : nativeReadFileSync(path, ...args);
+try {
+  captureChromeProcessIdentity({ pid: 10, chromeExit: null });
+  throw new Error('Chrome outside its dedicated process group was accepted');
+} catch (err) {
+  if (!String(err && err.message || err).includes('dedicated Linux process group')) throw err;
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+  Object.defineProperty(process, 'platform', nativePlatform);
+}
+process.stdout.write('rejected');
+`)
+	if err != nil || stdout.String() != "rejected" {
+		t.Fatalf("Chrome process-group identity check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestKillFreshChromeProcessBoundaryConsumesSpawnMarker(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeKill = process.kill;
+const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+const signals = [];
+Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+process.kill = (target, signal) => { signals.push(target + ':' + signal); return true; };
+try {
+  const chrome = { pid: 10, linuxFreshProcessBoundary: true };
+  if (!killFreshChromeProcessBoundary(chrome)) throw new Error('fresh Chrome boundary was not killed');
+  if (chrome.linuxFreshProcessBoundary !== false) throw new Error('fresh Chrome marker was not consumed');
+  try {
+    killFreshChromeProcessBoundary(chrome);
+    throw new Error('consumed fresh Chrome marker was reused');
+  } catch (err) {
+    if (!String(err && err.message || err).includes('fresh Chrome process boundary is unavailable')) throw err;
+  }
+  if (signals.join(',') !== '-10:SIGKILL') throw new Error('fresh Chrome signals: ' + signals.join(','));
+} finally {
+  process.kill = nativeKill;
+  Object.defineProperty(process, 'platform', nativePlatform);
+}
+process.stdout.write('consumed');
+`)
+	if err != nil || stdout.String() != "consumed" {
+		t.Fatalf("fresh Chrome process-boundary cleanup failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestCaptureChromeProcessIdentityOrAbortKillsFreshGroupOnCaptureFailure(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const nativeKill = process.kill;
+  const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  const signals = [];
+  let resolveExit;
+  const chrome = {
+    pid: 10,
+    chromeExit: null,
+    linuxFreshProcessBoundary: true,
+    exited: new Promise((resolve) => { resolveExit = resolve; }),
+  };
+  Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+  linuxProcessStat = () => { throw new Error('procfs identity capture failed'); };
+  process.kill = (target, signal) => {
+    signals.push(target + ':' + signal);
+    chrome.chromeExit = { code: null, signal };
+    resolveExit();
+    return true;
+  };
+  try {
+    await captureChromeProcessIdentityOrAbort(chrome, 50);
+    throw new Error('Chrome identity capture failure was swallowed');
+  } catch (err) {
+    if (!String(err && err.message || err).includes('procfs identity capture failed')) throw err;
+    await terminateChromeChild(chrome, 50);
+    if (signals.join(',') !== '-10:SIGKILL') throw new Error('capture abort signals: ' + signals.join(','));
+    if (chrome.linuxFreshProcessBoundary !== false || chrome.chromeExit === null) {
+      throw new Error('fresh Chrome group was not consumed and reaped');
+    }
+  } finally {
+    process.kill = nativeKill;
+    Object.defineProperty(process, 'platform', nativePlatform);
+  }
+  process.stdout.write('killed and propagated');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil || stdout.String() != "killed and propagated" {
+		t.Fatalf("fresh Chrome identity-capture abort failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestChromeProcessAliveRejectsReusedLinuxPID(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+const nativeKill = process.kill;
+const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+fs.readFileSync = (path, ...args) => String(path) === '/proc/10/stat'
+  ? '10 (other) S 1 10 10 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0 200'
+  : nativeReadFileSync(path, ...args);
+process.kill = () => true;
+try {
+  chromeProcessAlive({ pid: 10, chromeExit: null, linuxStartTime: '100' });
+  throw new Error('reused Linux Chrome PID was reported alive');
+} catch (err) {
+  if (!String(err && err.message || err).includes('Chrome process identity changed')) throw err;
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+  process.kill = nativeKill;
+  Object.defineProperty(process, 'platform', nativePlatform);
+}
+process.stdout.write('rejected');
+`)
+	if err != nil || stdout.String() != "rejected" {
+		t.Fatalf("reused Chrome liveness check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestWaitForChromeEndpointChecksIdentityBeforeListenerOwnership(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  let ownershipChecks = 0;
+  chromeProcessAlive = () => { throw new Error('Chrome process identity changed'); };
+  ownsChromeListeningPort = () => { ownershipChecks++; return true; };
+  try {
+    await waitForChromeEndpoint({ pid: 10, chromeExit: null, startError: null }, 9222);
+    throw new Error('stale Chrome identity was accepted');
+  } catch (err) {
+    if (!String(err && err.message || err).includes('Chrome process identity changed')) throw err;
+    if (ownershipChecks !== 0) throw new Error('listener ownership was checked before Chrome identity');
+  }
+  process.stdout.write('identity first');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil || stdout.String() != "identity first" {
+		t.Fatalf("Chrome endpoint identity ordering failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestReadLinuxChromeBrowserPIDHandlesChunkedSupervisorLine(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const { PassThrough } = require('stream');
+  const supervisorOutput = new PassThrough();
+  const reading = readLinuxChromeBrowserPID({ stdout: supervisorOutput }, 100);
+  supervisorOutput.write('12');
+  supervisorOutput.write('345\n');
+  const browserPID = await reading;
+  if (browserPID !== 12345) throw new Error('browser PID = ' + browserPID);
+  process.stdout.write('parsed');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil || stdout.String() != "parsed" {
+		t.Fatalf("Linux Chrome supervisor PID parse failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 	}
 }
 
@@ -816,7 +1482,7 @@ func TestBrowserScriptTerminatesDedicatedChromeProcessGroupWithoutProcfsTree(t *
 	}
 	stdout, stderr, err := runBrowserPreludeSnippet(t, `
 (async () => {
-  const parentProgram = "const { spawn } = require('child_process'); const child = spawn('/bin/sh', ['-c', \"trap '' TERM HUP; sleep 30 & wait\"], { stdio: 'ignore' }); process.stdout.write(String(child.pid) + '\\n'); setInterval(() => {}, 1000);";
+	  const parentProgram = "process.on('SIGTERM', () => {}); process.on('SIGHUP', () => {}); const { spawn } = require('child_process'); const child = spawn('/bin/sh', ['-c', \"trap '' TERM HUP; sleep 30 & wait\"], { stdio: 'ignore' }); process.stdout.write(String(child.pid) + '\\n'); setInterval(() => {}, 1000);";
   const chrome = spawn(process.execPath, ['-e', parentProgram], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
   chrome.chromeExit = null;
   chrome.startError = null;
@@ -826,33 +1492,107 @@ func TestBrowserScriptTerminatesDedicatedChromeProcessGroupWithoutProcfsTree(t *
   });
   const processGroupID = chrome.pid;
   const nativeReadFileSync = fs.readFileSync;
-  const childPID = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('test child PID timed out')), 1000);
-    chrome.stdout.once('data', (chunk) => {
-      clearTimeout(timer);
-      resolve(Number(String(chunk).trim()));
-    });
-  });
-  const stat = nativeReadFileSync('/proc/' + childPID + '/stat', 'utf8');
-  const close = stat.lastIndexOf(')');
-  const fields = stat.slice(close + 2).trim().split(/\s+/);
-  if (Number(fields[2]) !== processGroupID) throw new Error('test child did not inherit dedicated process group');
-  fs.readFileSync = (path, ...args) => String(path).includes('/children') ? '' : nativeReadFileSync(path, ...args);
+  let childPID = 0;
   try {
+    const leaderStat = linuxProcessStat(processGroupID);
+    chrome.linuxStartTime = leaderStat.startTime;
+    childPID = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('test child PID timed out')), 1000);
+      chrome.stdout.once('data', (chunk) => {
+        clearTimeout(timer);
+        resolve(Number(String(chunk).trim()));
+      });
+    });
+    const stat = nativeReadFileSync('/proc/' + childPID + '/stat', 'utf8');
+    const close = stat.lastIndexOf(')');
+    const fields = stat.slice(close + 2).trim().split(/\s+/);
+    if (Number(fields[2]) !== processGroupID) throw new Error('test child did not inherit dedicated process group');
+    let transientStatInjected = false;
+    fs.readFileSync = (path, ...args) => {
+      if (String(path).includes('/children')) return '';
+      if (!transientStatInjected && String(path) === '/proc/' + processGroupID + '/stat') {
+        transientStatInjected = true;
+        return processGroupID + ' (leader) S 1 ' + processGroupID;
+      }
+      return nativeReadFileSync(path, ...args);
+    };
     await terminateChromeChild(chrome, 250);
+    if (!transientStatInjected) throw new Error('transient process-group stat was not exercised');
     if (processIsRunning(childPID)) throw new Error('dedicated Chrome child survived cleanup');
     for (const state of linuxProcessGroupMembers(processGroupID).values()) {
       if (state !== 'Z') throw new Error('live dedicated Chrome process-group member survived cleanup');
     }
   } finally {
     fs.readFileSync = nativeReadFileSync;
-    try { process.kill(-processGroupID, 'SIGKILL'); } catch {}
+    try { signalChromeProcessBoundary(chrome, 'SIGKILL'); } catch {}
   }
   process.stdout.write('group reaped');
 })().catch((err) => { console.error(err); process.exit(1); });
 `)
 	if err != nil || stdout.String() != "group reaped" {
 		t.Fatalf("dedicated process-group cleanup failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestBrowserScriptKillsCapturedGroupAndFailsOnPersistentProcfsUncertainty(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("dedicated Chrome process-group cleanup is Linux-specific")
+	}
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+	  const parentProgram = "process.on('SIGTERM', () => {}); process.on('SIGHUP', () => {}); const { spawn } = require('child_process'); const child = spawn('/bin/sh', ['-c', \"trap '' TERM HUP; sleep 30 & wait\"], { stdio: 'ignore' }); process.stdout.write(String(child.pid) + '\\n'); setInterval(() => {}, 1000);";
+  const chrome = spawn(process.execPath, ['-e', parentProgram], { detached: true, stdio: ['ignore', 'pipe', 'ignore'] });
+  chrome.chromeExit = null;
+  chrome.startError = null;
+  chrome.exited = new Promise((resolve) => {
+    chrome.once('error', (err) => { chrome.startError = err; chrome.chromeExit = { code: null, signal: null, spawnError: true }; resolve(); });
+    chrome.once('exit', (code, signal) => { chrome.chromeExit = { code, signal }; resolve(); });
+  });
+  const processGroupID = chrome.pid;
+  const nativeReadFileSync = fs.readFileSync;
+  let childPID = 0;
+  try {
+    const leaderStat = linuxProcessStat(processGroupID);
+    chrome.linuxStartTime = leaderStat.startTime;
+    childPID = await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('test child PID timed out')), 1000);
+      chrome.stdout.once('data', (chunk) => {
+        clearTimeout(timer);
+        resolve(Number(String(chunk).trim()));
+      });
+    });
+    let leaderStatReads = 0;
+    fs.readFileSync = (path, ...args) => {
+      if (String(path) === '/proc/' + processGroupID + '/stat') {
+        leaderStatReads++;
+        if (leaderStatReads >= 2 && leaderStatReads <= 4) {
+          return processGroupID + ' (leader) S 1 ' + processGroupID;
+        }
+      }
+      return nativeReadFileSync(path, ...args);
+    };
+    let cleanupError;
+    try {
+      await terminateChromeChild(chrome, 250);
+    } catch (err) {
+      cleanupError = err;
+    }
+    fs.readFileSync = nativeReadFileSync;
+    if (!cleanupError || !String(cleanupError.message || cleanupError).includes('malformed procfs process group')) {
+      throw new Error('persistent procfs uncertainty was not propagated');
+    }
+    if (processIsRunning(childPID)) throw new Error('captured Chrome child survived uncertain cleanup');
+    for (const state of linuxProcessGroupMembers(processGroupID).values()) {
+      if (state !== 'Z') throw new Error('live captured Chrome process-group member survived uncertain cleanup');
+    }
+  } finally {
+    try { signalChromeProcessBoundary(chrome, 'SIGKILL'); } catch {}
+  }
+  process.stdout.write('killed and failed');
+})().catch((err) => { console.error(err); process.exit(1); });
+`)
+	if err != nil || stdout.String() != "killed and failed" {
+		t.Fatalf("persistent procfs cleanup check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 	}
 }
 
@@ -1043,7 +1783,8 @@ func TestBrowserProcessScriptTerminatesChromeChildOnSignals(t *testing.T) {
 		"process.once('SIGTERM'",
 		"process.once('SIGINT'",
 		"await terminateChromeChild(activeChromeChild",
-		"detached: process.platform === 'linux'",
+		"product-capture-chrome-supervisor",
+		"detached: true",
 		"process.kill(target, signal)",
 		"process.exit(exitCode)",
 	} {
@@ -1204,6 +1945,114 @@ func TestBrowserScriptCleanupAttemptsTerminationAndPropagatesFailures(t *testing
 	}
 }
 
+func TestBrowserScriptCleanupKillsCapturedGroupAfterInspectionFailure(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const nativeKill = process.kill;
+  const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  const signals = [];
+  let boundaryChecks = 0;
+  let identityChecks = 0;
+  let resolveExit;
+  const chrome = {
+    pid: 10,
+    chromeExit: null,
+    linuxStartTime: '100',
+    exited: new Promise((resolve) => { resolveExit = resolve; }),
+  };
+  Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+  process.kill = (target, signal) => {
+    signals.push(target + ':' + signal);
+    if (signal === 'SIGKILL') {
+      chrome.chromeExit = { code: null, signal };
+      resolveExit();
+    }
+    return true;
+  };
+  chromeProcessBoundaryAlive = () => {
+    boundaryChecks++;
+    if (boundaryChecks === 1) return true;
+    throw new Error('procfs inspection failed');
+  };
+  linuxProcessStat = () => {
+    identityChecks++;
+    return { state: 'S', processGroupID: 10, startTime: '100' };
+  };
+  chromeProcessBoundaryAliveAfterKill = () => false;
+  try {
+    await terminateChromeChild(chrome, 50);
+    throw new Error('uncertain cleanup unexpectedly succeeded');
+  } catch (err) {
+    if (!String(err && err.message || err).includes('procfs inspection failed')) throw err;
+    if (signals.join(',') !== '-10:SIGTERM,-10:SIGKILL') {
+      throw new Error('cleanup signals: ' + signals.join(','));
+    }
+    if (identityChecks !== 2) throw new Error('fallback SIGKILL skipped captured identity validation');
+    if (chrome.chromeExit === null) throw new Error('Chrome leader was not reaped after fallback SIGKILL');
+  } finally {
+    process.kill = nativeKill;
+    Object.defineProperty(process, 'platform', nativePlatform);
+  }
+  process.stdout.write('killed and failed closed');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil || stdout.String() != "killed and failed closed" {
+		t.Fatalf("uncertain process-group cleanup failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestBrowserScriptCleanupNeverFallbackKillsReusedGroup(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const nativeKill = process.kill;
+  const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  const signals = [];
+  let statReads = 0;
+  let resolveExit;
+  const chrome = {
+    pid: 10,
+    chromeExit: null,
+    linuxStartTime: '100',
+    exited: new Promise((resolve) => { resolveExit = resolve; }),
+  };
+  Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+  process.kill = (_target, signal) => {
+    if (signal) signals.push(signal);
+    if (signal === 'SIGKILL') {
+      chrome.chromeExit = { code: null, signal };
+      resolveExit();
+    }
+    return true;
+  };
+  linuxProcessStat = () => {
+    statReads++;
+    return { state: 'S', processGroupID: 10, startTime: statReads === 1 ? '100' : '200' };
+  };
+  linuxProcessGroupMembers = () => new Map([[10, 'S']]);
+  try {
+    await terminateChromeChild(chrome, 50);
+    throw new Error('reused process group was accepted');
+  } catch (err) {
+    if (!String(err && err.message || err).includes('Chrome process identity changed')) throw err;
+    if (signals.join(',') !== 'SIGTERM') throw new Error('reused group cleanup signals: ' + signals.join(','));
+  } finally {
+    process.kill = nativeKill;
+    Object.defineProperty(process, 'platform', nativePlatform);
+  }
+  process.stdout.write('reused group preserved');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil || stdout.String() != "reused group preserved" {
+		t.Fatalf("reused process-group cleanup failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
 func TestBrowserScriptCleanupPreservesPrimaryOperationFailure(t *testing.T) {
 	stdout, stderr, err := runBrowserPreludeSnippet(t, `
 (async () => {
@@ -1277,6 +2126,7 @@ func TestBrowserScriptCleanupClearsCloseTimeout(t *testing.T) {
   const chrome = {
     pid: 123,
     chromeExit: { code: 0, signal: null },
+    linuxProcessBoundaryTerminated: true,
     exited: Promise.resolve(),
     kill: () => { throw new Error('already-exited Chrome should not be signaled'); },
   };
@@ -1361,6 +2211,107 @@ func TestBrowserScriptTerminationClearsGraceTimerAfterPromptExit(t *testing.T) {
 	}
 }
 
+func TestBrowserScriptTerminationUsesMonotonicDeadline(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const nativeDateNow = Date.now;
+  const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  const nativeDelay = delay;
+  const signals = [];
+  let boundaryAlive = true;
+  let delayCalls = 0;
+  let resolveExit;
+  const chrome = {
+    pid: 10,
+    chromeExit: null,
+    linuxStartTime: '100',
+    exited: new Promise((resolve) => { resolveExit = resolve; }),
+  };
+  Date.now = () => 0;
+  Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+  delay = async (milliseconds) => {
+    delayCalls++;
+    if (delayCalls > 10) throw new Error('process cleanup deadline used frozen wall clock');
+    await nativeDelay(Math.min(milliseconds, 5));
+  };
+  chromeProcessBoundaryAlive = () => boundaryAlive;
+  chromeProcessBoundaryAliveAfterKill = () => boundaryAlive;
+  signalChromeProcessBoundary = (_chrome, signal) => {
+    signals.push(signal);
+    if (signal === 'SIGKILL') {
+      boundaryAlive = false;
+      chrome.chromeExit = { code: null, signal };
+      resolveExit();
+    }
+    return true;
+  };
+  try {
+    await terminateChromeChild(chrome, 20);
+    if (signals.join(',') !== 'SIGTERM,SIGKILL') throw new Error('cleanup signals: ' + signals.join(','));
+  } finally {
+    Date.now = nativeDateNow;
+    delay = nativeDelay;
+    Object.defineProperty(process, 'platform', nativePlatform);
+  }
+  process.stdout.write('monotonic');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil || stdout.String() != "monotonic" {
+		t.Fatalf("monotonic browser cleanup deadline failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
+func TestBrowserScriptTerminationAcceptsMissingLeaderAfterCheckedKill(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const nativeKill = process.kill;
+  const nativePlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+  let leaderExists = true;
+  let resolveExit;
+  const signals = [];
+  const chrome = {
+    pid: 10,
+    chromeExit: null,
+    linuxStartTime: '100',
+    exited: new Promise((resolve) => { resolveExit = resolve; }),
+  };
+  Object.defineProperty(process, 'platform', { configurable: true, value: 'linux' });
+  process.kill = (_target, signal) => {
+    if (signal) signals.push(signal);
+    if (signal === 'SIGKILL') {
+      leaderExists = false;
+      chrome.chromeExit = { code: null, signal };
+      resolveExit();
+    }
+    return true;
+  };
+  linuxProcessStat = () => leaderExists
+    ? { state: 'S', processGroupID: 10, startTime: '100' }
+    : null;
+  linuxProcessGroupMembers = () => leaderExists
+    ? new Map([[10, 'S'], [11, 'S']])
+    : new Map([[11, 'Z']]);
+  try {
+    await terminateChromeChild(chrome, 0);
+    if (signals.join(',') !== 'SIGTERM,SIGKILL') throw new Error('cleanup signals: ' + signals.join(','));
+  } finally {
+    process.kill = nativeKill;
+    Object.defineProperty(process, 'platform', nativePlatform);
+  }
+  process.stdout.write('reaped after checked kill');
+})().catch((err) => {
+  console.error(err && err.stack ? err.stack : String(err));
+  process.exit(1);
+});
+`)
+	if err != nil || stdout.String() != "reaped after checked kill" {
+		t.Fatalf("post-kill process-group observation failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
 func TestBrowserDiagnosticScriptEnforcesExactOriginAndEphemeralProfile(t *testing.T) {
 	for _, required := range []string{
 		"PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN",
@@ -1381,15 +2332,24 @@ func TestBrowserProcessPolicyHasPlatformBoundedTermination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read Linux browser process policy: %v", err)
 	}
-	otherSource, err := os.ReadFile("browser_process_other.go")
+	unixSource, err := os.ReadFile("browser_process_darwin.go")
 	if err != nil {
-		t.Fatalf("read non-Linux browser process policy: %v", err)
+		t.Fatalf("read Unix browser process policy: %v", err)
+	}
+	windowsSource, err := os.ReadFile("browser_process_windows.go")
+	if err != nil {
+		t.Fatalf("read Windows browser process policy: %v", err)
 	}
 
 	for _, required := range []string{
 		"Setpgid: true",
-		"syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)",
-		"syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)",
+		"identity, exists, err := p.readProcessIdentity(processID)",
+		"identity.processGroupID != processID",
+		"p.signalProcessGroup(processID, syscall.SIGTERM)",
+		"current, exists, err := p.readProcessIdentity(processID)",
+		"current.processGroupID != processID || current.startTime != identity.startTime",
+		"p.signalProcessGroup(processID, syscall.SIGKILL)",
+		"syscall.Kill(-processID, signal)",
 		"if errors.Is(termErr, syscall.ESRCH)",
 	} {
 		if !strings.Contains(string(linuxSource), required) {
@@ -1397,20 +2357,42 @@ func TestBrowserProcessPolicyHasPlatformBoundedTermination(t *testing.T) {
 		}
 	}
 	for _, required := range []string{
-		"//go:build !linux",
-		"runtime.GOOS == \"windows\"",
-		"runBoundedBrowserCleanupCommand(grace, \"taskkill\", \"/PID\"",
-		"\"/T\", \"/F\"",
-		"cmd.Process.Signal(os.Interrupt)",
-		"errors.Is(interruptErr, os.ErrProcessDone)",
-		"cmd.Process.Kill()",
+		"//go:build darwin",
+		"Setpgid: true",
+		"unixProcessIdentity",
+		"readUnixProcessIdentity(processID)",
+		"current.startTime != identity.startTime",
+		"syscall.Kill(-processID, syscall.SIGTERM)",
+		"syscall.Kill(-processID, syscall.SIGKILL)",
+		"requireExitedUnixProcessGroup(processID)",
 	} {
-		if !strings.Contains(string(otherSource), required) {
-			t.Errorf("non-Linux browser process policy missing %q", required)
+		if !strings.Contains(string(unixSource), required) {
+			t.Errorf("Unix browser process policy missing %q", required)
 		}
 	}
-	if strings.Contains(string(otherSource), "return interruptErr") {
-		t.Error("non-Linux browser process policy must still kill when graceful interrupt is unsupported")
+	for _, required := range []string{
+		"//go:build windows",
+		"windowsProcessIdentity",
+		"readWindowsProcessIdentity(processID)",
+		"current.creationTime != identity.creationTime",
+		"runBoundedBrowserCleanupCommand(grace, \"taskkill\", \"/PID\"",
+		"\"/T\", \"/F\"",
+		"cmd.Process.Kill()",
+		"if killErr == nil",
+		"terminate browser process tree: %w",
+		"errors.Join(",
+	} {
+		if !strings.Contains(string(windowsSource), required) {
+			t.Errorf("Windows browser process policy missing %q", required)
+		}
+	}
+	if strings.Contains(string(windowsSource), "if killErr == nil {\n\t\treturn nil") {
+		t.Error("Windows browser process policy must preserve taskkill failure after parent fallback")
+	}
+	for platform, source := range map[string][]byte{"Unix": unixSource, "Windows": windowsSource} {
+		if strings.Contains(string(source), "cmd.ProcessState") {
+			t.Errorf("%s browser process policy reads exec.Cmd.ProcessState concurrently with Wait", platform)
+		}
 	}
 }
 
@@ -1511,13 +2493,15 @@ func TestBrowserDiagnosticForcesEphemeralProfile(t *testing.T) {
 	node := filepath.Join(dir, "node")
 	if err := os.WriteFile(node, []byte(`#!/bin/sh
 printf '%s' "$PRODUCT_CAPTURE_BROWSER_PROFILE_DIR" > "$PRODUCT_CAPTURE_TEST_PROFILE_MARKER"
-printf '{"target_url":"https://93.184.216.34/","final_url":"https://93.184.216.34/","posted_to_origin":true,"post_error":""}'
+/bin/cat "$PRODUCT_CAPTURE_TEST_DIAGNOSTIC_JSON_PATH"
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", stableProfile)
 	t.Setenv("PRODUCT_CAPTURE_TEST_PROFILE_MARKER", marker)
+	t.Setenv("PRODUCT_CAPTURE_TEST_DIAGNOSTIC_JSON_PATH", writeValidBrowserDiagnosticFixture(t, "https://93.184.216.34/"))
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
 
 	if err := runBrowserDiagnostic("https://93.184.216.34/", io.Discard); err != nil {
@@ -1598,6 +2582,7 @@ printf '<html></html>'
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", "https://diagnostic.example")
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", "MAP diagnostic.example 93.184.216.34")
 
@@ -1658,7 +2643,7 @@ func TestBrowserProcessTerminatesAndReapsProcessGroup(t *testing.T) {
 	}
 }
 
-func TestBrowserProcessCommandContextErrorStillCleansReapedGroup(t *testing.T) {
+func TestBrowserProcessCommandContextErrorNeverSignalsReapedGroup(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake browser command uses a POSIX shell")
 	}
@@ -1669,24 +2654,21 @@ func TestBrowserProcessCommandContextErrorStillCleansReapedGroup(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	policy := &recordingBrowserProcessPolicy{terminateErr: errors.New("timeout group cleanup failed")}
+	policy := &recordingBrowserProcessPolicy{terminateErr: errors.New("reaped group must not be signaled")}
 	previousPolicy := browserProcesses
 	browserProcesses = policy
 	t.Cleanup(func() { browserProcesses = previousPolicy })
 
 	err := cleanupBrowserCommandAfterError(ctx, cmd)
-	if policy.terminateCalls != 1 {
-		t.Fatalf("TerminateGroup calls = %d, want 1", policy.terminateCalls)
+	if policy.terminateCalls != 0 {
+		t.Fatalf("TerminateGroup calls = %d, want 0", policy.terminateCalls)
 	}
-	if policy.terminated == nil || policy.terminated.ProcessState == nil || !policy.terminated.ProcessState.Exited() {
-		t.Fatalf("browser command was not reaped before group cleanup: %+v", policy.terminated)
-	}
-	if err == nil || !strings.Contains(err.Error(), "timeout group cleanup failed") {
+	if err != nil {
 		t.Fatalf("cleanup error = %v", err)
 	}
 }
 
-func TestBrowserProcessCommandErrorTerminatesGroupAfterReap(t *testing.T) {
+func TestBrowserProcessCommandErrorNeverTerminatesGroupAfterReap(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake node executable uses a POSIX shell script")
 	}
@@ -1712,24 +2694,18 @@ func TestBrowserProcessCommandErrorTerminatesGroupAfterReap(t *testing.T) {
 	if err == nil {
 		t.Fatal("browser command unexpectedly succeeded")
 	}
-	if policy.terminateCalls != 1 {
-		t.Fatalf("TerminateGroup calls = %d, want 1", policy.terminateCalls)
-	}
-	if policy.terminated == nil || policy.terminated.ProcessState == nil || !policy.terminated.ProcessState.Exited() {
-		t.Fatalf("browser command was not reaped before group cleanup: %+v", policy.terminated)
-	}
-	if policy.grace <= 0 {
-		t.Fatalf("termination grace = %s", policy.grace)
+	if policy.terminateCalls != 0 {
+		t.Fatalf("TerminateGroup calls = %d, want 0", policy.terminateCalls)
 	}
 }
 
-func TestBrowserProcessCommandCleanupFailureIsReturned(t *testing.T) {
+func TestBrowserProcessCommandCancellationReturnsCleanupFailure(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake node executable uses a POSIX shell script")
 	}
 	dir := t.TempDir()
 	node := filepath.Join(dir, "node")
-	if err := os.WriteFile(node, []byte("#!/bin/sh\necho 'node operation failed' >&2\nexit 17\n"), 0o700); err != nil {
+	if err := os.WriteFile(node, []byte("#!/bin/sh\ntrap '' TERM\nwhile :; do :; done\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
@@ -1740,19 +2716,24 @@ func TestBrowserProcessCommandCleanupFailureIsReturned(t *testing.T) {
 	browserProcesses = policy
 	t.Cleanup(func() { browserProcesses = previousPolicy })
 
-	_, err := captureHTMLWithPlaywright(Workload{
-		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
-		AllowedHosts:   []string{"www.amazon.com"},
-		TimeoutSeconds: 1,
-		MaxHTMLBytes:   1024,
-	})
-	if err == nil {
-		t.Fatal("browser command unexpectedly succeeded")
+	ctx, cancel := context.WithCancel(context.Background())
+	cmd := browserNodeCommand(ctx, "ignored.js")
+	defer browserCommandCleanupStates.Delete(cmd)
+	cmd.WaitDelay = 50 * time.Millisecond
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
 	}
-	for _, want := range []string{"node operation failed", "group cleanup failed"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("error = %v, want %q", err, want)
-		}
+	cancel()
+	waitErr := cmd.Wait()
+	err := errors.Join(waitErr, cleanupBrowserCommandAfterError(ctx, cmd))
+	if err == nil || !strings.Contains(err.Error(), "group cleanup failed") {
+		t.Fatalf("error = %v, want cleanup failure", err)
+	}
+	if policy.terminateCalls != 1 {
+		t.Fatalf("TerminateGroup calls = %d, want 1", policy.terminateCalls)
+	}
+	if policy.grace < 2*time.Second {
+		t.Fatalf("outer browser stop grace = %s, want enough time for Node TERM/KILL/reap cleanup", policy.grace)
 	}
 }
 
@@ -2032,26 +3013,16 @@ func TestMainRunsWorkflowComputeBrowserDiagnosticOperation(t *testing.T) {
 	dir := t.TempDir()
 	node := filepath.Join(dir, "node")
 	if err := os.WriteFile(node, []byte(`#!/bin/sh
-printf '%s\n' '{
-  "target_url": "https://93.184.216.34/product-capture-browser",
-  "final_url": "https://93.184.216.34/product-capture-browser",
-  "posted_to_origin": true,
-  "post_error": "",
-  "browser_signals": {
-    "automation": {
-      "playwright_binding_present": true,
-      "playwright_init_scripts_present": false
-    },
-    "document": {
-      "cookie_present": true,
-      "cookie_length": 17
-    }
-  }
-}'
+/bin/cat "$PRODUCT_CAPTURE_TEST_DIAGNOSTIC_JSON_PATH"
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
+	t.Setenv("PRODUCT_CAPTURE_TEST_DIAGNOSTIC_JSON_PATH", writeValidBrowserDiagnosticFixture(t, "https://93.184.216.34/product-capture-browser", func(artifact map[string]any) {
+		automation := artifact["browser_signals"].(map[string]any)["automation"].(map[string]any)
+		automation["playwright_binding_present"] = true
+	}))
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
 	t.Chdir(dir)
 	env := validWorkflowComputeProviderEnvelope(t)
@@ -2079,7 +3050,7 @@ printf '%s\n' '{
 		t.Fatalf("read diagnostic artifact: %v", err)
 	}
 	assertFileMode(t, diagnosticArtifact, 0o644)
-	if !strings.Contains(string(data), `"playwright_binding_present": true`) {
+	if !strings.Contains(string(data), `"playwright_binding_present":true`) {
 		t.Fatalf("diagnostic artifact missing browser automation signal: %s", string(data))
 	}
 	if strings.Contains(string(data), "redacted=value") {
@@ -2437,9 +3408,29 @@ exec "$@"
 	}
 }
 
-func TestCaptureHTMLWithPlaywrightRunsHeadedBrowserDirectlyWhenXvfbUnavailable(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("fake node executable uses a POSIX shell script")
+func TestCaptureHTMLWithPlaywrightRejectsHeadedLinuxWithoutDisplayOrXvfb(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux display preflight contract")
+	}
+	dir := t.TempDir()
+	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "0")
+	t.Setenv("DISPLAY", "")
+
+	_, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err == nil || !strings.Contains(err.Error(), "headed browser requires DISPLAY or xvfb-run on Linux") {
+		t.Fatalf("captureHTMLWithPlaywright error = %v, want missing display provider", err)
+	}
+}
+
+func TestCaptureHTMLWithPlaywrightRunsHeadedBrowserDirectlyOnNativeGUI(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("native GUI direct-launch contract")
 	}
 	dir := t.TempDir()
 	node := filepath.Join(dir, "node")
@@ -2467,6 +3458,30 @@ printf '<html></html>'
 	}
 }
 
+func TestBrowserDisplayPreflightRequiresXvfbOnHeadedLinux(t *testing.T) {
+	missing := func(string) (string, error) { return "", exec.ErrNotFound }
+	if err := browserDisplayPreflight("linux", false, "", missing); err == nil || !strings.Contains(err.Error(), "xvfb-run") {
+		t.Fatalf("headed Linux preflight error = %v, want missing xvfb-run", err)
+	}
+	for _, test := range []struct {
+		name     string
+		goos     string
+		headless bool
+		display  string
+	}{
+		{name: "headless Linux", goos: "linux", headless: true},
+		{name: "existing Linux display", goos: "linux", display: ":99"},
+		{name: "native macOS GUI", goos: "darwin"},
+		{name: "native Windows GUI", goos: "windows"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if err := browserDisplayPreflight(test.goos, test.headless, test.display, missing); err != nil {
+				t.Fatalf("browserDisplayPreflight: %v", err)
+			}
+		})
+	}
+}
+
 func TestRunBrowserDiagnosticRunsHeadedBrowserThroughXvfbWhenNoDisplay(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake node executable uses a POSIX shell script")
@@ -2475,7 +3490,7 @@ func TestRunBrowserDiagnosticRunsHeadedBrowserThroughXvfbWhenNoDisplay(t *testin
 	node := filepath.Join(dir, "node")
 	if err := os.WriteFile(node, []byte(`#!/bin/sh
 [ "$PRODUCT_CAPTURE_XVFB_WRAPPED" = "1" ] || { echo "node was not launched through xvfb-run" >&2; exit 25; }
-printf '{"target_url":"https://93.184.216.34/","final_url":"https://93.184.216.34/"}'
+/bin/cat "$PRODUCT_CAPTURE_TEST_DIAGNOSTIC_JSON_PATH"
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -2491,6 +3506,7 @@ exec "$@"
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "0")
 	t.Setenv("DISPLAY", "")
+	t.Setenv("PRODUCT_CAPTURE_TEST_DIAGNOSTIC_JSON_PATH", writeValidBrowserDiagnosticFixture(t, "https://93.184.216.34/"))
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
 
 	var stdout bytes.Buffer

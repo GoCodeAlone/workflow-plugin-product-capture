@@ -83,6 +83,7 @@ func TestStagingProofWorkflowUsesBoundedControlClient(t *testing.T) {
 		"cancel-in-progress: false",
 		"go run ./cmd/product-capture-staging-proof",
 		"WORKFLOW_COMPUTE_TASK_TOKEN: ${{ secrets.WORKFLOW_COMPUTE_TASK_TOKEN }}",
+		"SERVER_URL: ${{ vars.WORKFLOW_COMPUTE_SERVER_URL }}",
 		"--provider-image-ref \"$PROVIDER_IMAGE_REF\"",
 		"--worker-id \"$WORKER_ID\"",
 		"--artifact-timeout 5m",
@@ -96,6 +97,7 @@ func TestStagingProofWorkflowUsesBoundedControlClient(t *testing.T) {
 	}
 	for _, forbidden := range []string{
 		"docker save", "podman save", "oci.tar", "agent-artifacts", "provider-package", "campaign",
+		"inputs.server_url",
 		`--server "${{ inputs.server_url }}"`,
 		`--provider-image-ref "${{ inputs.provider_image_ref }}"`,
 		`--worker-id "${{ inputs.worker_id }}"`,
@@ -118,6 +120,9 @@ func TestStagingProofDocsRequireMinimumScopedCredential(t *testing.T) {
 		if !strings.Contains(docs, scope) {
 			t.Fatalf("staging proof docs missing required credential scope %s", scope)
 		}
+	}
+	if !strings.Contains(docs, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS=https://<diagnostic-host>") {
+		t.Fatal("staging proof docs omit the required browser diagnostic origin allowlist")
 	}
 }
 

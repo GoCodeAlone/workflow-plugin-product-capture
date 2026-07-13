@@ -21,17 +21,21 @@ import (
 )
 
 const (
-	defaultPollInterval           = 30 * time.Second
-	defaultCapacityTimeout        = 30 * time.Minute
-	defaultResultTimeout          = 30 * time.Minute
-	defaultArtifactTimeout        = 5 * time.Minute
-	defaultTaskTimeoutSeconds     = 300
-	maxTaskTimeoutSeconds         = 300
-	maxSummaryTitleBytes          = 512
-	maxSummaryImageURLBytes       = 2048
-	maxSummaryPriceBytes          = 128
-	maxSummaryCurrencyBytes       = 16
-	browserDiagnosticSchemaSHA256 = "sha256:d4d927c6a43ac41ab220d2813fcc86a7fcf35534966ad645daa23a36783fbe6a"
+	defaultPollInterval                          = 30 * time.Second
+	defaultCapacityTimeout                       = 30 * time.Minute
+	defaultResultTimeout                         = 30 * time.Minute
+	defaultArtifactTimeout                       = 5 * time.Minute
+	defaultTaskTimeoutSeconds                    = 300
+	maxTaskTimeoutSeconds                        = 300
+	maxSummaryTitleBytes                         = 512
+	maxSummaryImageURLBytes                      = 2048
+	maxSummaryPriceBytes                         = 128
+	maxSummaryCurrencyBytes                      = 16
+	browserDiagnosticSchemaSHA256                = "sha256:c7cfb25ad2fe4842cdd1b5a078c495e16d729cc18f81e7054e7becba0d620d40"
+	browserDiagnosticOperationInputSchemaRef     = "schema://providers/workflow-plugin-product-capture/browser/operations/browser_diagnostic/input/v1"
+	browserDiagnosticOperationInputSchemaSHA256  = "sha256:732d520997602aea2e1f0bc751b5e05bf372608a373f078d9ac4c3eb1ae912f4"
+	browserDiagnosticOperationOutputSchemaRef    = "schema://providers/workflow-plugin-product-capture/browser/operations/browser_diagnostic/output/v1"
+	browserDiagnosticOperationOutputSchemaSHA256 = "sha256:94eb33379184a7f00f489c7bc018afff76e0abb4a675609b541ed3cf61ef155e"
 )
 
 var canonicalPricePattern = regexp.MustCompile(`^(0|[1-9][0-9]*)(\.[0-9]{2})?$`)
@@ -68,6 +72,7 @@ type Summary struct {
 	WorkerID          string                      `json:"worker_id"`
 	ArtifactHash      string                      `json:"artifact_hash"`
 	ProviderImageRef  string                      `json:"provider_image_ref"`
+	Executor          protocol.ExecutorRef        `json:"executor"`
 	Product           ProductSummary              `json:"product"`
 	Artifacts         []ArtifactSummary           `json:"artifacts"`
 	BrowserDiagnostic *DiagnosticSummary          `json:"browser_diagnostic,omitempty"`
@@ -146,7 +151,7 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		return Summary{}, fmt.Errorf("create compute client: %w", err)
 	}
 
-	capacity, err := waitForCapacity(ctx, client, cfg, imageDigest)
+	capacity, executor, err := waitForCapacity(ctx, client, cfg, imageDigest)
 	if err != nil {
 		return Summary{}, err
 	}
@@ -154,7 +159,7 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	if err != nil {
 		return Summary{}, fmt.Errorf("submit product task: %w", err)
 	}
-	task, proof, err := waitForAcceptedProof(ctx, client, cfg, task, imageDigest)
+	task, proof, err := waitForAcceptedProof(ctx, client, cfg, task, executor)
 	if err != nil {
 		return Summary{}, err
 	}
@@ -164,14 +169,15 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	}
 	var diagnostic *DiagnosticSummary
 	if cfg.BrowserDiagnosticURL != "" {
-		if _, err := waitForCapacity(ctx, client, cfg, imageDigest); err != nil {
+		_, diagnosticExecutor, err := waitForCapacity(ctx, client, cfg, imageDigest)
+		if err != nil {
 			return Summary{}, fmt.Errorf("wait for diagnostic capacity: %w", err)
 		}
 		diagnosticTask, err := submitDiagnosticTask(ctx, client, cfg)
 		if err != nil {
 			return Summary{}, fmt.Errorf("submit browser diagnostic task: %w", err)
 		}
-		diagnosticTask, diagnosticProof, err := waitForAcceptedProof(ctx, client, cfg, diagnosticTask, imageDigest)
+		diagnosticTask, diagnosticProof, err := waitForAcceptedProof(ctx, client, cfg, diagnosticTask, diagnosticExecutor)
 		if err != nil {
 			return Summary{}, fmt.Errorf("browser diagnostic: %w", err)
 		}
@@ -197,6 +203,7 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		WorkerID:          proof.WorkerID,
 		ArtifactHash:      proof.ArtifactHash,
 		ProviderImageRef:  cfg.ProviderImageRef,
+		Executor:          executor,
 		Product:           product,
 		Artifacts:         artifacts,
 		BrowserDiagnostic: diagnostic,
@@ -281,6 +288,18 @@ func validateConfig(cfg Config) (protocol.ProviderOperation, *jsonschema.Schema,
 		if !ok || len(diagnostic.ArtifactSpecs) == 0 {
 			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic must declare bounded artifact_specs")
 		}
+		if diagnostic.InputSchemaRef != browserDiagnosticOperationInputSchemaRef {
+			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic input_schema_ref does not match the pinned operation input schema")
+		}
+		if diagnostic.InputSchemaDigest != browserDiagnosticOperationInputSchemaSHA256 {
+			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic input_schema_digest does not match the pinned operation input schema")
+		}
+		if diagnostic.OutputSchemaRef != browserDiagnosticOperationOutputSchemaRef {
+			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic output_schema_ref does not match the pinned operation output schema")
+		}
+		if diagnostic.OutputSchemaDigest != browserDiagnosticOperationOutputSchemaSHA256 {
+			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic output_schema_digest does not match the pinned operation output schema")
+		}
 	}
 	schema, err := compileProductSchema(cfg.ProductSchema)
 	if err != nil {
@@ -318,6 +337,7 @@ func compileSchema(data []byte, resource, target string) (*jsonschema.Schema, er
 		return nil, err
 	}
 	compiler := jsonschema.NewCompiler()
+	compiler.AssertFormat()
 	if err := compiler.AddResource(resource, document); err != nil {
 		return nil, err
 	}
@@ -333,7 +353,7 @@ func providerOperation(contract protocol.ProviderContract, id string) (protocol.
 	return protocol.ProviderOperation{}, false
 }
 
-func waitForCapacity(ctx context.Context, client *protocol.Client, cfg Config, imageDigest string) (CapacitySummary, error) {
+func waitForCapacity(ctx context.Context, client *protocol.Client, cfg Config, imageDigest string) (CapacitySummary, protocol.ExecutorRef, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, cfg.CapacityTimeout)
 	defer cancel()
 	var last CapacitySummary
@@ -342,27 +362,34 @@ func waitForCapacity(ctx context.Context, client *protocol.Client, cfg Config, i
 			return client.ListAgents(waitCtx)
 		})
 		if err != nil {
-			return CapacitySummary{}, fmt.Errorf("list capacity agents: %w", err)
+			return CapacitySummary{}, protocol.ExecutorRef{}, fmt.Errorf("list capacity agents: %w", err)
 		}
 		leases, err := retryTransient(waitCtx, cfg.PollInterval, func() ([]protocol.Lease, error) {
 			return client.ListLeases(waitCtx)
 		})
 		if err != nil {
-			return CapacitySummary{}, fmt.Errorf("list capacity leases: %w", err)
+			return CapacitySummary{}, protocol.ExecutorRef{}, fmt.Errorf("list capacity leases: %w", err)
 		}
 		tasks, err := retryTransient(waitCtx, cfg.PollInterval, func() (protocol.TaskList, error) {
 			return client.ListTasks(waitCtx)
 		})
 		if err != nil {
-			return CapacitySummary{}, fmt.Errorf("list capacity tasks: %w", err)
+			return CapacitySummary{}, protocol.ExecutorRef{}, fmt.Errorf("list capacity tasks: %w", err)
 		}
 		last = summarizeCapacity(cfg, imageDigest, agents, leases, tasks.Tasks, time.Now().UTC())
 		if last.MatchingOnlineAgents == 1 && last.RetainedWorkerMatching && last.WorkerStatus == protocol.AgentOnline &&
 			last.ActiveMatchingLeases == 0 && last.QueuedMatchingTasks == 0 {
-			return last, nil
+			for _, agent := range agents {
+				if agent.ID == cfg.WorkerID {
+					if executor, ok := compatibleExecutor(agent, cfg, imageDigest); ok {
+						return last, executor, nil
+					}
+				}
+			}
+			return CapacitySummary{}, protocol.ExecutorRef{}, errors.New("retained worker executor identity disappeared during capacity check")
 		}
 		if err := waitForPoll(waitCtx, cfg.PollInterval); err != nil {
-			return CapacitySummary{}, fmt.Errorf("capacity unavailable before timeout: online=%d active_leases=%d queued_tasks=%d worker_status=%s",
+			return CapacitySummary{}, protocol.ExecutorRef{}, fmt.Errorf("capacity unavailable before timeout: online=%d active_leases=%d queued_tasks=%d worker_status=%s",
 				last.MatchingOnlineAgents, last.ActiveMatchingLeases, last.QueuedMatchingTasks, last.WorkerStatus)
 		}
 	}
@@ -409,25 +436,35 @@ func summarizeCapacity(cfg Config, imageDigest string, agents []protocol.Agent, 
 }
 
 func agentCompatible(agent protocol.Agent, cfg Config, imageDigest string) bool {
+	_, ok := compatibleExecutor(agent, cfg, imageDigest)
+	return ok
+}
+
+func compatibleExecutor(agent protocol.Agent, cfg Config, imageDigest string) (protocol.ExecutorRef, bool) {
 	if agent.Status != protocol.AgentOnline {
-		return false
+		return protocol.ExecutorRef{}, false
 	}
 	if _, ok := protocol.SelectIdleAgent([]protocol.Agent{agent}, nil, cfg.OrgID, cfg.PoolID, time.Now().UTC()); !ok {
-		return false
+		return protocol.ExecutorRef{}, false
 	}
 	caps := agent.Capabilities
 	if !slices.Contains(caps.ExecutorProviders, "product-capture-browser") ||
 		!slices.Contains(caps.WorkloadKinds, string(protocol.WorkloadProvider)) ||
 		!slices.Contains(caps.ExecutionTiers, protocol.ExecutionSandboxedContainer) ||
 		!slices.Contains(caps.ProofTiers, protocol.ProofArtifactHash) {
-		return false
+		return protocol.ExecutorRef{}, false
 	}
 	for _, executor := range caps.Executors {
-		if executor.Provider == "product-capture-browser" && executor.ImageDigest == imageDigest {
-			return true
+		if executor.Provider == "product-capture-browser" && executor.ImageDigest == imageDigest &&
+			executor.ExecutionSecurityTier == protocol.ExecutionSandboxedContainer && executor.ProofTier == protocol.ProofArtifactHash &&
+			executor.Version != "" && strings.TrimSpace(executor.Version) == executor.Version && !strings.ContainsAny(executor.Version, " \t\r\n\x00") &&
+			validSHA256(executor.ImageDigest) && validSHA256(executor.RootFSDigest) {
+			if err := executor.ValidateForProof(); err == nil {
+				return executor, true
+			}
 		}
 	}
-	return false
+	return protocol.ExecutorRef{}, false
 }
 
 func submitProductTask(ctx context.Context, client *protocol.Client, cfg Config) (protocol.Task, error) {
@@ -512,16 +549,19 @@ func validateSubmittedTask(created, expected protocol.Task) error {
 	if err := created.Validate(); err != nil {
 		return fmt.Errorf("submitted task response: %w", err)
 	}
-	if created.ID != expected.ID || created.OrgID != expected.OrgID || created.PoolID != expected.PoolID ||
-		created.ProductID != expected.ProductID || created.PolicyID != expected.PolicyID || created.InputHash != expected.InputHash ||
-		protocol.CanonicalHash(created.Requirements) != protocol.CanonicalHash(expected.Requirements) ||
-		protocol.CanonicalHash(created.Workload) != protocol.CanonicalHash(expected.Workload) {
+	if taskBindingHash(created) != taskBindingHash(expected) {
 		return errors.New("submitted task response does not match requested provider task")
 	}
 	return nil
 }
 
-func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Config, expected protocol.Task, imageDigest string) (protocol.Task, protocol.ProofReceipt, error) {
+func taskBindingHash(task protocol.Task) string {
+	task.Status = ""
+	task.Signature.Verified = false
+	return protocol.CanonicalHash(task)
+}
+
+func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Config, expected protocol.Task, expectedExecutor protocol.ExecutorRef) (protocol.Task, protocol.ProofReceipt, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, cfg.ResultTimeout)
 	defer cancel()
 	taskID := expected.ID
@@ -538,10 +578,7 @@ func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Conf
 			return protocol.Task{}, protocol.ProofReceipt{}, fmt.Errorf("task %s stalled: %s", taskID, stalls[0].Reason)
 		}
 		if found {
-			if task.ID != expected.ID || task.OrgID != expected.OrgID || task.PoolID != expected.PoolID ||
-				task.ProductID != expected.ProductID || task.PolicyID != expected.PolicyID || task.InputHash != expected.InputHash ||
-				protocol.CanonicalHash(task.Requirements) != protocol.CanonicalHash(expected.Requirements) ||
-				protocol.CanonicalHash(task.Workload) != protocol.CanonicalHash(expected.Workload) {
+			if taskBindingHash(task) != taskBindingHash(expected) {
 				return protocol.Task{}, protocol.ProofReceipt{}, errors.New("terminal task does not match submitted provider task")
 			}
 			switch task.Status {
@@ -560,7 +597,7 @@ func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Conf
 					if proof.Verifier.Status != protocol.VerificationAccepted {
 						return protocol.Task{}, protocol.ProofReceipt{}, fmt.Errorf("proof %s is %s", proof.ID, proof.Verifier.Status)
 					}
-					if err := validateAcceptedProof(proof, task, expected, cfg, imageDigest); err != nil {
+					if err := validateAcceptedProof(proof, task, expected, cfg, expectedExecutor); err != nil {
 						return protocol.Task{}, protocol.ProofReceipt{}, err
 					}
 					return task, proof, nil
@@ -573,7 +610,7 @@ func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Conf
 	}
 }
 
-func validateAcceptedProof(proof protocol.ProofReceipt, terminal, expected protocol.Task, cfg Config, imageDigest string) error {
+func validateAcceptedProof(proof protocol.ProofReceipt, terminal, expected protocol.Task, cfg Config, expectedExecutor protocol.ExecutorRef) error {
 	if err := proof.Validate(); err != nil {
 		return fmt.Errorf("accepted proof receipt: %w", err)
 	}
@@ -589,9 +626,7 @@ func validateAcceptedProof(proof protocol.ProofReceipt, terminal, expected proto
 	if proof.DependencyClosureHash != protocol.CanonicalHash(expected.Workload) {
 		return errors.New("accepted proof dependency closure does not match submitted workload")
 	}
-	if proof.Executor.Provider != expected.Requirements.ExecutorProvider ||
-		proof.Executor.ExecutionSecurityTier != expected.Requirements.ExecutionSecurityTier ||
-		proof.Executor.ProofTier != expected.Requirements.ProofTier || proof.Executor.ImageDigest != imageDigest {
+	if protocol.CanonicalHash(proof.Executor) != protocol.CanonicalHash(expectedExecutor) {
 		return errors.New("accepted proof executor does not match requested runtime")
 	}
 	if proof.ExitCode != 0 {

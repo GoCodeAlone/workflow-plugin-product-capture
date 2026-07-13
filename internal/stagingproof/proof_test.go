@@ -246,6 +246,12 @@ func TestRunRejectsInvalidProductArtifacts(t *testing.T) {
 		"schema invalid": func(f *computeFixture) {
 			f.productBody = []byte(`{"provider":"amazon","url":"https://www.amazon.com/dp/B000000000","requested_url":"https://www.amazon.com/dp/B000000000"}`)
 		},
+		"invalid captured at": func(f *computeFixture) {
+			setProductField(f, "captured_at", "not-a-date")
+		},
+		"invalid secondary image url": func(f *computeFixture) {
+			setProductField(f, "images", []string{"not a URI"})
+		},
 		"digest mismatch": func(f *computeFixture) { f.artifactSHA256 = "sha256:" + strings.Repeat("f", 64) },
 		"wrong requested url": func(f *computeFixture) {
 			setProductField(f, "requested_url", "https://www.amazon.com/dp/B111111111")
@@ -321,6 +327,43 @@ func TestRunRejectsMismatchedTerminalRequirements(t *testing.T) {
 	}
 }
 
+func TestRunRejectsMismatchedSubmittedTaskFields(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.mutateSubmittedResponse = func(task *protocol.Task) {
+		task.TimeoutSeconds++
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	if _, err := Run(t.Context(), testConfig(t, server.URL)); err == nil || !strings.Contains(err.Error(), "submitted task response") {
+		t.Fatalf("Run error = %v, want submitted task response rejection", err)
+	}
+}
+
+func TestRunRejectsMismatchedTerminalTaskFields(t *testing.T) {
+	tests := map[string]func(*protocol.Task){
+		"timeout":         func(task *protocol.Task) { task.TimeoutSeconds++ },
+		"network policy":  func(task *protocol.Task) { task.NetworkPolicy.AuditDestinations = true },
+		"proof policy":    func(task *protocol.Task) { task.ProofPolicy.Quorum = 2 },
+		"access policy":   func(task *protocol.Task) { task.AccessPolicy.ArtifactVisibility = protocol.AccessVisibility("private") },
+		"residue policy":  func(task *protocol.Task) { task.ResiduePolicy.MaxReuseCount = 1 },
+		"resource limits": func(task *protocol.Task) { task.ResourceLimits.CPUPercent = 1 },
+		"labels":          func(task *protocol.Task) { task.Labels = map[string]string{"mutated": "true"} },
+		"requested time":  func(task *protocol.Task) { task.RequestedAt = task.RequestedAt.Add(time.Second) },
+		"signature":       func(task *protocol.Task) { task.Signature.KeyID = "other-key" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := newComputeFixture(t)
+			fixture.mutateTerminalTask = mutate
+			server := httptest.NewServer(fixture)
+			t.Cleanup(server.Close)
+			if _, err := Run(t.Context(), testConfig(t, server.URL)); err == nil || !strings.Contains(err.Error(), "terminal task") {
+				t.Fatalf("Run error = %v, want terminal task rejection", err)
+			}
+		})
+	}
+}
+
 func TestRunRejectsMismatchedProofBindings(t *testing.T) {
 	tests := map[string]func(*protocol.ProofReceipt){
 		"org":    func(proof *protocol.ProofReceipt) { proof.OrgID = "other-org" },
@@ -340,6 +383,10 @@ func TestRunRejectsMismatchedProofBindings(t *testing.T) {
 		"image": func(proof *protocol.ProofReceipt) {
 			proof.Executor.ImageDigest = sha256RefForTest([]byte("other-image"))
 		},
+		"executor version": func(proof *protocol.ProofReceipt) { proof.Executor.Version = "v0.1.61" },
+		"rootfs": func(proof *protocol.ProofReceipt) {
+			proof.Executor.RootFSDigest = sha256RefForTest([]byte("other-rootfs"))
+		},
 		"execution": func(proof *protocol.ProofReceipt) {
 			proof.Executor.ExecutionSecurityTier = protocol.ExecutionTrustedNative
 		},
@@ -356,6 +403,18 @@ func TestRunRejectsMismatchedProofBindings(t *testing.T) {
 				t.Fatal("Run succeeded, want proof binding rejection")
 			}
 		})
+	}
+}
+
+func TestRunRequiresCompleteCapacityExecutorIdentity(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.agents[0].Capabilities.Executors[0].RootFSDigest = ""
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.CapacityTimeout = 10 * time.Millisecond
+	if _, err := Run(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "capacity") {
+		t.Fatalf("Run error = %v, want incomplete executor capacity rejection", err)
 	}
 }
 
@@ -385,6 +444,75 @@ func TestRunRejectsMismatchedDiagnosticSchemaDigestBeforeNetworkAccess(t *testin
 	}
 	if calls != 0 {
 		t.Fatalf("network calls = %d, want 0", calls)
+	}
+}
+
+func TestRunRejectsMismatchedDiagnosticContractDigestBeforeNetworkAccess(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.BrowserDiagnosticURL = "https://diagnostic.example.test/product-capture-browser"
+	for index := range cfg.Contract.Operations {
+		if cfg.Contract.Operations[index].ID == "browser_diagnostic" {
+			cfg.Contract.Operations[index].OutputSchemaDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		}
+	}
+	if _, err := Run(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "browser_diagnostic output_schema_digest") {
+		t.Fatalf("Run error = %v, want diagnostic contract digest rejection", err)
+	}
+	if calls != 0 {
+		t.Fatalf("network calls = %d, want 0", calls)
+	}
+}
+
+func TestRunRejectsMismatchedDiagnosticContractReferenceBeforeNetworkAccess(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.BrowserDiagnosticURL = "https://diagnostic.example.test/product-capture-browser"
+	for index := range cfg.Contract.Operations {
+		if cfg.Contract.Operations[index].ID == "browser_diagnostic" {
+			cfg.Contract.Operations[index].OutputSchemaRef = "schema://providers/workflow-plugin-product-capture/browser/operations/browser_diagnostic/wrong/v1"
+		}
+	}
+	if _, err := Run(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "browser_diagnostic output_schema_ref") {
+		t.Fatalf("Run error = %v, want diagnostic contract reference rejection", err)
+	}
+	if calls != 0 {
+		t.Fatalf("network calls = %d, want 0", calls)
+	}
+}
+
+func TestRunRejectsMismatchedDiagnosticContractInputIdentityBeforeNetworkAccess(t *testing.T) {
+	tests := map[string]func(*protocol.ProviderOperation){
+		"reference": func(operation *protocol.ProviderOperation) {
+			operation.InputSchemaRef = "schema://providers/workflow-plugin-product-capture/browser/operations/browser_diagnostic/wrong/v1"
+		},
+		"digest": func(operation *protocol.ProviderOperation) {
+			operation.InputSchemaDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+			t.Cleanup(server.Close)
+			cfg := testConfig(t, server.URL)
+			cfg.BrowserDiagnosticURL = "https://diagnostic.example.test/product-capture-browser"
+			for index := range cfg.Contract.Operations {
+				if cfg.Contract.Operations[index].ID == "browser_diagnostic" {
+					mutate(&cfg.Contract.Operations[index])
+				}
+			}
+			if _, err := Run(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "browser_diagnostic input_schema") {
+				t.Fatalf("Run error = %v, want diagnostic input contract rejection", err)
+			}
+			if calls != 0 {
+				t.Fatalf("network calls = %d, want 0", calls)
+			}
+		})
 	}
 }
 
@@ -494,9 +622,6 @@ func TestRunRejectsInvalidBrowserDiagnosticArtifacts(t *testing.T) {
 		"empty navigator signals": func(f *computeFixture) {
 			setDiagnosticSignalSection(f, "navigator", map[string]any{})
 		},
-		"unknown navigator signals": func(f *computeFixture) {
-			setDiagnosticSignalSection(f, "navigator", map[string]any{"junk": nil})
-		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {
@@ -510,6 +635,18 @@ func TestRunRejectsInvalidBrowserDiagnosticArtifacts(t *testing.T) {
 				t.Fatal("Run succeeded, want browser diagnostic rejection")
 			}
 		})
+	}
+}
+
+func TestRunRejectsUnknownBrowserDiagnosticSignal(t *testing.T) {
+	fixture := newComputeFixture(t)
+	setDiagnosticSignalField(fixture, "document", "cookie_value", "secret-cookie")
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.BrowserDiagnosticURL = "https://diagnostic.example.test/product-capture-browser"
+	if _, err := Run(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "violates schema") {
+		t.Fatalf("Run error = %v, want unknown diagnostic signal schema rejection", err)
 	}
 }
 
@@ -575,6 +712,7 @@ type computeFixture struct {
 	transientArtifactDownloadFailures int
 	mutateProof                       func(*protocol.ProofReceipt)
 	mutateTerminalTask                func(*protocol.Task)
+	mutateSubmittedResponse           func(*protocol.Task)
 	handlerErrors                     []error
 }
 
@@ -585,10 +723,16 @@ func newComputeFixture(t *testing.T) *computeFixture {
 			ID: "worker-1", OrgID: "org-1", PoolID: "pool-1", Status: protocol.AgentOnline,
 			Capabilities: protocol.Capabilities{
 				ExecutorProviders: []string{"product-capture-browser"},
-				Executors:         []protocol.ExecutorRef{{Provider: "product-capture-browser", ImageDigest: testImageDigest}},
-				WorkloadKinds:     []string{string(protocol.WorkloadProvider)},
-				ExecutionTiers:    []protocol.ExecutionSecurityTier{protocol.ExecutionSandboxedContainer},
-				ProofTiers:        []protocol.ProofTier{protocol.ProofArtifactHash},
+				Executors: []protocol.ExecutorRef{{
+					Provider: "product-capture-browser", Version: "v0.1.60",
+					ExecutionSecurityTier: protocol.ExecutionSandboxedContainer,
+					ProofTier:             protocol.ProofArtifactHash,
+					ImageDigest:           testImageDigest,
+					RootFSDigest:          sha256RefForTest([]byte("rootfs")),
+				}},
+				WorkloadKinds:  []string{string(protocol.WorkloadProvider)},
+				ExecutionTiers: []protocol.ExecutionSecurityTier{protocol.ExecutionSandboxedContainer},
+				ProofTiers:     []protocol.ProofTier{protocol.ProofArtifactHash},
 			},
 		}},
 		productBody: productJSON(),
@@ -598,13 +742,29 @@ func newComputeFixture(t *testing.T) *computeFixture {
 			"posted_to_origin":true,
 			"post_error":"",
 			"browser_signals":{
-				"navigator":{"webdriver":false,"user_agent":"Chrome","language":"en-US","platform":"Linux x86_64"},
-				"window":{"outer_width":1920,"outer_height":1080,"inner_width":1920,"inner_height":936},
+				"navigator":{
+					"webdriver":false,
+					"user_agent":"Chrome",
+					"user_agent_data":{"brands":[{"brand":"Chromium","version":"140"}],"mobile":false,"platform":"Linux"},
+					"user_agent_high_entropy":null,
+					"language":"en-US",
+					"languages":["en-US","en"],
+					"platform":"Linux x86_64",
+					"hardware_concurrency":8,
+					"device_memory":8,
+					"max_touch_points":0,
+					"plugins":{"length":1,"names":["PDF Viewer"]},
+					"mime_types":{"length":1,"names":["application/pdf"]}
+				},
+				"window":{
+					"outer_width":1920,"outer_height":1080,"inner_width":1920,"inner_height":936,
+					"device_pixel_ratio":1,"chrome_runtime_present":true,"prefers_color_scheme_dark":false
+				},
 				"automation":{"playwright_binding_present":false,"playwright_init_scripts_present":false},
-				"screen":{"width":1920,"height":1080},
-				"document":{"cookie_present":false,"cookie_length":0},
+				"screen":{"width":1920,"height":1080,"avail_width":1920,"avail_height":1040,"color_depth":24,"pixel_depth":24},
+				"document":{"cookie_present":false,"cookie_length":0,"visibility_state":"visible","has_focus":true},
 				"intl":{"timezone":"UTC"},
-				"webgl":{"available":false}
+				"webgl":{"available":true,"vendor":"Google Inc.","renderer":"ANGLE"}
 			}
 		}`),
 		artifactName:        "product_json",
@@ -688,13 +848,20 @@ func (f *computeFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		f.submitted = append(f.submitted, task)
+		created := task
+		if f.mutateSubmittedResponse != nil {
+			f.mutateSubmittedResponse(&created)
+		}
 		w.WriteHeader(http.StatusCreated)
-		f.writeJSON(w, protocol.TaskResponse{Task: task})
+		f.writeJSON(w, protocol.TaskResponse{Task: created})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/proofs":
 		proofs := make([]protocol.ProofReceipt, 0, len(f.submitted))
 		for _, task := range f.submitted {
 			finishedAt := time.Now().UTC()
 			leasedTask := task
+			if f.mutateTerminalTask != nil {
+				f.mutateTerminalTask(&leasedTask)
+			}
 			leasedTask.Status = protocol.TaskLeased
 			artifactName, artifactBody := "product_json", f.productBody
 			if task.Workload.Provider != nil && task.Workload.Provider.Operation == "browser_diagnostic" {
@@ -878,6 +1045,21 @@ func setDiagnosticSignalSection(fixture *computeFixture, name string, value any)
 	}
 	signals := diagnostic["browser_signals"].(map[string]any)
 	signals[name] = value
+	data, err := json.Marshal(diagnostic)
+	if err != nil {
+		panic(err)
+	}
+	fixture.diagnosticBody = data
+}
+
+func setDiagnosticSignalField(fixture *computeFixture, section, name string, value any) {
+	var diagnostic map[string]any
+	if err := json.Unmarshal(fixture.diagnosticBody, &diagnostic); err != nil {
+		panic(err)
+	}
+	signals := diagnostic["browser_signals"].(map[string]any)
+	fields := signals[section].(map[string]any)
+	fields[name] = value
 	data, err := json.Marshal(diagnostic)
 	if err != nil {
 		panic(err)

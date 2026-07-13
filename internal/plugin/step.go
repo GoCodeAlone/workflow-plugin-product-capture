@@ -248,7 +248,7 @@ func (s *productCaptureStep) waitForProductCapture(ctx context.Context, client *
 			return nil, fmt.Errorf("task %q not found", taskID)
 		}
 		actionableStalls := actionableStalls(stalls, s.requireProof())
-		if task.Status == protocol.TaskFailed || task.Status == protocol.TaskStalled || len(actionableStalls) > 0 {
+		if task.Status == protocol.TaskFailed || task.Status == protocol.TaskStalled || task.Status == protocol.TaskCanceled || len(actionableStalls) > 0 {
 			output := taskOutput(task)
 			addProviderProvenance(output, submittedProvider)
 			if len(actionableStalls) > 0 {
@@ -474,7 +474,7 @@ func actionableStalls(stalls []protocol.TaskStall, requireProof bool) []protocol
 
 func isTerminalTaskStatus(status protocol.TaskStatus) bool {
 	switch status {
-	case protocol.TaskSucceeded, protocol.TaskFailed, protocol.TaskStalled:
+	case protocol.TaskSucceeded, protocol.TaskFailed, protocol.TaskStalled, protocol.TaskCanceled:
 		return true
 	default:
 		return false

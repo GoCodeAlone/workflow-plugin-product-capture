@@ -36,7 +36,8 @@ diagnostic from the same staging worker/runtime before changing capture
 behavior:
 
 ```sh
-product-capture-provider \
+PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS=https://<diagnostic-host> \
+  product-capture-provider \
   --browser-diagnostic-url https://<diagnostic-host>/product-capture-browser
 ```
 

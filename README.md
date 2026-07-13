@@ -33,11 +33,12 @@ PRODUCT_CAPTURE_HTML_FIXTURE=internal/snapshot/testdata/amazon_xbox.html \
 ```
 
 Live browser capture requires `node`, Playwright, and an installed
-`google-chrome` executable in the worker image. The provider starts Chrome as a
-direct child, attaches Playwright to its default context over loopback CDP, and
-keeps launch identity under Chrome's control. Local development can set
-`NODE_PATH` to a Playwright install; fixture mode is used by unit tests and never
-emits raw HTML in the provider response.
+`google-chrome` executable in the worker image. On Linux, the provider starts a
+stable process-group supervisor as Node's direct child and verifies the Chrome
+child separately by PID and start time. Playwright attaches to Chrome's default
+context over loopback CDP, keeping browser launch identity under Chrome's
+control. Local development can set `NODE_PATH` to a Playwright install; fixture
+mode is used by unit tests and never emits raw HTML in the provider response.
 
 Generated Playwright script regressions execute with `node` when it is present.
 CI provisions Node explicitly so those regressions are always exercised there.

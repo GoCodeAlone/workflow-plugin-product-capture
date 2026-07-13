@@ -415,3 +415,185 @@ Scope: no manifest change; Task 4 owns these proof-boundary invariants.
 
 Evidence: focused regressions fail with each guard removed and pass restored;
 `actionlint .github/workflows/staging-proof.yml` validates the workflow shape.
+
+### Backport 2026-07-13: Stable procfs cleanup identity
+
+Cause: CI observed a transiently truncated `/proc/<pid>/stat`; numeric PID/PGID
+alone could omit a live member, leak detached Chrome after uncertain cleanup, or
+signal a reused process group. Later Linux stress disproved two assumptions:
+Chrome itself cannot both exit on TERM and remain the stable PGID identity
+anchor, and page tests may freeze `Date.now()` while lifecycle cleanup runs.
+
+Change: retry only incomplete stat reads and require fields through `starttime`.
+On Linux, a TERM-resistant supervisor owns the PGID while the browser child PID
+and start time are verified separately. Reject missing/drifted supervisor
+identity before every liveness decision or signal, including fallback KILL. If
+initial capture fails, a one-shot marker permits abort only before the first
+event-loop yield, while the fresh detached child cannot be reaped or reused.
+After a checked KILL, send no further signal; accept a missing leader only when
+a procfs scan finds no live non-zombie group member. Use monotonic time for CDP
+startup and process cleanup; retain wall time for page-operation budgets.
+Propagate cleanup uncertainty. Shared cleanup formatting stays in the prelude
+used by capture and diagnostics.
+
+Scope: no manifest change; Task 2 owns native Chrome process-group cleanup.
+
+Evidence: focused regressions fail with each fix removed and pass restored;
+real transient/persistent teardown stress passes 10 consecutive runs; the
+formerly hanging frozen-clock continuation test passes in the Linux provider
+runtime.
+
+### Backport 2026-07-13: Outer lifecycle identity and cancellation
+
+Cause: the Go command policy could signal a numeric Linux PGID after its leader
+was reaped or reused. Lifecycle conformance also returned on context
+cancellation after container startup without stopping/removing the container or
+reaping the `docker run` process.
+
+Change: capture Linux leader PGID and start time before TERM; revalidate both
+before KILL; never signal after `Run`/`Wait` reaps the command; treat a missing
+leader with a live group as cleanup uncertainty. Preserve cancellation as the
+result while completing bounded container stop, force removal, process reap,
+absence assertion, and profile cleanup.
+
+Scope: no manifest change; Tasks 2 and 3 own runtime and conformance lifecycle
+cleanup within PR 2.
+
+Evidence: focused policy and cancellation regressions fail with each fix
+removed and pass restored; Linux provider and conformance suites pass.
+
+### Backport 2026-07-13: Promotion proof fails closed
+
+Cause: final review disproved remaining promotion assumptions: lifecycle tests
+launched bare Chrome; some post-start Docker exits leaked containers; the
+supervisor's ignored TERM/HUP disposition reached Chrome; absent diagnostic
+booleans decoded as false; dispatch input could redirect a staging token;
+nested schemas/formats, task fields, and executor provenance were only partly
+bound; non-Linux cleanup was parent-only; and bounded evidence readers or
+ordered encodings could hide valid runtime evidence.
+
+Change: run lifecycle activation through provider -> Node -> supervisor ->
+Chrome and funnel every post-start exit through bounded stop/remove/reap/
+absence checks. Reset child signal defaults before `exec`. Require explicit
+automation booleans, strict nested schemas/formats, environment-owned server
+origin, full normalized task binding, and exact complete executor identity.
+Use dedicated Unix process groups and preserve Windows tree-cleanup failures.
+Platform cancellation policies must not read `exec.Cmd.ProcessState` while
+`Wait` may mutate it.
+Drain tunnel output beyond its retained-log bound, compare brand/language
+fields as semantic sets, document the diagnostic origin allowlist, and replace
+the delayed shell PID watchdog with checked pre-reap child-state polling.
+
+Scope: no manifest change; Tasks 2-4 retain these runtime and promotion
+invariants within PR 2.
+
+Evidence: each focused regression fails with its guard removed and passes when
+restored; macOS process-tree behavior, focused `-race`, and Windows amd64
+compilation pass.
+
+### Backport 2026-07-13: Full boundary consumption and activation cleanup
+
+Cause: full-diff review found eight remaining fail-open edges: provider
+diagnostics exceeded their published schema; outer cancellation could preempt
+inner Chrome cleanup; transient tunnel-start failures were not retried; Docker
+version probes were unmanaged; canceled tasks were nonterminal; non-Linux
+cleanup lacked stable process identity; headed Linux could start without a
+display provider; and empty matching observations could pass conformance.
+
+Change: publish and validate the complete secret-safe diagnostic payload; give
+inner cleanup a bounded three-second outer grace; retry only typed transient
+tunnel activation failures; name, stop, remove, reap, and absence-check Docker
+version probes; treat canceled tasks as terminal with provenance; verify Darwin
+kernel start time and Windows process creation time before tree termination;
+fail headed Linux preflight without `DISPLAY` or `xvfb-run`; and require
+nonempty, well-formed stable browser/request evidence before comparison.
+
+Scope: no manifest change; Tasks 2-4 retain these runtime, conformance, and
+promotion-proof invariants within PR 2.
+
+Evidence: focused regressions fail with each guard removed and pass restored;
+provider-output schema integration and Darwin process-tree behavior pass, and
+Windows amd64 test compilation succeeds.
+
+### Backport 2026-07-13: Native evidence and failed-start teardown
+
+Cause: second full-diff review found that native Chrome returns `brands` and
+`mobile` with high-entropy UA values beyond the strict schema; retryable tunnel
+`Start` errors lacked caller-side teardown; matching empty `Sec-Fetch-*` values
+could pass; and pre-process cloudflared failures retained temp ownership or
+discarded cleanup errors.
+
+Change: publish and test the representative native UA-data shape; require
+top-level navigation fetch-metadata semantics; stop every failed tunnel start
+before classification or retry and abort on cleanup failure; and route every
+cloudflared start error through idempotent bounded `Stop`, joining temp/process
+cleanup errors with the primary failure.
+
+Scope: no manifest change; Tasks 3-4 retain conformance transport and diagnostic
+artifact ownership within PR 2.
+
+Evidence: each focused regression fails with its guard removed and passes when
+restored; the strict schema digest is
+`sha256:c7cfb25ad2fe4842cdd1b5a078c495e16d729cc18f81e7054e7becba0d620d40`.
+
+### Backport 2026-07-13: Contract digest and completed-launch cleanup
+
+Cause: third full-diff review found public diagnostic digest drift, completed
+`docker run` cleanup asymmetry, swallowed native tunnel kill errors, non-Unix
+build-tag overreach, and duplicate-sensitive semantic sets.
+
+Change: bind the public contract and staging proof to exact diagnostic schema
+bytes before network access; funnel ordinary post-start Docker completion
+through bounded stop/remove/reap/absence cleanup; preserve force-kill errors;
+select explicit Unix and non-Unix process policies; and deduplicate browser,
+language, and client-hint sets during semantic comparison.
+
+Scope: no manifest change; Tasks 2-4 retain contract, lifecycle, and diagnostic
+proof ownership within PR 2.
+
+Evidence: focused regressions fail before each fix and pass restored; build
+selection covers every Go OS family, including Plan 9, JS, and WASI.
+
+### Backport 2026-07-13: Exact schema identities and terminal cleanup
+
+Cause: fourth full-diff review found a diagnostic operation reference/digest
+mismatch, cancellation and timely-reap container-removal gaps, and browser data
+that could exceed the published artifact schema after valid input acceptance.
+
+Change: hash each diagnostic operation reference from its resolved schema and
+pin the separate artifact schema explicitly; reject reference drift before
+network access; route cancellation through common stop/remove/reap/absence
+cleanup; remove and inspect Docker-backed tunnels after every reap outcome; and
+buffer, size-limit, schema-validate, then publish browser diagnostic artifacts.
+The input schema now matches the provider's HTTPS and 2,048-character policy.
+
+Scope: no manifest change; Tasks 2-4 retain lifecycle, contract, and artifact
+validation within PR 2.
+
+Evidence: focused negative controls leave named containers after timely reap and
+emit oversized URL, error, plugin, MIME, and UA-data values before the fixes;
+all are rejected or removed after restoration. The operation output digest is
+`sha256:94eb33379184a7f00f489c7bc018afff76e0abb4a675609b541ed3cf61ef155e`;
+the artifact digest remains
+`sha256:c7cfb25ad2fe4842cdd1b5a078c495e16d729cc18f81e7054e7becba0d620d40`.
+
+### Backport 2026-07-13: Shared cleanup budget and truthful evidence
+
+Cause: fifth full-diff review found that the outer launcher waited 10 seconds
+for cleanup whose explicit inner bound was 54 seconds, URL length used bytes
+while JSON Schema uses characters, sorted header names were labeled as wire
+order, and unexpected diagnostic listener failure was discarded.
+
+Change: derive a 59-second outer wait from named stop, reap, force-remove,
+final-remove, and absence-inspection bounds; enforce the public URL limit by
+Unicode character count; publish sorted request data as `header_names`; and
+cancel the run while preserving non-`ErrServerClosed` server failures through
+bounded shutdown.
+
+Scope: no manifest change; Tasks 2-4 retain conformance lifecycle and evidence
+accuracy within PR 2.
+
+Evidence: the old cleanup budget fails an explicit bound invariant; a
+schema-valid multibyte URL fails before character-count enforcement; and an
+injected listener failure previously degrades into context timeout. Each
+focused control passes after restoration.

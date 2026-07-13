@@ -28,17 +28,23 @@ import (
 )
 
 const (
-	SchemaV1                  = "v1"
-	VerdictPass               = "pass"
-	VerdictFail               = "fail"
-	MaxObservationBytes       = 64 << 10
-	MaxPageBytes              = 16 << 10
-	CloudflaredVersion        = "2026.7.1"
-	CloudflaredSHA256         = "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1"
-	CloudflaredDownloadURL    = "https://github.com/cloudflare/cloudflared/releases/download/" + CloudflaredVersion + "/cloudflared-linux-amd64"
-	candidateStopSeconds      = 10
-	candidateReapGrace        = 12 * time.Second
-	defaultConformanceTimeout = 12 * time.Minute
+	SchemaV1                       = "v1"
+	VerdictPass                    = "pass"
+	VerdictFail                    = "fail"
+	MaxObservationBytes            = 64 << 10
+	MaxPageBytes                   = 16 << 10
+	CloudflaredVersion             = "2026.7.1"
+	CloudflaredSHA256              = "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1"
+	CloudflaredDownloadURL         = "https://github.com/cloudflare/cloudflared/releases/download/" + CloudflaredVersion + "/cloudflared-linux-amd64"
+	candidateStopSeconds           = 10
+	candidateReapGrace             = 12 * time.Second
+	candidateStopCommandTimeout    = 15 * time.Second
+	candidateForceRemoveTimeout    = 5 * time.Second
+	candidateFinalRemoveTimeout    = 5 * time.Second
+	candidateInspectTimeout        = 5 * time.Second
+	candidateLifecycleCleanupBound = candidateStopCommandTimeout + candidateReapGrace + candidateForceRemoveTimeout + candidateReapGrace + candidateFinalRemoveTimeout + candidateInspectTimeout
+	launchCleanupWaitTimeout       = candidateLifecycleCleanupBound + 5*time.Second
+	defaultConformanceTimeout      = 12 * time.Minute
 )
 
 type Brand struct {
@@ -111,7 +117,7 @@ type RequestSignals struct {
 	UserAgent   string            `json:"user_agent"`
 	ClientHints ClientHintSignals `json:"client_hints"`
 	SecFetch    SecFetchSignals   `json:"sec_fetch"`
-	HeaderOrder []string          `json:"header_order,omitempty"`
+	HeaderNames []string          `json:"header_names,omitempty"`
 }
 
 type Observation struct {
@@ -153,11 +159,180 @@ type Report struct {
 	Verdict           string                       `json:"verdict"`
 }
 
+func normalizedBrandSet(brands []Brand) []Brand {
+	normalized := append([]Brand{}, brands...)
+	slices.SortFunc(normalized, func(left, right Brand) int {
+		if order := strings.Compare(left.Brand, right.Brand); order != 0 {
+			return order
+		}
+		return strings.Compare(left.Version, right.Version)
+	})
+	return slices.CompactFunc(normalized, func(left, right Brand) bool {
+		return left.Brand == right.Brand && left.Version == right.Version
+	})
+}
+
+func normalizedStringSet(values []string) []string {
+	normalized := append([]string{}, values...)
+	slices.Sort(normalized)
+	return slices.Compact(normalized)
+}
+
+func parseClientHintBrandSet(value string) ([]Brand, bool) {
+	index := 0
+	brands := make([]Brand, 0, 4)
+	for {
+		skipOptionalWhitespace(value, &index)
+		brand, ok := parseClientHintQuotedString(value, &index)
+		if !ok || brand == "" {
+			return nil, false
+		}
+		skipOptionalWhitespace(value, &index)
+		if index >= len(value) || value[index] != ';' {
+			return nil, false
+		}
+		index++
+		skipOptionalWhitespace(value, &index)
+		if index >= len(value) || value[index] != 'v' {
+			return nil, false
+		}
+		index++
+		skipOptionalWhitespace(value, &index)
+		if index >= len(value) || value[index] != '=' {
+			return nil, false
+		}
+		index++
+		skipOptionalWhitespace(value, &index)
+		version, ok := parseClientHintQuotedString(value, &index)
+		if !ok || version == "" {
+			return nil, false
+		}
+		brands = append(brands, Brand{Brand: brand, Version: version})
+		skipOptionalWhitespace(value, &index)
+		if index == len(value) {
+			return normalizedBrandSet(brands), true
+		}
+		if value[index] != ',' {
+			return nil, false
+		}
+		index++
+	}
+}
+
+func skipOptionalWhitespace(value string, index *int) {
+	for *index < len(value) && (value[*index] == ' ' || value[*index] == '\t') {
+		*index++
+	}
+}
+
+func parseClientHintQuotedString(value string, index *int) (string, bool) {
+	if *index >= len(value) || value[*index] != '"' {
+		return "", false
+	}
+	*index++
+	var parsed strings.Builder
+	for *index < len(value) {
+		char := value[*index]
+		*index++
+		switch char {
+		case '"':
+			return parsed.String(), true
+		case '\\':
+			if *index >= len(value) {
+				return "", false
+			}
+			parsed.WriteByte(value[*index])
+			*index++
+		default:
+			if char < 0x20 || char == 0x7f {
+				return "", false
+			}
+			parsed.WriteByte(char)
+		}
+	}
+	return "", false
+}
+
 func (r Report) ExitCode() int {
 	if r.Verdict == VerdictPass {
 		return 0
 	}
 	return 1
+}
+
+func stableEvidenceErrors(label string, observation Observation) []string {
+	prefix := label + " observation has invalid "
+	var result []string
+	navigator := observation.Browser.Navigator
+	if strings.TrimSpace(navigator.UserAgent) == "" {
+		result = append(result, prefix+"navigator user_agent")
+	}
+	if len(navigator.UserAgentData.Brands) == 0 {
+		result = append(result, prefix+"navigator brand set")
+	} else {
+		for _, brand := range navigator.UserAgentData.Brands {
+			if strings.TrimSpace(brand.Brand) == "" || strings.TrimSpace(brand.Version) == "" {
+				result = append(result, prefix+"navigator brand set")
+				break
+			}
+		}
+	}
+	if strings.TrimSpace(navigator.UserAgentData.Platform) == "" {
+		result = append(result, prefix+"navigator user-agent-data platform")
+	}
+	if strings.TrimSpace(navigator.Language) == "" {
+		result = append(result, prefix+"navigator language")
+	}
+	if len(navigator.Languages) == 0 {
+		result = append(result, prefix+"navigator language set")
+	} else {
+		for _, language := range navigator.Languages {
+			if strings.TrimSpace(language) == "" {
+				result = append(result, prefix+"navigator language set")
+				break
+			}
+		}
+	}
+	if strings.TrimSpace(navigator.Platform) == "" {
+		result = append(result, prefix+"navigator platform")
+	}
+	window := observation.Browser.Window
+	if window.OuterWidth <= 0 || window.OuterHeight <= 0 || window.InnerWidth <= 0 || window.InnerHeight <= 0 {
+		result = append(result, prefix+"window dimensions")
+	}
+	if strings.TrimSpace(observation.Request.UserAgent) == "" {
+		result = append(result, prefix+"request user_agent")
+	}
+	requestBrands, validRequestBrands := parseClientHintBrandSet(observation.Request.ClientHints.Brands)
+	if !validRequestBrands || len(requestBrands) == 0 {
+		result = append(result, prefix+"request client-hint brand set")
+	}
+	if mobile := strings.TrimSpace(observation.Request.ClientHints.Mobile); mobile != "?0" && mobile != "?1" {
+		result = append(result, prefix+"request client-hint mobile")
+	}
+	if strings.Trim(strings.TrimSpace(observation.Request.ClientHints.Platform), `"`) == "" {
+		result = append(result, prefix+"request client-hint platform")
+	}
+	secFetch := observation.Request.SecFetch
+	if strings.TrimSpace(secFetch.Dest) != "document" {
+		result = append(result, prefix+"request sec-fetch destination")
+	}
+	if strings.TrimSpace(secFetch.Mode) != "navigate" {
+		result = append(result, prefix+"request sec-fetch mode")
+	}
+	switch strings.TrimSpace(secFetch.Site) {
+	case "cross-site", "same-origin", "same-site", "none":
+	default:
+		result = append(result, prefix+"request sec-fetch site")
+	}
+	if strings.TrimSpace(secFetch.User) != "?1" {
+		result = append(result, prefix+"request sec-fetch user")
+	}
+	origin, err := url.Parse(observation.FirstNavigationOrigin)
+	if err != nil || (origin.Scheme != "https" && origin.Scheme != "http") || origin.Host == "" || origin.Path != "" || origin.RawQuery != "" || origin.Fragment != "" {
+		result = append(result, prefix+"first navigation origin")
+	}
+	return result
 }
 
 func Compare(direct, attached Observation, versions Versions) Report {
@@ -176,10 +351,17 @@ func Compare(direct, attached Observation, versions Versions) Report {
 	if direct.Kind != "direct" || attached.Kind != "attached" {
 		report.Errors = append(report.Errors, "observations must be ordered direct then attached")
 	}
+	report.Errors = append(report.Errors, stableEvidenceErrors("direct", direct)...)
+	report.Errors = append(report.Errors, stableEvidenceErrors("attached", attached)...)
 
 	addExact := func(field string, directValue, attachedValue any) {
 		report.StableComparisons = append(report.StableComparisons, Comparison{
 			Field: field, Direct: directValue, Attached: attachedValue, Match: reflect.DeepEqual(directValue, attachedValue),
+		})
+	}
+	addSet := func(field string, directValue, attachedValue, normalizedDirect, normalizedAttached any, valid bool) {
+		report.StableComparisons = append(report.StableComparisons, Comparison{
+			Field: field, Direct: directValue, Attached: attachedValue, Match: valid && reflect.DeepEqual(normalizedDirect, normalizedAttached),
 		})
 	}
 	addWindow := func(field string, directValue, attachedValue int) {
@@ -194,15 +376,38 @@ func Compare(direct, attached Observation, versions Versions) Report {
 
 	addExact("browser.navigator.webdriver", direct.Browser.Navigator.Webdriver, attached.Browser.Navigator.Webdriver)
 	addExact("browser.navigator.user_agent", direct.Browser.Navigator.UserAgent, attached.Browser.Navigator.UserAgent)
-	addExact("browser.navigator.user_agent_data.brands", direct.Browser.Navigator.UserAgentData.Brands, attached.Browser.Navigator.UserAgentData.Brands)
+	addSet(
+		"browser.navigator.user_agent_data.brands",
+		direct.Browser.Navigator.UserAgentData.Brands,
+		attached.Browser.Navigator.UserAgentData.Brands,
+		normalizedBrandSet(direct.Browser.Navigator.UserAgentData.Brands),
+		normalizedBrandSet(attached.Browser.Navigator.UserAgentData.Brands),
+		true,
+	)
 	addExact("browser.navigator.user_agent_data.platform", direct.Browser.Navigator.UserAgentData.Platform, attached.Browser.Navigator.UserAgentData.Platform)
 	addExact("browser.navigator.language", direct.Browser.Navigator.Language, attached.Browser.Navigator.Language)
-	addExact("browser.navigator.languages", direct.Browser.Navigator.Languages, attached.Browser.Navigator.Languages)
+	addSet(
+		"browser.navigator.languages",
+		direct.Browser.Navigator.Languages,
+		attached.Browser.Navigator.Languages,
+		normalizedStringSet(direct.Browser.Navigator.Languages),
+		normalizedStringSet(attached.Browser.Navigator.Languages),
+		true,
+	)
 	addExact("browser.navigator.platform", direct.Browser.Navigator.Platform, attached.Browser.Navigator.Platform)
 	addExact("browser.automation.playwright_binding_present", direct.Browser.Automation.PlaywrightBindingPresent, attached.Browser.Automation.PlaywrightBindingPresent)
 	addExact("browser.automation.playwright_init_scripts_present", direct.Browser.Automation.PlaywrightInitScriptsPresent, attached.Browser.Automation.PlaywrightInitScriptsPresent)
 	addExact("request.user_agent", direct.Request.UserAgent, attached.Request.UserAgent)
-	addExact("request.client_hints.brands", direct.Request.ClientHints.Brands, attached.Request.ClientHints.Brands)
+	directClientHintBrands, directClientHintBrandsValid := parseClientHintBrandSet(direct.Request.ClientHints.Brands)
+	attachedClientHintBrands, attachedClientHintBrandsValid := parseClientHintBrandSet(attached.Request.ClientHints.Brands)
+	addSet(
+		"request.client_hints.brands",
+		direct.Request.ClientHints.Brands,
+		attached.Request.ClientHints.Brands,
+		directClientHintBrands,
+		attachedClientHintBrands,
+		directClientHintBrandsValid && attachedClientHintBrandsValid,
+	)
 	addExact("request.client_hints.mobile", direct.Request.ClientHints.Mobile, attached.Request.ClientHints.Mobile)
 	addExact("request.client_hints.platform", direct.Request.ClientHints.Platform, attached.Request.ClientHints.Platform)
 	addExact("request.sec_fetch.dest", direct.Request.SecFetch.Dest, attached.Request.SecFetch.Dest)
@@ -218,7 +423,7 @@ func Compare(direct, attached Observation, versions Versions) Report {
 	addWindow("browser.window.inner_width", direct.Browser.Window.InnerWidth, attached.Browser.Window.InnerWidth)
 	addWindow("browser.window.inner_height", direct.Browser.Window.InnerHeight, attached.Browser.Window.InnerHeight)
 
-	report.Informational["request.header_order"] = InformationalPair{Direct: direct.Request.HeaderOrder, Attached: attached.Request.HeaderOrder}
+	report.Informational["request.header_names"] = InformationalPair{Direct: direct.Request.HeaderNames, Attached: attached.Request.HeaderNames}
 	report.Informational["timing"] = InformationalPair{Direct: direct.Timing, Attached: attached.Timing}
 	report.Informational["browser.webgl"] = InformationalPair{Direct: direct.Browser.WebGL, Attached: attached.Browser.WebGL}
 	report.Informational["browser.navigator.hardware_concurrency"] = InformationalPair{Direct: direct.Browser.Navigator.HardwareConcurrency, Attached: attached.Browser.Navigator.HardwareConcurrency}
@@ -298,8 +503,8 @@ func (c *Collector) Handler() http.Handler {
 			http.Error(w, "observation exceeds limit", http.StatusRequestEntityTooLarge)
 			return
 		}
-		var payload diagnosticPayload
-		if len(body) == 0 || json.Unmarshal(body, &payload) != nil || payload.Source != "product_capture_browser_diagnostic" {
+		payload, err := decodeDiagnosticPayload(body)
+		if err != nil || payload.Source != "product_capture_browser_diagnostic" {
 			http.Error(w, "invalid observation", http.StatusBadRequest)
 			return
 		}
@@ -322,12 +527,42 @@ type diagnosticPayload struct {
 	Timing         map[string]float64 `json:"timing,omitempty"`
 }
 
-func (c *Collector) recordNavigation(kind string, r *http.Request) {
-	headerOrder := make([]string, 0, len(r.Header))
-	for key := range r.Header {
-		headerOrder = append(headerOrder, strings.ToLower(key))
+func decodeDiagnosticPayload(body []byte) (diagnosticPayload, error) {
+	var required struct {
+		BrowserSignals struct {
+			Navigator struct {
+				Webdriver *bool `json:"webdriver"`
+			} `json:"navigator"`
+			Automation struct {
+				PlaywrightBindingPresent     *bool `json:"playwright_binding_present"`
+				PlaywrightInitScriptsPresent *bool `json:"playwright_init_scripts_present"`
+			} `json:"automation"`
+		} `json:"browser_signals"`
 	}
-	slices.Sort(headerOrder)
+	if len(body) == 0 {
+		return diagnosticPayload{}, errors.New("observation is empty")
+	}
+	if err := json.Unmarshal(body, &required); err != nil {
+		return diagnosticPayload{}, err
+	}
+	if required.BrowserSignals.Navigator.Webdriver == nil ||
+		required.BrowserSignals.Automation.PlaywrightBindingPresent == nil ||
+		required.BrowserSignals.Automation.PlaywrightInitScriptsPresent == nil {
+		return diagnosticPayload{}, errors.New("stable automation signals must be explicit booleans")
+	}
+	var payload diagnosticPayload
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return diagnosticPayload{}, err
+	}
+	return payload, nil
+}
+
+func (c *Collector) recordNavigation(kind string, r *http.Request) {
+	headerNames := make([]string, 0, len(r.Header))
+	for key := range r.Header {
+		headerNames = append(headerNames, strings.ToLower(key))
+	}
+	slices.Sort(headerNames)
 	navigation := navigationObservation{
 		request: RequestSignals{
 			UserAgent: r.UserAgent(),
@@ -342,7 +577,7 @@ func (c *Collector) recordNavigation(kind string, r *http.Request) {
 				Site: r.Header.Get("Sec-Fetch-Site"),
 				User: r.Header.Get("Sec-Fetch-User"),
 			},
-			HeaderOrder: headerOrder,
+			HeaderNames: headerNames,
 		},
 		origin: requestOrigin(r),
 	}
@@ -482,6 +717,7 @@ type Dependencies struct {
 	Tunnel              Tunnel
 	HTTPClient          *http.Client
 	TunnelHealthTimeout time.Duration
+	Listen              func(string, string) (net.Listener, error)
 	LaunchDirect        func(context.Context, string, string) error
 	LaunchAttached      func(context.Context, string, string) error
 	ValidateLifecycle   func(context.Context, string, string) error
@@ -497,6 +733,21 @@ type Options struct {
 
 type Runner struct {
 	Dependencies Dependencies
+}
+
+var (
+	errTunnelActivationTimeout  = errors.New("cloudflared timed out before publishing an origin")
+	errTunnelExitedBeforeOrigin = errors.New("cloudflared exited before publishing an origin")
+)
+
+func retryableTunnelStartError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var networkErr net.Error
+	return errors.As(err, &networkErr) ||
+		errors.Is(err, errTunnelActivationTimeout) ||
+		errors.Is(err, errTunnelExitedBeforeOrigin)
 }
 
 func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
@@ -515,16 +766,43 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 	if listenAddress == "" {
 		listenAddress = "0.0.0.0:0"
 	}
-	listener, err := net.Listen("tcp", listenAddress)
+	listen := r.Dependencies.Listen
+	if listen == nil {
+		listen = net.Listen
+	}
+	listener, err := listen("tcp", listenAddress)
 	if err != nil {
 		return fmt.Errorf("listen for diagnostic endpoint: %w", err)
 	}
 	server := &http.Server{Handler: collector.Handler(), ReadHeaderTimeout: 5 * time.Second}
-	go func() { _ = server.Serve(listener) }()
+	runCtx, cancelRun := context.WithCancel(ctx)
+	ctx = runCtx
+	serveResult := make(chan error, 1)
+	go func() {
+		err := server.Serve(listener)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		if err != nil {
+			cancelRun()
+		}
+		serveResult <- err
+	}()
 	defer func() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		runErr = errors.Join(runErr, server.Shutdown(shutdownCtx))
+		shutdownErr := server.Shutdown(shutdownCtx)
+		cancel()
+		var serveErr error
+		select {
+		case serveErr = <-serveResult:
+			if serveErr != nil {
+				serveErr = fmt.Errorf("serve diagnostic endpoint: %w", serveErr)
+			}
+		case <-time.After(2 * time.Second):
+			serveErr = errors.New("diagnostic server did not stop after shutdown")
+		}
+		cancelRun()
+		runErr = errors.Join(runErr, shutdownErr, serveErr)
 	}()
 
 	client := r.Dependencies.HTTPClient
@@ -545,7 +823,14 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 		for attempt := 0; attempt < 3; attempt++ {
 			candidate, startErr := r.Dependencies.Tunnel.Start(ctx, localURL)
 			if startErr != nil {
-				return fmt.Errorf("start diagnostic tunnel: %w", startErr)
+				cleanupErr := stopTunnel(r.Dependencies.Tunnel)
+				if cleanupErr != nil {
+					return errors.Join(fmt.Errorf("start diagnostic tunnel: %w", startErr), cleanupErr)
+				}
+				if ctx.Err() != nil || attempt == 2 || !retryableTunnelStartError(startErr) {
+					return fmt.Errorf("start diagnostic tunnel: %w", startErr)
+				}
+				continue
 			}
 			if err := validateDiagnosticOrigin(candidate); err != nil {
 				return errors.Join(err, stopTunnel(r.Dependencies.Tunnel))
@@ -736,14 +1021,21 @@ func launchAndCollect(
 }
 
 func waitForLaunchCleanup(kind string, cancel context.CancelFunc, launchResult <-chan error) error {
+	return waitForLaunchCleanupWithin(kind, cancel, launchResult, launchCleanupWaitTimeout)
+}
+
+func waitForLaunchCleanupWithin(kind string, cancel context.CancelFunc, launchResult <-chan error, timeout time.Duration) error {
 	cancel()
+	if timeout <= 0 {
+		return fmt.Errorf("%s browser cleanup timeout must be positive", kind)
+	}
 	select {
 	case err := <-launchResult:
 		if err != nil && !errors.Is(err, context.Canceled) {
 			return fmt.Errorf("%s browser cleanup: %w", kind, err)
 		}
 		return nil
-	case <-time.After(10 * time.Second):
+	case <-time.After(timeout):
 		return fmt.Errorf("%s browser cleanup timed out", kind)
 	}
 }
@@ -843,17 +1135,45 @@ func DefaultDependencies(stderr io.Writer) Dependencies {
 const headedContainerScript = `set -eu
 xvfb_pid=
 child_pid=
+child_process_state() {
+  pid=$1
+  retries=3
+  while [ "$retries" -gt 0 ]; do
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 1
+    case "$stat" in
+      *") "*)
+        rest=${stat##*) }
+        set -- $rest
+        if [ "$#" -ge 1 ]; then
+          state=$1
+          case "$state" in
+            [A-Za-z]) printf '%s\n' "$state"; return 0 ;;
+          esac
+        fi
+        ;;
+    esac
+    retries=$((retries - 1))
+  done
+  return 1
+}
 cleanup() {
   if [ -n "$child_pid" ]; then
     kill -TERM "$child_pid" 2>/dev/null || true
-    (
-      sleep "${PRODUCT_CAPTURE_CHILD_STOP_TIMEOUT:-10}"
+    timeout=${PRODUCT_CAPTURE_CHILD_STOP_TIMEOUT:-10}
+    attempts=$((timeout * 20))
+    while [ "$attempts" -gt 0 ]; do
+      state=$(child_process_state "$child_pid") || state=
+      if [ "$state" = Z ] || { [ -z "$state" ] && ! kill -0 "$child_pid" 2>/dev/null; }; then
+        break
+      fi
+      attempts=$((attempts - 1))
+      sleep 0.05
+    done
+    state=$(child_process_state "$child_pid") || state=
+    if [ "$state" != Z ] && kill -0 "$child_pid" 2>/dev/null; then
       kill -KILL "$child_pid" 2>/dev/null || true
-    ) &
-    watchdog_pid=$!
+    fi
     wait "$child_pid" 2>/dev/null || true
-    kill "$watchdog_pid" 2>/dev/null || true
-    wait "$watchdog_pid" 2>/dev/null || true
     child_pid=
   fi
   if [ -n "$xvfb_pid" ]; then kill -TERM "$xvfb_pid" 2>/dev/null || true; fi
@@ -954,27 +1274,22 @@ func runManagedContainer(ctx context.Context, name string, args []string, starte
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
 	select {
-	case err := <-wait:
-		if err != nil {
-			return fmt.Errorf("candidate container %s: %w: %s", name, err, output.String())
+	case waitErr := <-wait:
+		var runErr error
+		if waitErr != nil {
+			runErr = fmt.Errorf("candidate container %s: %w: %s", name, waitErr, output.String())
 		}
-		return assertContainerGone(name)
+		runErr = errors.Join(runErr, ctx.Err())
+		return errors.Join(runErr, cleanupLifecycleContainer(name, wait, true, "stop"))
 	case <-ctx.Done():
-		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		stopErr := dockerCommand(stopCtx, "stop", "--time", fmt.Sprintf("%d", candidateStopSeconds), name)
-		reapErr := forceContainerAndWait(wait, candidateReapGrace, func() error {
-			forceCtx, forceCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer forceCancel()
-			return ignoreMissingContainer(dockerCommand(forceCtx, "rm", "-f", name))
-		})
-		return errors.Join(stopErr, reapErr, assertContainerGone(name))
+		return errors.Join(ctx.Err(), cleanupLifecycleContainer(name, wait, false, "stop"))
 	}
 }
 
 type boundedWriter struct {
 	buffer bytes.Buffer
 	limit  int
+	over   bool
 }
 
 func (w *boundedWriter) Write(data []byte) (int, error) {
@@ -982,6 +1297,9 @@ func (w *boundedWriter) Write(data []byte) (int, error) {
 	remaining := w.limit - w.buffer.Len()
 	if remaining > 0 {
 		_, _ = w.buffer.Write(data[:min(remaining, len(data))])
+	}
+	if original > remaining {
+		w.over = true
 	}
 	return original, nil
 }
@@ -997,7 +1315,7 @@ func dockerCommand(ctx context.Context, args ...string) error {
 }
 
 func assertContainerGone(name string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), candidateInspectTimeout)
 	defer cancel()
 	output, err := exec.CommandContext(ctx, "docker", "container", "inspect", name).CombinedOutput()
 	if err == nil {
@@ -1005,6 +1323,19 @@ func assertContainerGone(name string) error {
 	}
 	if !strings.Contains(string(output), "No such") {
 		return fmt.Errorf("inspect candidate cleanup %s: %w: %s", name, err, strings.TrimSpace(string(output)))
+	}
+	return nil
+}
+
+func assertContainerGoneWith(docker func(context.Context, ...string) error, name string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), candidateInspectTimeout)
+	defer cancel()
+	err := docker(ctx, "container", "inspect", name)
+	if err == nil {
+		return fmt.Errorf("container %s remains after cleanup", name)
+	}
+	if ignoreMissingContainer(err) != nil {
+		return fmt.Errorf("inspect container cleanup %s: %w", name, err)
 	}
 	return nil
 }
@@ -1047,15 +1378,7 @@ func validateCandidateLifecycle(ctx context.Context, image, origin string) error
 }
 
 func runLifecycleScenario(ctx context.Context, image, target string, delay time.Duration, signal string) error {
-	profile, err := os.MkdirTemp("", "product-capture-lifecycle-profile-*")
-	if err != nil {
-		return err
-	}
-	defer func() { _ = os.RemoveAll(profile) }()
-	if err := os.Chmod(profile, 0o777); err != nil {
-		return err
-	}
-	args := directChromeContainerArgs(image, target, profile)
+	args := attachedProviderContainerArgs(image, target)
 	name := containerName(args)
 	cmd := exec.Command("docker", args...)
 	var output boundedWriter
@@ -1067,32 +1390,50 @@ func runLifecycleScenario(ctx context.Context, image, target string, delay time.
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
 	if err := waitForContainer(ctx, name); err != nil {
-		_ = cmd.Process.Kill()
-		<-wait
-		return err
+		return errors.Join(err, cleanupLifecycleContainer(name, wait, false, "stop"))
 	}
 	timer := time.NewTimer(delay)
+	var triggerErr error
 	select {
 	case <-ctx.Done():
 		timer.Stop()
-		return ctx.Err()
+		triggerErr = ctx.Err()
 	case <-timer.C:
-	case err := <-wait:
-		return fmt.Errorf("container exited before %s termination: %w: %s", signal, err, output.String())
+	case waitErr := <-wait:
+		earlyExitErr := fmt.Errorf("container exited before %s termination: %s", signal, output.String())
+		if waitErr != nil {
+			earlyExitErr = fmt.Errorf("container exited before %s termination: %w: %s", signal, waitErr, output.String())
+		}
+		return errors.Join(earlyExitErr, cleanupLifecycleContainer(name, wait, true, "stop"))
 	}
-	commandCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	cleanupSignal := signal
+	if triggerErr != nil {
+		cleanupSignal = "stop"
+	}
+	return errors.Join(triggerErr, cleanupLifecycleContainer(name, wait, false, cleanupSignal))
+}
+
+func cleanupLifecycleContainer(name string, wait <-chan error, processReaped bool, signal string) error {
+	commandCtx, cancel := context.WithTimeout(context.Background(), candidateStopCommandTimeout)
 	defer cancel()
+	var terminateErr error
 	if signal == "stop" {
-		err = dockerCommand(commandCtx, "stop", "--time", fmt.Sprintf("%d", candidateStopSeconds), name)
+		terminateErr = ignoreMissingContainer(dockerCommand(commandCtx, "stop", "--time", fmt.Sprintf("%d", candidateStopSeconds), name))
 	} else {
-		err = dockerCommand(commandCtx, "kill", "--signal", signal, name)
+		terminateErr = ignoreMissingContainer(dockerCommand(commandCtx, "kill", "--signal", signal, name))
 	}
-	reapErr := forceContainerAndWait(wait, candidateReapGrace, func() error {
-		forceCtx, forceCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer forceCancel()
-		return ignoreMissingContainer(dockerCommand(forceCtx, "rm", "-f", name))
-	})
-	return errors.Join(err, reapErr, assertContainerGone(name), cleanupEphemeralProfile(profile))
+	var reapErr error
+	if !processReaped {
+		reapErr = forceContainerAndWait(wait, candidateReapGrace, func() error {
+			forceCtx, forceCancel := context.WithTimeout(context.Background(), candidateForceRemoveTimeout)
+			defer forceCancel()
+			return ignoreMissingContainer(dockerCommand(forceCtx, "rm", "-f", name))
+		})
+	}
+	removeCtx, removeCancel := context.WithTimeout(context.Background(), candidateFinalRemoveTimeout)
+	defer removeCancel()
+	removeErr := ignoreMissingContainer(dockerCommand(removeCtx, "rm", "-f", name))
+	return errors.Join(terminateErr, reapErr, removeErr, assertContainerGone(name))
 }
 
 func forceContainerAndWait(wait <-chan error, grace time.Duration, force func() error) error {
@@ -1160,6 +1501,13 @@ func inspectCandidateVersions(ctx context.Context, image string) (Versions, erro
 }
 
 func dockerOutput(ctx context.Context, args ...string) (string, error) {
+	if len(args) > 0 && args[0] == "run" {
+		name := "product-capture-version-" + mustRandomSuffix()
+		namedArgs := make([]string, 0, len(args)+2)
+		namedArgs = append(namedArgs, "run", "--name", name)
+		namedArgs = append(namedArgs, args[1:]...)
+		return managedDockerRunOutput(ctx, name, namedArgs)
+	}
 	output, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
@@ -1167,6 +1515,38 @@ func dockerOutput(ctx context.Context, args ...string) (string, error) {
 	value := strings.TrimSpace(string(output))
 	if value == "" || len(value) > 4096 {
 		return "", fmt.Errorf("docker %s returned invalid bounded output", strings.Join(args, " "))
+	}
+	return value, nil
+}
+
+func managedDockerRunOutput(ctx context.Context, name string, args []string) (string, error) {
+	cmd := exec.Command("docker", args...)
+	var output boundedWriter
+	output.limit = 4096
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		return "", fmt.Errorf("start Docker version probe %s: %w", name, err)
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	var waitErr error
+	processReaped := false
+	select {
+	case waitErr = <-wait:
+		processReaped = true
+	case <-ctx.Done():
+		waitErr = ctx.Err()
+	}
+	cleanupErr := cleanupLifecycleContainer(name, wait, processReaped, "stop")
+	if waitErr != nil {
+		return "", errors.Join(fmt.Errorf("docker version probe %s: %w: %s", name, waitErr, output.String()), cleanupErr)
+	}
+	if cleanupErr != nil {
+		return "", cleanupErr
+	}
+	value := output.String()
+	if value == "" || output.over {
+		return "", fmt.Errorf("docker version probe %s returned invalid bounded output", name)
 	}
 	return value, nil
 }
@@ -1199,6 +1579,7 @@ type pinnedCloudflaredTunnel struct {
 	client        *http.Client
 	stderr        io.Writer
 	docker        func(context.Context, ...string) error
+	killProcess   func(*os.Process) error
 	reapTimeout   time.Duration
 	mu            sync.Mutex
 	cmd           *exec.Cmd
@@ -1209,6 +1590,8 @@ type pinnedCloudflaredTunnel struct {
 }
 
 var quickTunnelOrigin = regexp.MustCompile(`https://[a-z0-9-]+\.trycloudflare\.com`)
+
+const tunnelRetainedLogLimit = 128 << 10
 
 func parseQuickTunnelOrigin(line string) string {
 	location := quickTunnelOrigin.FindStringIndex(line)
@@ -1225,24 +1608,55 @@ func parseQuickTunnelOrigin(line string) string {
 	return origin
 }
 
-func (t *pinnedCloudflaredTunnel) Start(ctx context.Context, localURL string) (string, error) {
+func scanTunnelOutput(reader io.Reader, stderr io.Writer, origins chan<- string) error {
+	scanner := bufio.NewScanner(reader)
+	scanner.Buffer(make([]byte, 64<<10), 1<<20)
+	retainedBytes := 0
+	for scanner.Scan() {
+		line := scanner.Text()
+		if stderr != nil && retainedBytes < tunnelRetainedLogLimit {
+			redacted := redactTunnelLog(line)
+			lineBytes := len(redacted) + 1
+			if retainedBytes+lineBytes <= tunnelRetainedLogLimit {
+				_, _ = fmt.Fprintln(stderr, redacted)
+				retainedBytes += lineBytes
+			}
+		}
+		if origin := parseQuickTunnelOrigin(line); origin != "" {
+			select {
+			case origins <- origin:
+			default:
+			}
+		}
+	}
+	return scanner.Err()
+}
+
+func (t *pinnedCloudflaredTunnel) Start(ctx context.Context, localURL string) (origin string, startErr error) {
 	tempDir, err := os.MkdirTemp("", "product-capture-cloudflared-*")
 	if err != nil {
 		return "", err
 	}
+	t.mu.Lock()
 	t.tempDir = tempDir
+	t.mu.Unlock()
+	defer func() {
+		if startErr == nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		startErr = errors.Join(startErr, t.Stop(cleanupCtx))
+	}()
 	path := filepath.Join(tempDir, "cloudflared-linux-amd64")
 	if err := t.download(ctx, path); err != nil {
-		_ = os.RemoveAll(tempDir)
 		return "", err
 	}
 	versionOutput, err := t.cloudflaredVersion(ctx, path)
 	if err != nil {
-		_ = os.RemoveAll(tempDir)
 		return "", err
 	}
 	if err := VerifyCloudflaredArtifact(path, CloudflaredSHA256, versionOutput); err != nil {
-		_ = os.RemoveAll(tempDir)
 		return "", err
 	}
 	cmd, containerName := cloudflaredCommand(path, localURL)
@@ -1252,10 +1666,10 @@ func (t *pinnedCloudflaredTunnel) Start(ctx context.Context, localURL string) (s
 	}
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
-		return "", err
+		return "", errors.Join(err, stdout.Close())
 	}
 	if err := cmd.Start(); err != nil {
-		return "", err
+		return "", errors.Join(err, stdout.Close(), stderr.Close())
 	}
 	t.mu.Lock()
 	t.cmd = cmd
@@ -1271,19 +1685,10 @@ func (t *pinnedCloudflaredTunnel) Start(ctx context.Context, localURL string) (s
 		t.mu.Unlock()
 	}()
 	origins := make(chan string, 2)
+	scanErrors := make(chan error, 2)
 	scan := func(reader io.Reader) {
-		scanner := bufio.NewScanner(io.LimitReader(reader, 128<<10))
-		for scanner.Scan() {
-			line := scanner.Text()
-			if t.stderr != nil {
-				_, _ = fmt.Fprintln(t.stderr, redactTunnelLog(line))
-			}
-			if origin := parseQuickTunnelOrigin(line); origin != "" {
-				select {
-				case origins <- origin:
-				default:
-				}
-			}
+		if err := scanTunnelOutput(reader, t.stderr, origins); err != nil {
+			scanErrors <- err
 		}
 	}
 	go scan(stdout)
@@ -1297,14 +1702,13 @@ func (t *pinnedCloudflaredTunnel) Start(ctx context.Context, localURL string) (s
 		t.mu.Lock()
 		err := t.waitErr
 		t.mu.Unlock()
-		_ = t.Stop(context.Background())
-		return "", fmt.Errorf("cloudflared exited before publishing an origin: %w", err)
+		return "", errors.Join(errTunnelExitedBeforeOrigin, err)
 	case <-timer.C:
-		_ = t.Stop(context.Background())
-		return "", errors.New("cloudflared timed out before publishing an origin")
+		return "", errTunnelActivationTimeout
 	case <-ctx.Done():
-		_ = t.Stop(context.Background())
 		return "", ctx.Err()
+	case scanErr := <-scanErrors:
+		return "", fmt.Errorf("scan cloudflared output: %w", scanErr)
 	}
 }
 
@@ -1380,16 +1784,17 @@ func (t *pinnedCloudflaredTunnel) Stop(ctx context.Context) error {
 		reapTimeout = 5 * time.Second
 	}
 	if cmd == nil {
-		var removeErr error
+		var removeErr, absenceErr error
 		if name != "" {
 			forceCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			removeErr = ignoreMissingContainer(docker(forceCtx, "rm", "-f", name))
 			cancel()
+			absenceErr = assertContainerGoneWith(docker, name)
 		}
 		if tempDir != "" {
 			removeErr = errors.Join(removeErr, os.RemoveAll(tempDir))
 		}
-		return removeErr
+		return errors.Join(removeErr, absenceErr)
 	}
 	var stopErr error
 	if name != "" {
@@ -1408,10 +1813,8 @@ func (t *pinnedCloudflaredTunnel) Stop(ctx context.Context) error {
 			forceErr = ignoreMissingContainer(docker(forceCtx, "rm", "-f", name))
 			cancel()
 		}
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		stopErr = errors.Join(stopErr, forceErr, ctx.Err())
+		killErr := t.forceKill(cmd.Process)
+		stopErr = errors.Join(stopErr, forceErr, killErr, ctx.Err())
 	case <-timer.C:
 		var forceErr error
 		if name != "" {
@@ -1419,13 +1822,11 @@ func (t *pinnedCloudflaredTunnel) Stop(ctx context.Context) error {
 			forceErr = ignoreMissingContainer(docker(forceCtx, "rm", "-f", name))
 			cancel()
 		}
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
-		}
-		if name != "" && forceErr == nil {
+		killErr := t.forceKill(cmd.Process)
+		if name != "" && forceErr == nil && killErr == nil {
 			stopErr = nil
 		} else {
-			stopErr = errors.Join(stopErr, forceErr, errors.New("cloudflared did not reap after stop"))
+			stopErr = errors.Join(stopErr, forceErr, killErr, errors.New("cloudflared did not reap after stop"))
 		}
 	}
 	postKillTimer := time.NewTimer(reapTimeout)
@@ -1435,7 +1836,29 @@ func (t *pinnedCloudflaredTunnel) Stop(ctx context.Context) error {
 	case <-postKillTimer.C:
 		stopErr = errors.Join(stopErr, errors.New("cloudflared process did not reap after force removal"))
 	}
-	return errors.Join(stopErr, os.RemoveAll(tempDir))
+	var removeErr, absenceErr error
+	if name != "" {
+		removeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		removeErr = ignoreMissingContainer(docker(removeCtx, "rm", "-f", name))
+		cancel()
+		absenceErr = assertContainerGoneWith(docker, name)
+	}
+	return errors.Join(stopErr, removeErr, absenceErr, os.RemoveAll(tempDir))
+}
+
+func (t *pinnedCloudflaredTunnel) forceKill(process *os.Process) error {
+	if process == nil {
+		return nil
+	}
+	kill := t.killProcess
+	if kill == nil {
+		kill = func(process *os.Process) error { return process.Kill() }
+	}
+	err := kill(process)
+	if errors.Is(err, os.ErrProcessDone) {
+		return nil
+	}
+	return err
 }
 
 func ignoreMissingContainer(err error) error {

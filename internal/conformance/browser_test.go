@@ -1,12 +1,14 @@
 package conformance
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -19,6 +21,7 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -34,7 +37,7 @@ func TestCompareBrowserObservationsClassifiesSchemaV1Fields(t *testing.T) {
 	attached.Browser.Document.CookiePresent = true
 	attached.Browser.Document.CookieLength = 12
 	attached.Browser.WebGL.Renderer = "different informational renderer"
-	attached.Request.HeaderOrder = []string{"sec-fetch-site", "user-agent"}
+	attached.Request.HeaderNames = []string{"sec-fetch-site", "user-agent"}
 	attached.Timing = map[string]float64{"navigation_ms": 42}
 
 	report := Compare(direct, attached, Versions{Chrome: "Google Chrome 140", Playwright: "1.57.0", Xvfb: "1.20.14"})
@@ -70,7 +73,7 @@ func TestCompareBrowserObservationsClassifiesSchemaV1Fields(t *testing.T) {
 		}
 	}
 	for _, field := range []string{
-		"request.header_order",
+		"request.header_names",
 		"timing",
 		"browser.webgl",
 		"browser.navigator.hardware_concurrency",
@@ -118,6 +121,64 @@ func TestCompareBrowserObservationsReturnsNonzeroForStableMismatch(t *testing.T)
 	}
 }
 
+func TestCompareBrowserObservationsTreatsBrandAndLanguageFieldsAsSets(t *testing.T) {
+	direct := matchingObservation("direct")
+	attached := matchingObservation("attached")
+	slices.Reverse(attached.Browser.Navigator.UserAgentData.Brands)
+	attached.Browser.Navigator.UserAgentData.Brands = append(attached.Browser.Navigator.UserAgentData.Brands, attached.Browser.Navigator.UserAgentData.Brands[0])
+	slices.Reverse(attached.Browser.Navigator.Languages)
+	attached.Browser.Navigator.Languages = append(attached.Browser.Navigator.Languages, attached.Browser.Navigator.Languages[0])
+	attached.Request.ClientHints.Brands = ` "Google Chrome";v="140" , "Chromium";v="140", "Google Chrome";v="140" `
+
+	report := Compare(direct, attached, Versions{})
+	if report.Verdict != VerdictPass {
+		t.Fatalf("report = %+v, want reordered semantic sets with duplicates to match", report)
+	}
+	for _, field := range []string{
+		"browser.navigator.user_agent_data.brands",
+		"browser.navigator.languages",
+		"request.client_hints.brands",
+	} {
+		comparison, ok := findComparison(report.StableComparisons, field)
+		if !ok || !comparison.Match {
+			t.Errorf("comparison %q = %+v, found %v", field, comparison, ok)
+		}
+	}
+}
+
+func TestCompareBrowserObservationsRejectsEmptyStableEvidence(t *testing.T) {
+	tests := map[string]func(*Observation){
+		"user agent":       func(o *Observation) { o.Browser.Navigator.UserAgent = "" },
+		"browser brands":   func(o *Observation) { o.Browser.Navigator.UserAgentData.Brands = nil },
+		"language":         func(o *Observation) { o.Browser.Navigator.Language = "" },
+		"language set":     func(o *Observation) { o.Browser.Navigator.Languages = nil },
+		"browser platform": func(o *Observation) { o.Browser.Navigator.Platform = "" },
+		"client platform":  func(o *Observation) { o.Browser.Navigator.UserAgentData.Platform = "" },
+		"window dimensions": func(o *Observation) {
+			o.Browser.Window = WindowSignals{}
+		},
+		"request user agent": func(o *Observation) { o.Request.UserAgent = "" },
+		"request brands":     func(o *Observation) { o.Request.ClientHints.Brands = "" },
+		"sec-fetch dest":     func(o *Observation) { o.Request.SecFetch.Dest = "" },
+		"sec-fetch mode":     func(o *Observation) { o.Request.SecFetch.Mode = "" },
+		"sec-fetch site":     func(o *Observation) { o.Request.SecFetch.Site = "" },
+		"sec-fetch user":     func(o *Observation) { o.Request.SecFetch.User = "" },
+		"navigation origin":  func(o *Observation) { o.FirstNavigationOrigin = "" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			direct := matchingObservation("direct")
+			attached := matchingObservation("attached")
+			mutate(&direct)
+			mutate(&attached)
+			report := Compare(direct, attached, Versions{})
+			if report.Verdict != VerdictFail || len(report.Errors) == 0 {
+				t.Fatalf("report = %+v, want explicit empty-evidence failure", report)
+			}
+		})
+	}
+}
+
 func TestCompareBrowserObservationsRejectsWrongSchemaOrRun(t *testing.T) {
 	for _, mutate := range []func(*Observation){
 		func(o *Observation) { o.Schema = "v2" },
@@ -160,6 +221,25 @@ func TestRunnerRejectsUncorrelatedTunnelEndpointAndCleansUp(t *testing.T) {
 	}
 	if tunnel.stopCalls != 1 {
 		t.Fatalf("tunnel stop calls = %d, want 1", tunnel.stopCalls)
+	}
+}
+
+func TestRunnerPropagatesUnexpectedDiagnosticServerFailure(t *testing.T) {
+	serveErr := errors.New("injected listener failure")
+	runner := Runner{Dependencies: Dependencies{
+		Listen: func(string, string) (net.Listener, error) {
+			return &failingListener{err: serveErr}, nil
+		},
+		Tunnel: contextCancellationTunnel{},
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	err := runner.Run(ctx, Options{
+		Image:  "candidate:test",
+		Output: filepath.Join(t.TempDir(), "conformance.json"),
+	})
+	if !errors.Is(err, serveErr) {
+		t.Fatalf("Run error = %v, want diagnostic server failure", err)
 	}
 }
 
@@ -236,6 +316,72 @@ func TestRunnerRetriesQuickTunnelActivationAndCleansEachAttempt(t *testing.T) {
 	}
 }
 
+func TestRunnerRetriesTransientQuickTunnelStartFailure(t *testing.T) {
+	tunnel := &sequenceTunnel{
+		origins: []string{"", "https://second.test"},
+		startErrors: []error{
+			&net.DNSError{Err: "temporary failure", Name: "api.trycloudflare.com", IsTemporary: true},
+			nil,
+		},
+	}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		runID := strings.Split(strings.Trim(request.URL.Path, "/"), "/")[1]
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"` + runID + `"}`)),
+			Request:    request,
+		}, nil
+	})}
+	runner := Runner{Dependencies: Dependencies{
+		Tunnel:              tunnel,
+		HTTPClient:          client,
+		TunnelHealthTimeout: 5 * time.Millisecond,
+	}}
+	err := runner.Run(context.Background(), Options{
+		Image:  "candidate:test",
+		Output: filepath.Join(t.TempDir(), "conformance.json"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "browser launch dependencies") {
+		t.Fatalf("Run error = %v, want post-health dependency failure", err)
+	}
+	if tunnel.startCalls != 2 || tunnel.stopCalls != 2 {
+		t.Fatalf("tunnel calls = start:%d stop:%d, want 2/2", tunnel.startCalls, tunnel.stopCalls)
+	}
+}
+
+func TestRunnerAbortsRetryWhenFailedTunnelStartCleanupFails(t *testing.T) {
+	cleanupErr := errors.New("cleanup failed")
+	tunnel := &sequenceTunnel{
+		origins: []string{"", "https://second.test"},
+		startErrors: []error{
+			&net.DNSError{Err: "temporary failure", Name: "api.trycloudflare.com", IsTemporary: true},
+			nil,
+		},
+		stopErrors: []error{cleanupErr},
+	}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		runID := strings.Split(strings.Trim(request.URL.Path, "/"), "/")[1]
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"` + runID + `"}`)),
+			Request:    request,
+		}, nil
+	})}
+	runner := Runner{Dependencies: Dependencies{Tunnel: tunnel, HTTPClient: client}}
+	err := runner.Run(context.Background(), Options{
+		Image:  "candidate:test",
+		Output: filepath.Join(t.TempDir(), "conformance.json"),
+	})
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("Run error = %v, want failed-start cleanup error", err)
+	}
+	if tunnel.startCalls != 1 || tunnel.stopCalls != 1 {
+		t.Fatalf("tunnel calls = start:%d stop:%d, want retry aborted at 1/1", tunnel.startCalls, tunnel.stopCalls)
+	}
+}
+
 func TestFetchRunHealthRedactsEndpointOnFailure(t *testing.T) {
 	const secretURL = "https://secret-tunnel.trycloudflare.com/runs/secret-run/healthz"
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -284,6 +430,44 @@ func TestCollectorRejectsWrongRunAndOversizedObservation(t *testing.T) {
 			defer func() { _ = resp.Body.Close() }()
 			if resp.StatusCode < 400 {
 				t.Fatalf("status = %d, want rejection", resp.StatusCode)
+			}
+		})
+	}
+}
+
+func TestCollectorRejectsMissingOrNullStableAutomationSignals(t *testing.T) {
+	tests := map[string]func(map[string]any){
+		"missing webdriver": func(signals map[string]any) {
+			delete(signals["navigator"].(map[string]any), "webdriver")
+		},
+		"null webdriver": func(signals map[string]any) {
+			signals["navigator"].(map[string]any)["webdriver"] = nil
+		},
+		"missing playwright binding": func(signals map[string]any) {
+			delete(signals["automation"].(map[string]any), "playwright_binding_present")
+		},
+		"null playwright init scripts": func(signals map[string]any) {
+			signals["automation"].(map[string]any)["playwright_init_scripts_present"] = nil
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			collector := NewCollector("run-123")
+			handler := collector.Handler()
+			handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "https://diagnostic.example/runs/run-123/direct", http.NoBody))
+			var payload map[string]any
+			if err := json.Unmarshal([]byte(providerPayload(matchingObservation("direct").Browser)), &payload); err != nil {
+				t.Fatal(err)
+			}
+			mutate(payload["browser_signals"].(map[string]any))
+			body, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := httptest.NewRecorder()
+			handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "https://diagnostic.example/runs/run-123/direct", bytes.NewReader(body)))
+			if response.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", response.Code, http.StatusBadRequest)
 			}
 		})
 	}
@@ -509,6 +693,28 @@ func TestLaunchAndCollectWaitsForLauncherCleanupAfterCancellation(t *testing.T) 
 	}
 }
 
+func TestLaunchCleanupBudgetCoversLifecycleCleanupBound(t *testing.T) {
+	if launchCleanupWaitTimeout <= candidateLifecycleCleanupBound {
+		t.Fatalf("launch cleanup timeout %s must exceed lifecycle cleanup bound %s", launchCleanupWaitTimeout, candidateLifecycleCleanupBound)
+	}
+}
+
+func TestWaitForLaunchCleanupWithinSupportsDelayedCompletion(t *testing.T) {
+	result := make(chan error, 1)
+	go func() {
+		time.Sleep(25 * time.Millisecond)
+		result <- nil
+	}()
+	canceled := false
+	err := waitForLaunchCleanupWithin("direct", func() { canceled = true }, result, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("waitForLaunchCleanupWithin: %v", err)
+	}
+	if !canceled {
+		t.Fatal("launch context was not canceled before cleanup wait")
+	}
+}
+
 func TestMainRequiresCandidateImageAndOutput(t *testing.T) {
 	for _, args := range [][]string{{}, {"--image", "candidate:test"}, {"--output", "report.json"}} {
 		var stdout, stderr bytes.Buffer
@@ -585,6 +791,26 @@ func TestHeadedContainerWrapperWaitsForChildBeforeStoppingXvfb(t *testing.T) {
 	}
 }
 
+func TestHeadedContainerWrapperAvoidsDelayedNumericPIDWatchdog(t *testing.T) {
+	for _, required := range []string{
+		"child_process_state()",
+		`/proc/$pid/stat`,
+		`[ "$state" = Z ]`,
+		`attempts=$((timeout * 20))`,
+		`kill -KILL "$child_pid"`,
+		`wait "$child_pid"`,
+	} {
+		if !strings.Contains(headedContainerScript, required) {
+			t.Errorf("headed cleanup missing checked child wait behavior %q", required)
+		}
+	}
+	for _, forbidden := range []string{"watchdog_pid", `sleep "${PRODUCT_CAPTURE_CHILD_STOP_TIMEOUT:-10}"`} {
+		if strings.Contains(headedContainerScript, forbidden) {
+			t.Errorf("headed cleanup retains delayed numeric PID watchdog %q", forbidden)
+		}
+	}
+}
+
 func TestAttachedContainerArgsRunRealProviderDiagnostic(t *testing.T) {
 	got := attachedProviderContainerArgs("candidate:test", "https://diagnostic.example/runs/run/attached")
 	want := []string{
@@ -612,6 +838,32 @@ func TestPinnedCloudflaredReleaseMetadata(t *testing.T) {
 	}
 }
 
+func TestPinnedCloudflaredStartCleansTempDirAfterDownloadFailure(t *testing.T) {
+	tempRoot := t.TempDir()
+	t.Setenv("TMPDIR", tempRoot)
+	tunnel := &pinnedCloudflaredTunnel{client: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("unavailable")),
+			Request:    request,
+		}, nil
+	})}}
+	if _, err := tunnel.Start(context.Background(), "http://127.0.0.1:8080"); err == nil {
+		t.Fatal("Start succeeded after cloudflared download failure")
+	}
+	if tunnel.tempDir != "" {
+		t.Fatalf("tunnel retained failed-start temp directory ownership: %s", tunnel.tempDir)
+	}
+	entries, err := os.ReadDir(tempRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("failed cloudflared start left temp entries: %v", entries)
+	}
+}
+
 func TestQuickTunnelOriginRejectsAPIAndPathURLs(t *testing.T) {
 	for _, line := range []string{
 		`failed: Post "https://api.trycloudflare.com/tunnel": certificate error`,
@@ -625,6 +877,31 @@ func TestQuickTunnelOriginRejectsAPIAndPathURLs(t *testing.T) {
 	want := "https://native-session-123.trycloudflare.com"
 	if origin := parseQuickTunnelOrigin("INF |  " + want + "  |"); origin != want {
 		t.Fatalf("generated origin = %q, want %q", origin, want)
+	}
+}
+
+func TestScanTunnelOutputDrainsBeyondRetainedLogLimit(t *testing.T) {
+	wantOrigin := "https://native-session-123.trycloudflare.com"
+	line := strings.Repeat("x", 1024) + "\n"
+	reader := bytes.NewBufferString(strings.Repeat(line, 140) + wantOrigin + "\n")
+	var retained bytes.Buffer
+	origins := make(chan string, 1)
+	if err := scanTunnelOutput(reader, &retained, origins); err != nil {
+		t.Fatalf("scanTunnelOutput: %v", err)
+	}
+	if reader.Len() != 0 {
+		t.Fatalf("tunnel reader retained %d bytes", reader.Len())
+	}
+	if retained.Len() > tunnelRetainedLogLimit {
+		t.Fatalf("retained tunnel log = %d bytes, limit %d", retained.Len(), tunnelRetainedLogLimit)
+	}
+	select {
+	case origin := <-origins:
+		if origin != wantOrigin {
+			t.Fatalf("origin = %q, want %q", origin, wantOrigin)
+		}
+	default:
+		t.Fatal("origin after retained log limit was not observed")
 	}
 }
 
@@ -669,6 +946,7 @@ func TestPinnedCloudflaredStopForceRemovesContainerAfterReapTimeout(t *testing.T
 		t.Fatal(err)
 	}
 	var calls []string
+	containerPresent := true
 	tunnel := &pinnedCloudflaredTunnel{
 		cmd:           cmd,
 		done:          done,
@@ -678,7 +956,17 @@ func TestPinnedCloudflaredStopForceRemovesContainerAfterReapTimeout(t *testing.T
 		docker: func(_ context.Context, args ...string) error {
 			calls = append(calls, strings.Join(args, " "))
 			if len(args) >= 2 && args[0] == "rm" && args[1] == "-f" {
+				if !containerPresent {
+					return errors.New("Error response from daemon: No such container")
+				}
+				containerPresent = false
 				return cmd.Process.Kill()
+			}
+			if len(args) >= 2 && args[0] == "container" && args[1] == "inspect" {
+				if containerPresent {
+					return nil
+				}
+				return errors.New("Error response from daemon: No such container")
 			}
 			return nil
 		},
@@ -699,6 +987,120 @@ func TestPinnedCloudflaredStopForceRemovesContainerAfterReapTimeout(t *testing.T
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("docker run process was not reaped after force removal")
+	}
+	if _, statErr := os.Stat(tempDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("cloudflared temp dir remains: %v", statErr)
+	}
+}
+
+func TestPinnedCloudflaredStopRemovesContainerAfterTimelyReap(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^$")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("helper process did not reap")
+	}
+
+	tempDir := filepath.Join(t.TempDir(), "cloudflared")
+	if err := os.Mkdir(tempDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	containerPresent := true
+	var calls []string
+	tunnel := &pinnedCloudflaredTunnel{
+		cmd:           cmd,
+		done:          done,
+		containerName: "product-capture-cloudflared-timely",
+		tempDir:       tempDir,
+		reapTimeout:   time.Second,
+		docker: func(_ context.Context, args ...string) error {
+			calls = append(calls, strings.Join(args, " "))
+			switch args[0] {
+			case "stop":
+				return nil
+			case "rm":
+				containerPresent = false
+				return nil
+			case "container":
+				if containerPresent {
+					return nil
+				}
+				return errors.New("Error response from daemon: No such container")
+			default:
+				return fmt.Errorf("unexpected docker command %q", args)
+			}
+		},
+	}
+	if err := tunnel.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop after timely reap: %v", err)
+	}
+	if containerPresent {
+		t.Fatal("timely reap left the named tunnel container")
+	}
+	for _, want := range []string{
+		"stop --timeout 3 product-capture-cloudflared-timely",
+		"rm -f product-capture-cloudflared-timely",
+		"container inspect product-capture-cloudflared-timely",
+	} {
+		if !slices.Contains(calls, want) {
+			t.Fatalf("docker calls = %v, missing %q", calls, want)
+		}
+	}
+}
+
+func TestPinnedCloudflaredStopPreservesForceKillError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("signal-resistant helper requires a POSIX shell")
+	}
+	cmd := exec.Command("sh", "-c", `trap '' INT TERM; echo ready; while :; do sleep 1; done`)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := bufio.NewReader(stdout).ReadString('\n'); err != nil || strings.TrimSpace(line) != "ready" {
+		t.Fatalf("wait for signal-resistant helper: line=%q err=%v", line, err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+		}
+	})
+
+	tempDir := filepath.Join(t.TempDir(), "cloudflared")
+	if err := os.Mkdir(tempDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	killErr := errors.New("injected force-kill failure")
+	tunnel := &pinnedCloudflaredTunnel{
+		cmd:         cmd,
+		done:        done,
+		tempDir:     tempDir,
+		reapTimeout: 20 * time.Millisecond,
+		killProcess: func(*os.Process) error { return killErr },
+	}
+	err = tunnel.Stop(context.Background())
+	if !errors.Is(err, killErr) {
+		t.Fatalf("Stop error = %v, want force-kill failure", err)
 	}
 	if _, statErr := os.Stat(tempDir); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("cloudflared temp dir remains: %v", statErr)
@@ -736,6 +1138,441 @@ func TestForceContainerAndWaitReapsAfterGraceTimeout(t *testing.T) {
 	}
 	if forceCalls != 1 {
 		t.Fatalf("force calls = %d, want 1", forceCalls)
+	}
+}
+
+func TestRunLifecycleScenarioCleansUpAfterContextCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	stateDir := t.TempDir()
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+state=${PRODUCT_CAPTURE_TEST_DOCKER_STATE:?}
+case "${1:-}" in
+run)
+  printf '%s\n' "$*" >"$state/run.args"
+  printf '%s\n' "$$" >"$state/run.pid"
+  : >"$state/container"
+  trap 'rm -f "$state/container"; : >"$state/stopped"; exit 0' TERM INT
+  while :; do sleep 1; done
+  ;;
+container)
+  if [ "${2:-}" = inspect ] && [ -e "$state/container" ]; then
+    exit 0
+  fi
+  echo 'Error response from daemon: No such container' >&2
+  exit 1
+  ;;
+stop)
+  printf '%s\n' "$*" >>"$state/calls"
+  kill -TERM "$(cat "$state/run.pid")"
+  ;;
+rm)
+  printf '%s\n' "$*" >>"$state/calls"
+  rm -f "$state/container"
+  kill -KILL "$(cat "$state/run.pid")" 2>/dev/null || true
+  ;;
+*)
+  echo "unexpected docker command: $*" >&2
+  exit 2
+  ;;
+esac
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_TEST_DOCKER_STATE", stateDir)
+	t.Cleanup(func() {
+		pidBytes, err := os.ReadFile(filepath.Join(stateDir, "run.pid"))
+		if err != nil {
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+		if err != nil {
+			return
+		}
+		if process, err := os.FindProcess(pid); err == nil {
+			_ = process.Kill()
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- runLifecycleScenario(ctx, "candidate:test", "https://example.test/lifecycle-hang", time.Minute, "stop")
+	}()
+	container := filepath.Join(stateDir, "container")
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(container); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("fake lifecycle container did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runLifecycleScenario error = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runLifecycleScenario did not return after cancellation")
+	}
+	calls, _ := os.ReadFile(filepath.Join(stateDir, "calls"))
+	if !strings.Contains(string(calls), "stop --time") {
+		t.Fatalf("docker calls = %q, want bounded stop after cancellation", calls)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "stopped")); err != nil {
+		t.Fatalf("docker run process returned before termination: %v", err)
+	}
+	if _, err := os.Stat(container); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fake lifecycle container remains after cancellation: %v", err)
+	}
+	runArgs, err := os.ReadFile(filepath.Join(stateDir, "run.args"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedArgs := string(runArgs)
+	for _, required := range []string{"/usr/local/bin/product-capture-provider", "--browser-diagnostic-url", "https://example.test/lifecycle-hang"} {
+		if !strings.Contains(joinedArgs, required) {
+			t.Errorf("lifecycle run args missing %q: %s", required, joinedArgs)
+		}
+	}
+}
+
+func TestRunLifecycleScenarioCleansUpWhenCanceledBeforeReadiness(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	stateDir := t.TempDir()
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+state=${PRODUCT_CAPTURE_TEST_DOCKER_STATE:?}
+case "${1:-}" in
+run)
+  printf '%s\n' "$$" >"$state/run.pid"
+  : >"$state/container"
+  trap 'rm -f "$state/container"; exit 0' TERM INT
+  while :; do sleep 1; done
+  ;;
+container)
+  echo 'Error response from daemon: No such container' >&2
+  exit 1
+  ;;
+stop)
+  printf '%s\n' "$*" >>"$state/calls"
+  kill -TERM "$(cat "$state/run.pid")" 2>/dev/null || true
+  ;;
+rm)
+  printf '%s\n' "$*" >>"$state/calls"
+  rm -f "$state/container"
+  kill -KILL "$(cat "$state/run.pid")" 2>/dev/null || true
+  ;;
+*) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_TEST_DOCKER_STATE", stateDir)
+	t.Cleanup(func() { killRecordedProcess(filepath.Join(stateDir, "run.pid")) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- runLifecycleScenario(ctx, "candidate:test", "https://example.test/lifecycle-hang", time.Minute, "stop")
+	}()
+	waitForPath(t, filepath.Join(stateDir, "container"))
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runLifecycleScenario error = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runLifecycleScenario did not return after pre-readiness cancellation")
+	}
+	calls, _ := os.ReadFile(filepath.Join(stateDir, "calls"))
+	if !strings.Contains(string(calls), "stop --time") || !strings.Contains(string(calls), "rm -f") {
+		t.Fatalf("docker calls = %q, want bounded stop and removal", calls)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "container")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fake lifecycle container remains after pre-readiness cancellation: %v", err)
+	}
+}
+
+func TestRunLifecycleScenarioCleansUpAfterEarlyDockerExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	stateDir := t.TempDir()
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+state=${PRODUCT_CAPTURE_TEST_DOCKER_STATE:?}
+case "${1:-}" in
+run)
+  printf '%s\n' "$$" >"$state/run.pid"
+  : >"$state/container"
+  while [ ! -e "$state/inspected" ]; do sleep 0.01; done
+  exit 42
+  ;;
+container)
+  if [ "${2:-}" = inspect ] && [ -e "$state/container" ]; then
+    : >"$state/inspected"
+    exit 0
+  fi
+  echo 'Error response from daemon: No such container' >&2
+  exit 1
+  ;;
+stop)
+  printf '%s\n' "$*" >>"$state/calls"
+  rm -f "$state/container"
+  ;;
+rm)
+  printf '%s\n' "$*" >>"$state/calls"
+  rm -f "$state/container"
+  ;;
+*) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_TEST_DOCKER_STATE", stateDir)
+
+	err := runLifecycleScenario(context.Background(), "candidate:test", "https://example.test/lifecycle-hang", time.Minute, "stop")
+	if err == nil || !strings.Contains(err.Error(), "container exited before stop termination") {
+		t.Fatalf("runLifecycleScenario error = %v, want early exit", err)
+	}
+	calls, _ := os.ReadFile(filepath.Join(stateDir, "calls"))
+	if !strings.Contains(string(calls), "stop --time") || !strings.Contains(string(calls), "rm -f") {
+		t.Fatalf("docker calls = %q, want bounded stop and removal", calls)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "container")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fake lifecycle container remains after Docker exit: %v", err)
+	}
+}
+
+func TestRunManagedContainerCleansUpAfterDockerExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	stateDir := t.TempDir()
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+state=${PRODUCT_CAPTURE_TEST_DOCKER_STATE:?}
+case "${1:-}" in
+run)
+  : >"$state/container"
+  exit 42
+  ;;
+container)
+  if [ "${2:-}" = inspect ] && [ -e "$state/container" ]; then exit 0; fi
+  echo 'Error response from daemon: No such container' >&2
+  exit 1
+  ;;
+stop)
+  printf '%s\n' "$*" >>"$state/calls"
+  rm -f "$state/container"
+  ;;
+rm)
+  printf '%s\n' "$*" >>"$state/calls"
+  rm -f "$state/container"
+  ;;
+*) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_TEST_DOCKER_STATE", stateDir)
+
+	err := runManagedContainer(context.Background(), "candidate-exit", []string{"run", "--name", "candidate-exit", "candidate:test"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "candidate container candidate-exit") {
+		t.Fatalf("runManagedContainer error = %v, want candidate exit failure", err)
+	}
+	calls, _ := os.ReadFile(filepath.Join(stateDir, "calls"))
+	if !strings.Contains(string(calls), "stop --time") || !strings.Contains(string(calls), "rm -f") {
+		t.Fatalf("docker calls = %q, want bounded stop and removal", calls)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "container")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fake candidate container remains after Docker exit: %v", err)
+	}
+}
+
+func TestRunManagedContainerCancellationRemovesContainerAfterTimelyReap(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	stateDir := t.TempDir()
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+state=${PRODUCT_CAPTURE_TEST_DOCKER_STATE:?}
+case "${1:-}" in
+run)
+  printf '%s\n' "$$" >"$state/run.pid"
+  : >"$state/container"
+  trap 'exit 0' TERM INT
+  while :; do sleep 0.01; done
+  ;;
+container)
+  if [ "${2:-}" = inspect ] && [ -e "$state/container" ]; then exit 0; fi
+  echo 'Error response from daemon: No such container' >&2
+  exit 1
+  ;;
+stop)
+  printf '%s\n' "$*" >>"$state/calls"
+  kill -TERM "$(cat "$state/run.pid")" 2>/dev/null || true
+  ;;
+rm)
+  printf '%s\n' "$*" >>"$state/calls"
+  rm -f "$state/container"
+  ;;
+*) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_TEST_DOCKER_STATE", stateDir)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- runManagedContainer(ctx, "candidate-canceled", []string{"run", "--name", "candidate-canceled", "candidate:test"}, nil)
+	}()
+	waitForPath(t, filepath.Join(stateDir, "container"))
+	cancel()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("runManagedContainer error = %v, want context canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runManagedContainer did not return after cancellation")
+	}
+	calls, _ := os.ReadFile(filepath.Join(stateDir, "calls"))
+	if !strings.Contains(string(calls), "stop --time") || !strings.Contains(string(calls), "rm -f") {
+		t.Fatalf("docker calls = %q, want bounded stop and final removal", calls)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "container")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fake candidate container remains after cancellation: %v", err)
+	}
+}
+
+func TestDockerOutputRunCleansUpAfterCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	stateDir := t.TempDir()
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+state=${PRODUCT_CAPTURE_TEST_DOCKER_STATE:?}
+case "${1:-}" in
+run)
+  printf '%s\n' "$$" >"$state/run.pid"
+  : >"$state/container"
+  trap 'rm -f "$state/container"; exit 0' TERM INT
+  while :; do sleep 1; done
+  ;;
+container)
+  if [ "${2:-}" = inspect ] && [ -e "$state/container" ]; then exit 0; fi
+  echo 'Error response from daemon: No such container' >&2
+  exit 1
+  ;;
+stop)
+  printf '%s\n' "$*" >>"$state/calls"
+  kill -TERM "$(cat "$state/run.pid")" 2>/dev/null || true
+  ;;
+rm)
+  printf '%s\n' "$*" >>"$state/calls"
+  rm -f "$state/container"
+  kill -KILL "$(cat "$state/run.pid")" 2>/dev/null || true
+  ;;
+*) exit 2 ;;
+esac
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_TEST_DOCKER_STATE", stateDir)
+	t.Cleanup(func() { killRecordedProcess(filepath.Join(stateDir, "run.pid")) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		_, err := dockerOutput(ctx, "run", "--rm", "candidate:test", "--version")
+		result <- err
+	}()
+	waitForPath(t, filepath.Join(stateDir, "container"))
+	cancel()
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Fatal("dockerOutput succeeded after cancellation")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("dockerOutput did not return after cancellation")
+	}
+	calls, _ := os.ReadFile(filepath.Join(stateDir, "calls"))
+	if !strings.Contains(string(calls), "stop --time") || !strings.Contains(string(calls), "rm -f") {
+		t.Fatalf("docker calls = %q, want bounded stop and removal", calls)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "container")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("version probe container remains after cancellation: %v", err)
+	}
+}
+
+func waitForPath(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("path did not appear: %s", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func killRecordedProcess(path string) {
+	pidBytes, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBytes)))
+	if err != nil {
+		return
+	}
+	if process, err := os.FindProcess(pid); err == nil {
+		_ = process.Kill()
 	}
 }
 
@@ -860,10 +1697,29 @@ type fakeTunnel struct {
 	stopCalls int
 }
 
+type failingListener struct {
+	err error
+}
+
+func (l *failingListener) Accept() (net.Conn, error) { return nil, l.err }
+func (*failingListener) Close() error                { return nil }
+func (*failingListener) Addr() net.Addr              { return &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 43123} }
+
+type contextCancellationTunnel struct{}
+
+func (contextCancellationTunnel) Start(ctx context.Context, _ string) (string, error) {
+	<-ctx.Done()
+	return "", ctx.Err()
+}
+
+func (contextCancellationTunnel) Stop(context.Context) error { return nil }
+
 type sequenceTunnel struct {
-	origins    []string
-	startCalls int
-	stopCalls  int
+	origins     []string
+	startErrors []error
+	stopErrors  []error
+	startCalls  int
+	stopCalls   int
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -937,13 +1793,21 @@ func (t *sequenceTunnel) Start(context.Context, string) (string, error) {
 	if t.startCalls >= len(t.origins) {
 		return "", errors.New("unexpected tunnel start")
 	}
-	origin := t.origins[t.startCalls]
+	index := t.startCalls
+	origin := t.origins[index]
 	t.startCalls++
+	if index < len(t.startErrors) && t.startErrors[index] != nil {
+		return "", t.startErrors[index]
+	}
 	return origin, nil
 }
 
 func (t *sequenceTunnel) Stop(context.Context) error {
+	index := t.stopCalls
 	t.stopCalls++
+	if index < len(t.stopErrors) {
+		return t.stopErrors[index]
+	}
 	return nil
 }
 
@@ -979,7 +1843,7 @@ func matchingObservation(kind string) Observation {
 				Platform: `"Linux"`,
 			},
 			SecFetch:    SecFetchSignals{Dest: "document", Mode: "navigate", Site: "none", User: "?1"},
-			HeaderOrder: []string{"user-agent", "sec-ch-ua", "sec-fetch-site"},
+			HeaderNames: []string{"user-agent", "sec-ch-ua", "sec-fetch-site"},
 		},
 		FirstNavigationOrigin: "https://diagnostic.example",
 		Timing:                map[string]float64{"navigation_ms": 10},

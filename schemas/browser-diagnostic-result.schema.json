@@ -28,26 +28,135 @@
       "properties": {
         "navigator": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "webdriver": { "type": ["boolean", "null"] },
             "user_agent": { "type": "string", "minLength": 1, "maxLength": 1024 },
+            "user_agent_data": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "properties": {
+                "brands": {
+                  "type": "array",
+                  "maxItems": 20,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "brand": { "type": "string", "maxLength": 256 },
+                      "version": { "type": "string", "maxLength": 128 }
+                    },
+                    "required": ["brand", "version"]
+                  }
+                },
+                "mobile": { "type": "boolean" },
+                "platform": { "type": "string", "maxLength": 128 }
+              },
+              "required": ["brands", "mobile", "platform"]
+            },
+            "user_agent_high_entropy": {
+              "type": ["object", "null"],
+              "additionalProperties": false,
+              "properties": {
+                "architecture": { "type": "string", "maxLength": 128 },
+                "bitness": { "type": "string", "maxLength": 128 },
+                "brands": {
+                  "type": "array",
+                  "maxItems": 20,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "brand": { "type": "string", "maxLength": 256 },
+                      "version": { "type": "string", "maxLength": 128 }
+                    },
+                    "required": ["brand", "version"]
+                  }
+                },
+                "mobile": { "type": "boolean" },
+                "model": { "type": "string", "maxLength": 256 },
+                "platform": { "type": "string", "maxLength": 128 },
+                "platformVersion": { "type": "string", "maxLength": 128 },
+                "uaFullVersion": { "type": "string", "maxLength": 128 },
+                "fullVersionList": {
+                  "type": "array",
+                  "maxItems": 20,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                      "brand": { "type": "string", "maxLength": 256 },
+                      "version": { "type": "string", "maxLength": 128 }
+                    },
+                    "required": ["brand", "version"]
+                  }
+                }
+              }
+            },
             "language": { "type": "string", "minLength": 1, "maxLength": 128 },
-            "platform": { "type": "string", "minLength": 1, "maxLength": 128 }
+            "languages": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 20,
+              "items": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "platform": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "hardware_concurrency": { "type": ["integer", "null"], "minimum": 0 },
+            "device_memory": { "type": ["number", "null"], "minimum": 0 },
+            "max_touch_points": { "type": ["integer", "null"], "minimum": 0 },
+            "plugins": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "length": { "type": "integer", "minimum": 0 },
+                "names": {
+                  "type": "array",
+                  "maxItems": 64,
+                  "items": { "type": "string", "maxLength": 256 }
+                }
+              },
+              "required": ["length", "names"]
+            },
+            "mime_types": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "length": { "type": "integer", "minimum": 0 },
+                "names": {
+                  "type": "array",
+                  "maxItems": 128,
+                  "items": { "type": "string", "maxLength": 256 }
+                }
+              },
+              "required": ["length", "names"]
+            }
           },
-          "required": ["webdriver", "user_agent", "language", "platform"]
+          "required": [
+            "webdriver", "user_agent", "user_agent_data", "user_agent_high_entropy",
+            "language", "languages", "platform", "hardware_concurrency", "device_memory",
+            "max_touch_points", "plugins", "mime_types"
+          ]
         },
         "window": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "outer_width": { "type": ["integer", "null"] },
             "outer_height": { "type": ["integer", "null"] },
             "inner_width": { "type": ["integer", "null"] },
-            "inner_height": { "type": ["integer", "null"] }
+            "inner_height": { "type": ["integer", "null"] },
+            "device_pixel_ratio": { "type": ["number", "null"], "minimum": 0 },
+            "chrome_runtime_present": { "type": "boolean" },
+            "prefers_color_scheme_dark": { "type": ["boolean", "null"] }
           },
-          "required": ["outer_width", "outer_height", "inner_width", "inner_height"]
+          "required": [
+            "outer_width", "outer_height", "inner_width", "inner_height",
+            "device_pixel_ratio", "chrome_runtime_present", "prefers_color_scheme_dark"
+          ]
         },
         "automation": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "playwright_binding_present": { "type": "boolean" },
             "playwright_init_scripts_present": { "type": "boolean" }
@@ -56,22 +165,31 @@
         },
         "screen": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "width": { "type": ["integer", "null"] },
-            "height": { "type": ["integer", "null"] }
+            "height": { "type": ["integer", "null"] },
+            "avail_width": { "type": ["integer", "null"] },
+            "avail_height": { "type": ["integer", "null"] },
+            "color_depth": { "type": ["integer", "null"], "minimum": 0 },
+            "pixel_depth": { "type": ["integer", "null"], "minimum": 0 }
           },
-          "required": ["width", "height"]
+          "required": ["width", "height", "avail_width", "avail_height", "color_depth", "pixel_depth"]
         },
         "document": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "cookie_present": { "type": "boolean" },
-            "cookie_length": { "type": "integer", "minimum": 0 }
+            "cookie_length": { "type": "integer", "minimum": 0 },
+            "visibility_state": { "type": "string", "maxLength": 128 },
+            "has_focus": { "type": ["boolean", "null"] }
           },
-          "required": ["cookie_present", "cookie_length"]
+          "required": ["cookie_present", "cookie_length", "visibility_state", "has_focus"]
         },
         "intl": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
             "timezone": { "type": "string", "minLength": 1, "maxLength": 128 }
           },
@@ -79,8 +197,11 @@
         },
         "webgl": {
           "type": "object",
+          "additionalProperties": false,
           "properties": {
-            "available": { "type": "boolean" }
+            "available": { "type": "boolean" },
+            "vendor": { "type": ["string", "null"], "maxLength": 1024 },
+            "renderer": { "type": ["string", "null"], "maxLength": 2048 }
           },
           "required": ["available"]
         }

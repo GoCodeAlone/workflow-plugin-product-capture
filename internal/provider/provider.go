@@ -15,12 +15,17 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	coreprotocol "github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
 	"github.com/GoCodeAlone/workflow-plugin-product-capture/internal/snapshot"
+	providerschemas "github.com/GoCodeAlone/workflow-plugin-product-capture/schemas"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 const (
@@ -35,6 +40,8 @@ const (
 	CaptureModeMeta               = "metadata"
 	ComputeProtocolVersion        = "compute.v1alpha1"
 	productArtifactMode           = 0o644
+	browserCommandStopGrace       = 3 * time.Second
+	maxBrowserDiagnosticBytes     = 1 << 20
 )
 
 var Version = "0.1.0"
@@ -52,6 +59,38 @@ type browserDiagnosticTarget struct {
 }
 
 var browserProcesses browserProcessPolicy = newBrowserProcessPolicy()
+var browserCommandCleanupStates sync.Map
+var browserDiagnosticSchemaOnce sync.Once
+var browserDiagnosticSchema *jsonschema.Schema
+var browserDiagnosticSchemaErr error
+
+type boundedDiagnosticBuffer struct {
+	bytes.Buffer
+}
+
+func (b *boundedDiagnosticBuffer) Write(data []byte) (int, error) {
+	if len(data) > maxBrowserDiagnosticBytes-b.Len() {
+		return 0, fmt.Errorf("browser diagnostic output exceeds %d bytes", maxBrowserDiagnosticBytes)
+	}
+	return b.Buffer.Write(data)
+}
+
+type browserCommandCleanupState struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (s *browserCommandCleanupState) record(err error) {
+	s.mu.Lock()
+	s.err = err
+	s.mu.Unlock()
+}
+
+func (s *browserCommandCleanupState) load() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
 
 var supportedAmazonHosts = map[string]struct{}{
 	"amazon.com":     {},
@@ -586,6 +625,9 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	timeout := time.Duration(timeoutSeconds(w.TimeoutSeconds)) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
 	defer cancel()
+	if err := browserDisplayPreflight(runtime.GOOS, browserHeadlessEnabled(), strings.TrimSpace(os.Getenv("DISPLAY")), exec.LookPath); err != nil {
+		return "", err
+	}
 
 	scriptPath, err := writeBrowserCaptureScript()
 	if err != nil {
@@ -594,6 +636,7 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	defer os.RemoveAll(filepath.Dir(scriptPath))
 
 	cmd := browserNodeCommand(ctx, scriptPath, w.URL, fmt.Sprintf("%d", timeout.Milliseconds()))
+	defer browserCommandCleanupStates.Delete(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", "")
@@ -684,6 +727,9 @@ func writeBrowserCaptureScript() (string, error) {
 func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	if err := browserDisplayPreflight(runtime.GOOS, browserHeadlessEnabled(), strings.TrimSpace(os.Getenv("DISPLAY")), exec.LookPath); err != nil {
+		return err
+	}
 	target, err := resolveBrowserDiagnosticTarget(
 		ctx,
 		rawURL,
@@ -699,13 +745,15 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 	}
 	defer os.RemoveAll(filepath.Dir(scriptPath))
 	cmd := browserNodeCommand(ctx, scriptPath, rawURL)
+	defer browserCommandCleanupStates.Delete(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", target.allowedOrigin)
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", target.resolverRules)
+	var diagnosticOutput boundedDiagnosticBuffer
 	var stderr bytes.Buffer
-	cmd.Stdout = stdout
+	cmd.Stdout = &diagnosticOutput
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		cleanupErr := cleanupBrowserCommandAfterError(ctx, cmd)
@@ -715,11 +763,56 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 		}
 		return errors.Join(fmt.Errorf("browser diagnostic failed: %s", msg), cleanupErr)
 	}
+	if err := validateBrowserDiagnosticArtifact(diagnosticOutput.Bytes()); err != nil {
+		return fmt.Errorf("browser diagnostic output schema: %w", err)
+	}
+	if _, err := stdout.Write(diagnosticOutput.Bytes()); err != nil {
+		return fmt.Errorf("write browser diagnostic output: %w", err)
+	}
 	return nil
 }
 
+func validateBrowserDiagnosticArtifact(data []byte) error {
+	var artifact any
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		return fmt.Errorf("decode: %w", err)
+	}
+	schema, err := compiledBrowserDiagnosticSchema()
+	if err != nil {
+		return err
+	}
+	return schema.Validate(artifact)
+}
+
+func compiledBrowserDiagnosticSchema() (*jsonschema.Schema, error) {
+	browserDiagnosticSchemaOnce.Do(func() {
+		var document any
+		if err := json.Unmarshal(providerschemas.BrowserDiagnosticResult(), &document); err != nil {
+			browserDiagnosticSchemaErr = fmt.Errorf("decode embedded browser diagnostic schema: %w", err)
+			return
+		}
+		const resource = "https://provider.invalid/browser-diagnostic-result.schema.json"
+		compiler := jsonschema.NewCompiler()
+		compiler.AssertFormat()
+		if err := compiler.AddResource(resource, document); err != nil {
+			browserDiagnosticSchemaErr = fmt.Errorf("load embedded browser diagnostic schema: %w", err)
+			return
+		}
+		browserDiagnosticSchema, browserDiagnosticSchemaErr = compiler.Compile(resource)
+	})
+	return browserDiagnosticSchema, browserDiagnosticSchemaErr
+}
+
 func cleanupBrowserCommandAfterError(_ context.Context, cmd *exec.Cmd) error {
-	if err := browserProcesses.TerminateGroup(cmd, 500*time.Millisecond); err != nil {
+	if stateValue, ok := browserCommandCleanupStates.Load(cmd); ok {
+		if cleanupErr := stateValue.(*browserCommandCleanupState).load(); cleanupErr != nil {
+			return fmt.Errorf("terminate browser process group after command error: %w", cleanupErr)
+		}
+	}
+	if cmd == nil || cmd.Process == nil || cmd.ProcessState != nil {
+		return nil
+	}
+	if err := browserProcesses.TerminateGroup(cmd, browserCommandStopGrace); err != nil {
 		return fmt.Errorf("terminate browser process group after command error: %w", err)
 	}
 	return nil
@@ -741,6 +834,9 @@ func runBoundedBrowserCleanupCommand(timeout time.Duration, name string, args ..
 }
 
 func resolveBrowserDiagnosticTarget(ctx context.Context, rawURL, allowedOrigins string, lookup browserDiagnosticLookup) (browserDiagnosticTarget, error) {
+	if utf8.RuneCountInString(rawURL) > 2048 {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostic URL exceeds 2048 characters")
+	}
 	if strings.TrimSpace(allowedOrigins) == "" {
 		return browserDiagnosticTarget{}, errors.New("browser diagnostics are disabled; PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS is unset")
 	}
@@ -871,8 +967,12 @@ func browserNodeCommand(ctx context.Context, scriptPath string, args ...string) 
 		cmd = exec.CommandContext(ctx, "node", nodeArgs...)
 	}
 	browserProcesses.Configure(cmd)
+	cleanupState := &browserCommandCleanupState{}
+	browserCommandCleanupStates.Store(cmd, cleanupState)
 	cmd.Cancel = func() error {
-		return browserProcesses.TerminateGroup(cmd, 500*time.Millisecond)
+		err := browserProcesses.TerminateGroup(cmd, browserCommandStopGrace)
+		cleanupState.record(err)
+		return err
 	}
 	return cmd
 }
@@ -883,6 +983,16 @@ func browserShouldUseXvfb() bool {
 	}
 	_, err := exec.LookPath("xvfb-run")
 	return err == nil
+}
+
+func browserDisplayPreflight(goos string, headless bool, display string, lookup func(string) (string, error)) error {
+	if goos != "linux" || headless || strings.TrimSpace(display) != "" {
+		return nil
+	}
+	if _, err := lookup("xvfb-run"); err != nil {
+		return fmt.Errorf("headed browser requires DISPLAY or xvfb-run on Linux: %w", err)
+	}
+	return nil
 }
 
 func browserHeadlessEnabled() bool {
@@ -966,6 +1076,10 @@ function remainingTimeout(deadline) {
   return Math.max(0, deadline - Date.now());
 }
 
+function monotonicMilliseconds() {
+  return Number(process.hrtime.bigint() / 1000000n);
+}
+
 function isTransientNavigationError(err) {
   const message = err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
   return [
@@ -989,6 +1103,10 @@ function isBrowserTargetCrashError(err) {
     'context has been closed',
     'page has been closed',
   ].some((needle) => normalized.includes(needle));
+}
+
+function errorMessage(err) {
+  return err && (err.message || err.stack) ? String(err.message || err.stack) : String(err);
 }
 
 function diagnosticErrorToken(err) {
@@ -1046,6 +1164,7 @@ let browserShutdownStarted = false;
 
 function chromeProcessAlive(chrome) {
   if (!chrome || !chrome.pid || chrome.chromeExit !== null) return false;
+  assertChromeProcessIdentity(chrome, 'during liveness check');
   return processIsRunning(chrome.pid);
 }
 
@@ -1064,21 +1183,143 @@ function processIsRunning(processID) {
 }
 
 function linuxProcessStat(processID) {
-  let stat;
-  try {
-    stat = fs.readFileSync('/proc/' + processID + '/stat', 'utf8');
-  } catch (err) {
-    if (err && err.code === 'ENOENT') return null;
+  let malformedError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let stat;
+    try {
+      stat = fs.readFileSync('/proc/' + processID + '/stat', 'utf8');
+    } catch (err) {
+      if (err && err.code === 'ENOENT') return null;
+      throw err;
+    }
+    const close = stat.lastIndexOf(')');
+    if (close < 0) {
+      malformedError = new Error('malformed procfs stat for PID ' + processID);
+      continue;
+    }
+    const fields = stat.slice(close + 2).trim().split(/\s+/);
+    const parentProcessID = Number(fields[1]);
+    const processGroupID = Number(fields[2]);
+    const sessionID = Number(fields[3]);
+    const startTime = fields[19];
+    if (
+      fields.length < 20 ||
+      !/^[A-Za-z]$/.test(fields[0] || '') ||
+      !Number.isInteger(parentProcessID) || parentProcessID < 0 ||
+      !Number.isInteger(processGroupID) || processGroupID < 0 ||
+      !Number.isInteger(sessionID) || sessionID < 0 ||
+      !/^\d+$/.test(startTime || '')
+    ) {
+      malformedError = new Error('malformed procfs process group for PID ' + processID);
+      continue;
+    }
+    return { state: fields[0], processGroupID, startTime };
+  }
+  throw malformedError;
+}
+
+function captureChromeProcessIdentity(chrome) {
+  if (process.platform !== 'linux') return;
+  if (!chrome || !Number.isInteger(chrome.pid) || chrome.pid <= 0) {
+    throw new Error('google-chrome did not expose a valid Linux process ID');
+  }
+  const stat = linuxProcessStat(chrome.pid);
+  if (!stat || stat.state === 'Z') {
+    throw new Error('google-chrome exited before its Linux process identity was captured');
+  }
+  if (stat.processGroupID !== chrome.pid) {
+    throw new Error('google-chrome is not the leader of its dedicated Linux process group');
+  }
+  chrome.linuxStartTime = stat.startTime;
+}
+
+function captureChromeBrowserProcessIdentity(chrome) {
+  if (process.platform !== 'linux') {
+    chrome.browserPID = chrome.pid;
+    return;
+  }
+  if (!Number.isInteger(chrome.browserPID) || chrome.browserPID <= 0) {
+    throw new Error('google-chrome supervisor did not expose a valid browser process ID');
+  }
+  const stat = linuxProcessStat(chrome.browserPID);
+  if (!stat || stat.state === 'Z') {
+    throw new Error('google-chrome exited before its Linux browser identity was captured');
+  }
+  if (stat.processGroupID !== chrome.pid) {
+    throw new Error('google-chrome browser is outside its dedicated Linux process group');
+  }
+  chrome.linuxBrowserStartTime = stat.startTime;
+}
+
+function chromeBrowserProcessAlive(chrome) {
+  if (process.platform !== 'linux') return chromeProcessAlive(chrome);
+  if (!chrome || !chrome.linuxBrowserStartTime || !Number.isInteger(chrome.browserPID)) return false;
+  const browserProcess = linuxProcessStat(chrome.browserPID);
+  if (!browserProcess || browserProcess.state === 'Z') return false;
+  if (browserProcess.startTime !== chrome.linuxBrowserStartTime) {
+    const err = new Error('Chrome browser process identity changed during liveness check');
+    err.code = 'PRODUCT_CAPTURE_CHROME_IDENTITY_CHANGED';
     throw err;
   }
-  const close = stat.lastIndexOf(')');
-  if (close < 0) throw new Error('malformed procfs stat for PID ' + processID);
-  const fields = stat.slice(close + 2).trim().split(/\s+/);
-  const processGroupID = Number(fields[2]);
-  if (!fields[0] || !Number.isInteger(processGroupID) || processGroupID < 0) {
-    throw new Error('malformed procfs process group for PID ' + processID);
+  if (browserProcess.processGroupID !== chrome.pid) {
+    throw new Error('Chrome browser left its dedicated Linux process group');
   }
-  return { state: fields[0], processGroupID };
+  return true;
+}
+
+function readLinuxChromeBrowserPID(chrome, timeoutMilliseconds) {
+  if (!chrome || !chrome.stdout) return Promise.reject(new Error('google-chrome supervisor stdout is unavailable'));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let output = '';
+    let timer;
+    const finish = (err, processID) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      chrome.stdout.off('data', onData);
+      chrome.stdout.off('error', onError);
+      chrome.stdout.off('end', onEnd);
+      if (err) reject(err); else resolve(processID);
+    };
+    const onData = (chunk) => {
+      output += String(chunk);
+      if (output.length > 64) return finish(new Error('google-chrome supervisor PID output is too large'));
+      const newline = output.indexOf('\n');
+      if (newline < 0) return;
+      const value = output.slice(0, newline).trim();
+      if (!/^[1-9]\d*$/.test(value)) return finish(new Error('google-chrome supervisor emitted an invalid browser PID'));
+      const processID = Number(value);
+      if (!Number.isSafeInteger(processID)) return finish(new Error('google-chrome supervisor browser PID is out of range'));
+      finish(null, processID);
+    };
+    const onError = (err) => finish(new Error('google-chrome supervisor stdout failed: ' + boundedBrowserErrorMessage(err), { cause: err }));
+    const onEnd = () => finish(new Error('google-chrome supervisor exited before emitting its browser PID'));
+    chrome.stdout.on('data', onData);
+    chrome.stdout.once('error', onError);
+    chrome.stdout.once('end', onEnd);
+    timer = setTimeout(() => finish(new Error('google-chrome supervisor PID timed out')), timeoutMilliseconds);
+  });
+}
+
+function assertChromeProcessIdentity(chrome, operation) {
+  if (process.platform !== 'linux') return;
+  if (!chrome || !chrome.linuxStartTime) {
+    const err = new Error('Chrome process identity is unavailable ' + operation);
+    err.code = 'PRODUCT_CAPTURE_CHROME_IDENTITY_UNAVAILABLE';
+    throw err;
+  }
+  const leader = linuxProcessStat(chrome.pid);
+  if (!leader) {
+    const err = new Error('Chrome process identity is unavailable ' + operation);
+    err.code = 'PRODUCT_CAPTURE_CHROME_IDENTITY_UNAVAILABLE';
+    throw err;
+  }
+  if (leader.startTime !== chrome.linuxStartTime) {
+    const err = new Error('Chrome process identity changed ' + operation);
+    err.code = 'PRODUCT_CAPTURE_CHROME_IDENTITY_CHANGED';
+    throw err;
+  }
 }
 
 function linuxProcessGroupMembers(processGroupID) {
@@ -1153,7 +1394,7 @@ async function selectLoopbackPort() {
 }
 
 function chromeEndpointReady(port, absoluteDeadline) {
-  const remaining = Math.max(0, Number(absoluteDeadline || 0) - Date.now());
+  const remaining = Math.max(0, Number(absoluteDeadline || 0) - monotonicMilliseconds());
   if (remaining <= 0) return Promise.resolve(false);
   return new Promise((resolve) => {
     let settled = false;
@@ -1196,15 +1437,18 @@ function chromeEndpointReady(port, absoluteDeadline) {
 }
 
 async function waitForChromeEndpoint(chrome, cdpPort) {
-  const deadline = Date.now() + 15000;
-  while (Date.now() < deadline) {
+  const deadline = monotonicMilliseconds() + 15000;
+  while (monotonicMilliseconds() < deadline) {
     if (chrome.startError) throw chrome.startError;
     if (chrome.chromeExit !== null) {
       throw new Error('google-chrome exited before opening its CDP listener');
     }
-    const ownsListener = ownsChromeListeningPort(chrome.pid, cdpPort);
+    const childAlive = chromeProcessAlive(chrome);
+    const browserAlive = childAlive && chromeBrowserProcessAlive(chrome);
+    if (childAlive && !browserAlive) throw new Error('google-chrome exited before opening its CDP listener');
+    const ownsListener = browserAlive ? ownsChromeListeningPort(chrome.pid, cdpPort) : false;
     if (
-      chromeProcessAlive(chrome) &&
+      browserAlive &&
       (process.platform !== 'linux' || ownsListener) &&
       await chromeEndpointReady(cdpPort, deadline)
     ) {
@@ -1216,7 +1460,8 @@ async function waitForChromeEndpoint(chrome, cdpPort) {
 }
 
 async function verifyAttachedBrowserProcess(browser, chrome) {
-  if (!chromeProcessAlive(chrome)) throw new Error('spawned Chrome child exited before CDP identity verification');
+  if (!chromeProcessAlive(chrome)) throw new Error('spawned Chrome supervisor exited before CDP identity verification');
+  if (!chromeBrowserProcessAlive(chrome)) throw new Error('spawned Chrome child exited before CDP identity verification');
   const session = await boundedBrowserStartupPromise(
     browser.newBrowserCDPSession(),
     1000,
@@ -1230,13 +1475,14 @@ async function verifyAttachedBrowserProcess(browser, chrome) {
     );
     const processes = Array.isArray(result && result.processInfo) ? result.processInfo : [];
     const browserProcesses = processes.filter((entry) => entry.type === 'browser');
-    if (browserProcesses.length !== 1 || Number(browserProcesses[0].id) !== chrome.pid) {
+    if (browserProcesses.length !== 1 || Number(browserProcesses[0].id) !== chrome.browserPID) {
       throw new Error('attached CDP browser is not the spawned Chrome child');
     }
   } finally {
     await boundedBrowserStartupPromise(session.detach(), 1000, 'CDP identity session detach timed out');
   }
-  if (!chromeProcessAlive(chrome)) throw new Error('spawned Chrome child exited during CDP identity verification');
+  if (!chromeProcessAlive(chrome)) throw new Error('spawned Chrome supervisor exited during CDP identity verification');
+  if (!chromeBrowserProcessAlive(chrome)) throw new Error('spawned Chrome child exited during CDP identity verification');
 }
 
 async function boundedBrowserStartupPromise(promise, timeoutMilliseconds, message) {
@@ -1256,6 +1502,7 @@ async function boundedBrowserStartupPromise(promise, timeoutMilliseconds, messag
 function chromeProcessBoundaryAlive(chrome) {
   if (process.platform !== 'linux') return chromeProcessAlive(chrome);
   if (!chrome || !Number.isInteger(chrome.pid) || chrome.pid <= 0) return false;
+  assertChromeProcessIdentity(chrome, 'during process-group inspection');
   try {
     process.kill(-chrome.pid, 0);
   } catch (err) {
@@ -1268,9 +1515,19 @@ function chromeProcessBoundaryAlive(chrome) {
   return false;
 }
 
+function chromeProcessBoundaryAliveAfterKill(chrome) {
+  if (process.platform !== 'linux') return chromeProcessAlive(chrome);
+  if (!chrome || !Number.isInteger(chrome.pid) || chrome.pid <= 0) return false;
+  for (const state of linuxProcessGroupMembers(chrome.pid).values()) {
+    if (state !== 'Z') return true;
+  }
+  return false;
+}
+
 function signalChromeProcessBoundary(chrome, signal) {
   if (!chrome || !Number.isInteger(chrome.pid) || chrome.pid <= 0) return false;
   if (process.platform !== 'linux') return chrome.kill(signal);
+  assertChromeProcessIdentity(chrome, 'before process-group signal');
   const target = -chrome.pid;
   try {
     process.kill(target, signal);
@@ -1281,24 +1538,117 @@ function signalChromeProcessBoundary(chrome, signal) {
   }
 }
 
+function killFreshChromeProcessBoundary(chrome) {
+  // This marker is created by detached spawn and consumed before the first event-loop yield.
+  if (
+    process.platform !== 'linux' ||
+    !chrome ||
+    !Number.isInteger(chrome.pid) ||
+    chrome.pid <= 0 ||
+    chrome.linuxFreshProcessBoundary !== true
+  ) {
+    throw new Error('fresh Chrome process boundary is unavailable');
+  }
+  chrome.linuxFreshProcessBoundary = false;
+  try {
+    process.kill(-chrome.pid, 'SIGKILL');
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ESRCH') return false;
+    throw err;
+  }
+}
+
+async function captureChromeProcessIdentityOrAbort(chrome, graceMilliseconds) {
+  try {
+    captureChromeProcessIdentity(chrome);
+    chrome.linuxFreshProcessBoundary = false;
+  } catch (identityError) {
+    let abortError = null;
+    try {
+      killFreshChromeProcessBoundary(chrome);
+      chrome.linuxProcessBoundaryTerminated = true;
+      if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
+      if (chrome.chromeExit === null) {
+        throw new Error('fresh google-chrome process-group leader was not reaped after SIGKILL');
+      }
+    } catch (err) {
+      abortError = err;
+    }
+    if (abortError) {
+      const combined = new AggregateError(
+        [identityError, abortError],
+        errorMessage(identityError) + '; fresh Chrome abort failed: ' + errorMessage(abortError),
+        { cause: identityError },
+      );
+      combined.browserCleanupFailed = true;
+      throw combined;
+    }
+    throw identityError;
+  }
+}
+
 async function waitForChromeProcessBoundaryExit(chrome, graceMilliseconds) {
-  const deadline = Date.now() + Math.max(0, graceMilliseconds);
-  while (Date.now() < deadline) {
+  const deadline = monotonicMilliseconds() + Math.max(0, graceMilliseconds);
+  while (monotonicMilliseconds() < deadline) {
     if (!chromeProcessBoundaryAlive(chrome)) return true;
     await delay(25);
   }
   return !chromeProcessBoundaryAlive(chrome);
 }
 
+async function waitForChromeProcessBoundaryExitAfterKill(chrome, graceMilliseconds) {
+  const deadline = monotonicMilliseconds() + Math.max(0, graceMilliseconds);
+  while (monotonicMilliseconds() < deadline) {
+    if (!chromeProcessBoundaryAliveAfterKill(chrome)) return true;
+    await delay(25);
+  }
+  return !chromeProcessBoundaryAliveAfterKill(chrome);
+}
+
 async function terminateChromeChild(chrome, graceMilliseconds) {
   if (!chrome) return;
   if (process.platform === 'linux') {
-    if (chromeProcessBoundaryAlive(chrome)) signalChromeProcessBoundary(chrome, 'SIGTERM');
-    if (!await waitForChromeProcessBoundaryExit(chrome, graceMilliseconds)) {
-      signalChromeProcessBoundary(chrome, 'SIGKILL');
-      if (!await waitForChromeProcessBoundaryExit(chrome, graceMilliseconds)) {
-        throw new Error('Chrome process group survived SIGKILL');
+    if (chrome.linuxProcessBoundaryTerminated === true) {
+      if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
+      if (chrome.chromeExit === null) throw new Error('terminated google-chrome process-group leader was not reaped');
+      return;
+    }
+    let termSent = false;
+    let killSent = false;
+    try {
+      termSent = signalChromeProcessBoundary(chrome, 'SIGTERM');
+      if (termSent && !await waitForChromeProcessBoundaryExit(chrome, graceMilliseconds)) {
+        killSent = signalChromeProcessBoundary(chrome, 'SIGKILL');
+        if (killSent && !await waitForChromeProcessBoundaryExitAfterKill(chrome, graceMilliseconds)) {
+          throw new Error('Chrome process group survived SIGKILL');
+        }
       }
+    } catch (inspectionError) {
+      if (killSent) throw inspectionError;
+      if (termSent && (!inspectionError || inspectionError.code !== 'PRODUCT_CAPTURE_CHROME_IDENTITY_CHANGED')) {
+        let fallbackError = null;
+        try {
+          const fallbackKillSent = signalChromeProcessBoundary(chrome, 'SIGKILL');
+          if (fallbackKillSent && !await waitForChromeProcessBoundaryExitAfterKill(chrome, graceMilliseconds)) {
+            throw new Error('Chrome process group survived fallback SIGKILL');
+          }
+          if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
+          if (chrome.chromeExit === null) {
+            throw new Error('google-chrome process-group leader was not reaped after fallback SIGKILL');
+          }
+        } catch (err) {
+          fallbackError = err;
+        }
+        if (fallbackError) {
+          throw new AggregateError(
+            [inspectionError, fallbackError],
+            errorMessage(inspectionError) + '; fallback SIGKILL failed: ' + errorMessage(fallbackError),
+            { cause: inspectionError },
+          );
+        }
+      }
+      throw inspectionError;
     }
     if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
     if (chrome.chromeExit === null) throw new Error('google-chrome process-group leader was not reaped');
@@ -1328,6 +1678,34 @@ async function shutdownBrowserProcess(exitCode) {
 process.once('SIGTERM', () => { void shutdownBrowserProcess(143); });
 process.once('SIGINT', () => { void shutdownBrowserProcess(130); });
 
+const linuxChromeSupervisorScript = [
+  "trap '' TERM HUP",
+  '(trap - TERM HUP; exec "$@") >/dev/null &',
+  'browser_pid=$!',
+  "printf '%s\\n' \"$browser_pid\"",
+  'wait "$browser_pid"',
+  'while :; do sleep 3600 & wait $!; done',
+].join('\n');
+
+function spawnChromeProcess(chromeExecutable, chromeArgs) {
+  if (process.platform === 'linux') {
+    return spawn('/bin/sh', [
+      '-c',
+      linuxChromeSupervisorScript,
+      'product-capture-chrome-supervisor',
+      chromeExecutable,
+      ...chromeArgs,
+    ], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  }
+  return spawn(chromeExecutable, chromeArgs, {
+    detached: false,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+}
+
 async function launchChromeBrowserAttempt(profileDir, viewport) {
   const cdpPort = await selectLoopbackPort();
   const chromeArgs = [
@@ -1347,11 +1725,9 @@ async function launchChromeBrowserAttempt(profileDir, viewport) {
   chromeArgs.push('about:blank');
 
   const chromeExecutable = 'google-chrome';
-  const chrome = spawn(chromeExecutable, chromeArgs, {
-    detached: process.platform === 'linux',
-    stdio: ['ignore', 'ignore', 'pipe'],
-  });
+  const chrome = spawnChromeProcess(chromeExecutable, chromeArgs);
   activeChromeChild = chrome;
+  chrome.linuxFreshProcessBoundary = process.platform === 'linux';
   chrome.chromeExit = null;
   chrome.startError = null;
   chrome.exited = new Promise((resolve) => {
@@ -1369,6 +1745,11 @@ async function launchChromeBrowserAttempt(profileDir, viewport) {
 
   let browser;
   try {
+    await captureChromeProcessIdentityOrAbort(chrome, 500);
+    if (process.platform === 'linux') {
+      chrome.browserPID = await readLinuxChromeBrowserPID(chrome, 1000);
+    }
+    captureChromeBrowserProcessIdentity(chrome);
     const cdpEndpoint = await waitForChromeEndpoint(chrome, cdpPort);
     browser = await chromium.connectOverCDP(cdpEndpoint, { timeout: 10000 });
     const contexts = browser.contexts();
@@ -1679,10 +2060,6 @@ async function safeProductTitleReady(page) {
 
 async function safeProductDomTitleReady(page) {
   return await productDomTitleReady(page).catch(() => false);
-}
-
-function errorMessage(err) {
-  return err && (err.message || err.stack) ? String(err.message || err.stack) : String(err);
 }
 
 async function requireProductTitleReady(page, requestedURL) {

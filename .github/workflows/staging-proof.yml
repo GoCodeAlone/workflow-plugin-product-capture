@@ -3,11 +3,6 @@ name: Product Capture Staging Proof
 on:
   workflow_dispatch:
     inputs:
-      server_url:
-        description: workflow-compute staging URL
-        type: string
-        required: true
-        default: https://workflow-compute-staging-ocysa.ondigitalocean.app
       provider_image_ref:
         description: Exact product-capture browser image reference
         type: string
@@ -73,7 +68,7 @@ jobs:
           cache: false
       - name: Validate staging proof inputs
         env:
-          SERVER_URL: ${{ inputs.server_url }}
+          SERVER_URL: ${{ vars.WORKFLOW_COMPUTE_SERVER_URL }}
           PROVIDER_IMAGE_REF: ${{ inputs.provider_image_ref }}
           WORKER_ID: ${{ inputs.worker_id }}
           PRODUCT_URL: ${{ inputs.product_url }}
@@ -115,7 +110,7 @@ jobs:
       - name: Run product capture staging proof
         env:
           WORKFLOW_COMPUTE_TASK_TOKEN: ${{ secrets.WORKFLOW_COMPUTE_TASK_TOKEN }}
-          SERVER_URL: ${{ inputs.server_url }}
+          SERVER_URL: ${{ vars.WORKFLOW_COMPUTE_SERVER_URL }}
           ORG_ID: ${{ inputs.org_id }}
           POOL_ID: ${{ inputs.pool_id }}
           PRODUCT_ID: ${{ inputs.product_id }}
