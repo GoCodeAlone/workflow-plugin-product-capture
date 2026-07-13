@@ -152,6 +152,31 @@ rejected.
 BuyMyWishlist live wiring details are in
 [`docs/buymywishlist-live-usage.md`](docs/buymywishlist-live-usage.md).
 
+## Staging proof
+
+The `Product Capture Staging Proof` workflow owns the live provider proof for
+this plugin. Dispatch it from `main` with the exact released
+`product-capture-browser@sha256:<digest>` reference, the retained staging worker
+ID, and a real product URL. The workflow uses a staging-environment scoped task
+token with `agent:read`, `task:read`, and `task:write` and runs only the control
+client on its GitHub-hosted runner; browser
+execution remains on the retained workflow-compute worker.
+
+Before submitting, the client requires that worker to be the sole online agent
+matching the candidate digest and provider capabilities, with no active lease
+or queued matching product task. It then submits generic provider operations,
+requires terminal success and an accepted proof from that worker, and downloads
+only contract-declared JSON results. Both `product_json` and
+`browser_diagnostic_json` are limited to 1 MiB. Name, content type, size,
+canonical reference, SHA-256, JSON syntax, and the product schema are checked
+before evidence is accepted. Product evidence requires the provider's canonical
+decimal USD price. Diagnostic evidence is validated against a pinned artifact
+schema digest, which is included in the redacted summary.
+
+The workflow artifact contains only a redacted summary JSON and a log capped at
+64 KiB. The runtime image is pulled by the retained worker from its digest-pinned
+reference; it is not copied into proof evidence.
+
 Terminal step output includes `provider_image_ref`, `provider_component_ref`,
 and `provider_component_digest` copied from the submitted provider workload.
 Consumers should persist those fields with the task/proof identifiers and

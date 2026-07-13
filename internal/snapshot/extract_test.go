@@ -553,10 +553,13 @@ func TestAmazonASINFromURLRecognizesSupportedPaths(t *testing.T) {
 		"https://www.amazon.com/gp/anything":                                            "",
 		"https://www.amazon.com/dp/not-a-real-product":                                  "",
 		"https://www.amazon.com/gp/product/ref=nav":                                     "",
+		"https://example.test/dp/B09B8V1LZ3":                                            "",
+		"https://www.amazon.co.uk/dp/B09B8V1LZ3":                                        "",
+		"https://amazon.com/dp/B09B8V1LZ3":                                              "B09B8V1LZ3",
 	}
 	for raw, want := range tests {
-		if got := asinFromURL(raw); got != want {
-			t.Fatalf("asinFromURL(%q)=%q want %q", raw, got, want)
+		if got := AmazonASINFromURL(raw); got != want {
+			t.Fatalf("AmazonASINFromURL(%q)=%q want %q", raw, got, want)
 		}
 	}
 }

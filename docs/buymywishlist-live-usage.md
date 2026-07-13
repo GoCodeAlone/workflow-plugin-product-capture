@@ -60,21 +60,50 @@ plane and embedded in the invite/setup flow.
 
 ## Current Release Target
 
-Use `workflow-plugin-product-capture` `v0.1.19` for the next BuyMyWishlist
+Use `workflow-plugin-product-capture` `v0.1.60` for the next BuyMyWishlist
 live-incorporation pass. Downstream workflow-compute scenarios, staging proof
 defaults, and BuyMyWishlist plugin pins should all reference this tag once its
 release workflow has published the matching browser runtime image digest.
 
 Do not copy a digest from this source tree. The digest that matters is the
-GHCR `product-capture-browser@sha256:<digest>` emitted by the `v0.1.19`
+GHCR `product-capture-browser@sha256:<digest>` emitted by the `v0.1.60`
 release workflow. For component-backed deployments, use the wfcompute package
 campaign's promoted component digest for
 `provider://workflow-plugin-product-capture/browser/runtime`.
 
+## Product-Owned Staging Proof
+
+After the `v0.1.60` release publishes its browser image, dispatch
+`.github/workflows/staging-proof.yml` from `main`. Supply the exact released
+image reference, the registered retained staging worker ID, and a real Amazon
+product URL. Store a credential scoped to `agent:read`, `task:read`, and
+`task:write` as the
+`WORKFLOW_COMPUTE_TASK_TOKEN` secret in the `workflow-compute-staging` GitHub
+environment; do not substitute an admin or bootstrap credential.
+
+The proof waits up to 30 minutes for exactly one compatible online worker and
+requires that worker to be the named retained worker, idle, and matched to the
+candidate image digest. It also requires no queued matching product task before
+dispatch. The control client then uses only generic workflow-compute task,
+proof, capacity, and artifact APIs. The candidate runtime is never transferred
+as proof input or evidence.
+
+The accepted `product_json` result must match the provider contract's name,
+`application/json` content type, 1 MiB size limit, canonical artifact reference,
+SHA-256, JSON syntax, and product schema. The redacted summary requires title,
+image URL, and the canonical decimal USD price. An optional controlled HTTPS
+diagnostic URL causes a second `browser_diagnostic` task; its accepted bounded
+JSON artifact is recorded
+by task/proof/artifact identifiers, artifact digest, and pinned diagnostic
+schema digest without copying raw browser signals into the summary.
+
+Keep the prior staging proof available only until this replacement records one
+accepted staging run. After that cutover, use this workflow for product runtime
+readiness evidence.
+
 ## Verified wfcompute Staging Baseline
 
-The last accepted wfcompute staging proof before the `v0.1.19` incorporation
-refresh completed on 2026-06-07 against:
+The historical accepted wfcompute staging proof completed on 2026-06-07 against:
 
 - wfcompute server:
   `https://workflow-compute-staging-ocysa.ondigitalocean.app`;

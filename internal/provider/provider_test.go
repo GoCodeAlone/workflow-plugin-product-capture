@@ -37,36 +37,12 @@ func TestProviderContractAlignsWithWorkflowComputeGenericProviderABI(t *testing.
 		t.Fatalf("read contract: %v", err)
 	}
 
-	var contract struct {
-		ProtocolVersion        string   `json:"protocol_version"`
-		ID                     string   `json:"id"`
-		PluginID               string   `json:"plugin_id"`
-		ProviderID             string   `json:"provider_id"`
-		ContractID             string   `json:"contract_id"`
-		Version                string   `json:"version"`
-		DisplayName            string   `json:"display_name"`
-		ConfigSchemaRef        string   `json:"config_schema_ref"`
-		ConfigSchemaDigest     string   `json:"config_schema_digest"`
-		OperatingModes         []string `json:"operating_modes"`
-		WorkloadKinds          []string `json:"workload_kinds"`
-		ExecutorProviders      []string `json:"executor_providers"`
-		ExecutionSecurityTiers []string `json:"execution_security_tiers"`
-		ProofTiers             []string `json:"proof_tiers"`
-		NetworkModes           []string `json:"network_modes"`
-		Operations             []struct {
-			ID                 string   `json:"id"`
-			InputSchemaRef     string   `json:"input_schema_ref"`
-			InputSchemaDigest  string   `json:"input_schema_digest"`
-			OutputSchemaRef    string   `json:"output_schema_ref"`
-			OutputSchemaDigest string   `json:"output_schema_digest"`
-			Artifacts          []string `json:"artifacts"`
-		} `json:"operations"`
-		RuntimeContract json.RawMessage `json:"runtime_contract"`
-	}
-	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&contract); err != nil {
+	var contract coreprotocol.ProviderContract
+	if err := coreprotocol.DecodeStrict(bytes.NewReader(data), &contract); err != nil {
 		t.Fatalf("decode contract: %v", err)
+	}
+	if err := contract.Validate(); err != nil {
+		t.Fatalf("validate contract: %v", err)
 	}
 
 	if contract.ProtocolVersion != "compute.v1alpha1" {
@@ -81,14 +57,7 @@ func TestProviderContractAlignsWithWorkflowComputeGenericProviderABI(t *testing.
 	if !containsString(contract.ExecutorProviders, ExecutorProvider) {
 		t.Fatalf("executor_providers = %v, want %q", contract.ExecutorProviders, ExecutorProvider)
 	}
-	var capture *struct {
-		ID                 string   `json:"id"`
-		InputSchemaRef     string   `json:"input_schema_ref"`
-		InputSchemaDigest  string   `json:"input_schema_digest"`
-		OutputSchemaRef    string   `json:"output_schema_ref"`
-		OutputSchemaDigest string   `json:"output_schema_digest"`
-		Artifacts          []string `json:"artifacts"`
-	}
+	var capture *coreprotocol.ProviderOperation
 	for i := range contract.Operations {
 		if contract.Operations[i].ID == CaptureOperation {
 			capture = &contract.Operations[i]
@@ -112,17 +81,12 @@ func TestProviderContractAlignsWithWorkflowComputeGenericProviderABI(t *testing.
 	if !strings.HasPrefix(capture.InputSchemaDigest, "sha256:") || !strings.HasPrefix(capture.OutputSchemaDigest, "sha256:") {
 		t.Fatalf("operation schema digests missing: %+v", *capture)
 	}
-	if !containsString(capture.Artifacts, ProductJSONArtifact) {
-		t.Fatalf("operation artifacts = %v, want %q", capture.Artifacts, ProductJSONArtifact)
+	captureSpecs := capture.NormalizedArtifactSpecs()
+	if len(captureSpecs) != 1 || captureSpecs[0].Name != ProductJSONArtifact ||
+		captureSpecs[0].ContentType != "application/json" || captureSpecs[0].MaxBytes != 1<<20 {
+		t.Fatalf("operation artifact specs = %+v", captureSpecs)
 	}
-	var diagnostic *struct {
-		ID                 string   `json:"id"`
-		InputSchemaRef     string   `json:"input_schema_ref"`
-		InputSchemaDigest  string   `json:"input_schema_digest"`
-		OutputSchemaRef    string   `json:"output_schema_ref"`
-		OutputSchemaDigest string   `json:"output_schema_digest"`
-		Artifacts          []string `json:"artifacts"`
-	}
+	var diagnostic *coreprotocol.ProviderOperation
 	for i := range contract.Operations {
 		if contract.Operations[i].ID == "browser_diagnostic" {
 			diagnostic = &contract.Operations[i]
@@ -138,8 +102,10 @@ func TestProviderContractAlignsWithWorkflowComputeGenericProviderABI(t *testing.
 	if !strings.HasPrefix(diagnostic.InputSchemaDigest, "sha256:") || !strings.HasPrefix(diagnostic.OutputSchemaDigest, "sha256:") {
 		t.Fatalf("diagnostic operation schema digests missing: %+v", *diagnostic)
 	}
-	if !containsString(diagnostic.Artifacts, "browser_diagnostic_json") {
-		t.Fatalf("diagnostic artifacts = %v, want browser_diagnostic_json", diagnostic.Artifacts)
+	diagnosticSpecs := diagnostic.NormalizedArtifactSpecs()
+	if len(diagnosticSpecs) != 1 || diagnosticSpecs[0].Name != BrowserDiagnosticJSONArtifact ||
+		diagnosticSpecs[0].ContentType != "application/json" || diagnosticSpecs[0].MaxBytes != 1<<20 {
+		t.Fatalf("diagnostic artifact specs = %+v", diagnosticSpecs)
 	}
 }
 

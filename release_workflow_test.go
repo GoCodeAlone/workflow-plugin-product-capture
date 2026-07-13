@@ -69,6 +69,58 @@ func TestCIWorkflowChecksReleaseManifest(t *testing.T) {
 	assertWorkflowUsesPinnedActions(t, ".github/workflows/ci.yml", workflow)
 }
 
+func TestStagingProofWorkflowUsesBoundedControlClient(t *testing.T) {
+	data, err := os.ReadFile(".github/workflows/staging-proof.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	for _, want := range []string{
+		"github.ref == 'refs/heads/main'",
+		"runs-on: ubuntu-latest",
+		"environment: workflow-compute-staging",
+		"timeout-minutes: 120",
+		"cancel-in-progress: false",
+		"go run ./cmd/product-capture-staging-proof",
+		"WORKFLOW_COMPUTE_TASK_TOKEN: ${{ secrets.WORKFLOW_COMPUTE_TASK_TOKEN }}",
+		"--provider-image-ref \"$PROVIDER_IMAGE_REF\"",
+		"--worker-id \"$WORKER_ID\"",
+		"--artifact-timeout 5m",
+		"product-capture-staging-proof.json",
+		"product-capture-staging-proof.log",
+		"head -c 65536",
+	} {
+		if !strings.Contains(workflow, want) {
+			t.Fatalf("staging proof workflow missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"docker save", "podman save", "oci.tar", "agent-artifacts", "provider-package", "campaign",
+		`--server "${{ inputs.server_url }}"`,
+		`--provider-image-ref "${{ inputs.provider_image_ref }}"`,
+		`--worker-id "${{ inputs.worker_id }}"`,
+		`--product-url "${{ inputs.product_url }}"`,
+	} {
+		if strings.Contains(workflow, forbidden) {
+			t.Fatalf("staging proof workflow contains forbidden transfer path %q", forbidden)
+		}
+	}
+	assertWorkflowUsesPinnedActions(t, ".github/workflows/staging-proof.yml", workflow)
+}
+
+func TestStagingProofDocsRequireMinimumScopedCredential(t *testing.T) {
+	data, err := os.ReadFile("docs/buymywishlist-live-usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := string(data)
+	for _, scope := range []string{"`agent:read`", "`task:read`", "`task:write`"} {
+		if !strings.Contains(docs, scope) {
+			t.Fatalf("staging proof docs missing required credential scope %s", scope)
+		}
+	}
+}
+
 func TestRuntimeImageInstallsChromeAndPlaywrightWithoutBundledBrowser(t *testing.T) {
 	data, err := os.ReadFile("docker/product-capture-browser/Dockerfile")
 	if err != nil {

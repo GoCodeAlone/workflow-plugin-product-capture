@@ -368,3 +368,50 @@ Scope: no manifest change; Task 3 retains the accepted ADR 0002 transport and
 explicit-origin fallback.
 Evidence: default command -> deadline + clean teardown; explicit origin ->
 full candidate conformance PASS.
+
+### Backport 2026-07-13: Canonical provider contract decoding
+
+Cause: the provider ABI test duplicated an older contract JSON projection and
+rejected the planned `artifact_specs` field before validating the shared wire
+contract.
+
+Change: contract compatibility tests decode and validate
+`compute-core/protocol.ProviderContract`, then assert normalized bounded
+artifact specs. Local ad hoc projections of the provider contract are
+forbidden.
+
+Scope: no manifest change; Task 4 owns the contract migration.
+
+Evidence: broad `go test ./...` failed on unknown `artifact_specs`; the focused
+provider contract test passes with the canonical SDK type.
+
+### Backport 2026-07-13: Staging proof boundary hardening
+
+Cause: review disproved proof assumptions: workflow inputs were interpolated
+inside shell; `task:*` scopes could not list agents; accepted receipts/schema
+files were not bound to the requested runtime/contract; same-host or
+structurally empty JSON could pass without Amazon/diagnostic correlation;
+transient reads either aborted known `auth state busy` recovery or retried
+artifacts without a deadline; summary image userinfo could leak; and the
+80-minute job could not cover both optional operations.
+
+Change: pass dispatch inputs through quoted environment variables; require
+`agent:read`, `task:read`, and `task:write`; validate and bind receipt/task/
+executor/image fields, including the receipt's exact leased-task hash and the
+provider runtime's sorted artifact aggregate recomputed from downloaded bytes;
+reject terminal placement-requirement drift; match schema bytes to the contract
+digest; correlate
+browser-capture output to supported Amazon hosts and the submitted ASIN across
+requested/result/canonical/external identity; require known typed diagnostic
+signals plus target/origin/post; reject image userinfo; retry only network,
+429, and 5xx reads within phase deadlines; fail fast on permanent 4xx; use a
+120-minute job timeout. Task submission remains non-retried, and product-only
+runs do not read or require the optional diagnostic schema. Final review also
+pins and records the diagnostic artifact-schema digest, requires canonical USD
+price output, and checks the artifact hash algorithm against fixed
+workflow-compute golden vectors.
+
+Scope: no manifest change; Task 4 owns these proof-boundary invariants.
+
+Evidence: focused regressions fail with each guard removed and pass restored;
+`actionlint .github/workflows/staging-proof.yml` validates the workflow shape.

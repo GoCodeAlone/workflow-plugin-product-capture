@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "schema://providers/workflow-plugin-product-capture/browser/artifacts/browser_diagnostic_json/v1",
+  "title": "Browser diagnostic artifact",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "target_url": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048
+    },
+    "final_url": {
+      "type": "string",
+      "format": "uri",
+      "maxLength": 2048
+    },
+    "posted_to_origin": {
+      "type": "boolean"
+    },
+    "post_error": {
+      "type": "string",
+      "maxLength": 2048
+    },
+    "browser_signals": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "navigator": {
+          "type": "object",
+          "properties": {
+            "webdriver": { "type": ["boolean", "null"] },
+            "user_agent": { "type": "string", "minLength": 1, "maxLength": 1024 },
+            "language": { "type": "string", "minLength": 1, "maxLength": 128 },
+            "platform": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "required": ["webdriver", "user_agent", "language", "platform"]
+        },
+        "window": {
+          "type": "object",
+          "properties": {
+            "outer_width": { "type": ["integer", "null"] },
+            "outer_height": { "type": ["integer", "null"] },
+            "inner_width": { "type": ["integer", "null"] },
+            "inner_height": { "type": ["integer", "null"] }
+          },
+          "required": ["outer_width", "outer_height", "inner_width", "inner_height"]
+        },
+        "automation": {
+          "type": "object",
+          "properties": {
+            "playwright_binding_present": { "type": "boolean" },
+            "playwright_init_scripts_present": { "type": "boolean" }
+          },
+          "required": ["playwright_binding_present", "playwright_init_scripts_present"]
+        },
+        "screen": {
+          "type": "object",
+          "properties": {
+            "width": { "type": ["integer", "null"] },
+            "height": { "type": ["integer", "null"] }
+          },
+          "required": ["width", "height"]
+        },
+        "document": {
+          "type": "object",
+          "properties": {
+            "cookie_present": { "type": "boolean" },
+            "cookie_length": { "type": "integer", "minimum": 0 }
+          },
+          "required": ["cookie_present", "cookie_length"]
+        },
+        "intl": {
+          "type": "object",
+          "properties": {
+            "timezone": { "type": "string", "minLength": 1, "maxLength": 128 }
+          },
+          "required": ["timezone"]
+        },
+        "webgl": {
+          "type": "object",
+          "properties": {
+            "available": { "type": "boolean" }
+          },
+          "required": ["available"]
+        }
+      },
+      "required": ["navigator", "window", "automation", "screen", "document", "intl", "webgl"]
+    }
+  },
+  "required": ["target_url", "final_url", "posted_to_origin", "post_error", "browser_signals"]
+}

@@ -1,0 +1,175 @@
+name: Product Capture Staging Proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_url:
+        description: workflow-compute staging URL
+        type: string
+        required: true
+        default: https://workflow-compute-staging-ocysa.ondigitalocean.app
+      provider_image_ref:
+        description: Exact product-capture browser image reference
+        type: string
+        required: true
+      worker_id:
+        description: Retained product-capture worker ID
+        type: string
+        required: true
+      product_url:
+        description: Real product URL to capture
+        type: string
+        required: true
+        default: https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8
+      allowed_host:
+        description: Exact allowed product host
+        type: string
+        required: true
+        default: www.amazon.com
+      browser_diagnostic_url:
+        description: Optional controlled HTTPS browser diagnostic endpoint
+        type: string
+        required: false
+        default: ""
+      org_id:
+        description: workflow-compute organization ID
+        type: string
+        required: true
+        default: bmw
+      pool_id:
+        description: workflow-compute pool ID
+        type: string
+        required: true
+        default: bmw-product-capture
+      product_id:
+        description: workflow-compute network product ID
+        type: string
+        required: true
+        default: bmw-product-capture
+      policy_id:
+        description: workflow-compute task policy ID
+        type: string
+        required: true
+        default: product-capture-staging
+
+permissions:
+  contents: read
+
+concurrency:
+  group: product-capture-staging-proof
+  cancel-in-progress: false
+
+jobs:
+  proof:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: workflow-compute-staging
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Validate staging proof inputs
+        env:
+          SERVER_URL: ${{ inputs.server_url }}
+          PROVIDER_IMAGE_REF: ${{ inputs.provider_image_ref }}
+          WORKER_ID: ${{ inputs.worker_id }}
+          PRODUCT_URL: ${{ inputs.product_url }}
+          ALLOWED_HOST: ${{ inputs.allowed_host }}
+          BROWSER_DIAGNOSTIC_URL: ${{ inputs.browser_diagnostic_url }}
+          WORKFLOW_COMPUTE_TASK_TOKEN: ${{ secrets.WORKFLOW_COMPUTE_TASK_TOKEN }}
+        run: |
+          set -euo pipefail
+          [[ "$SERVER_URL" =~ ^https://[a-zA-Z0-9.-]+\.ondigitalocean\.app/?$ ]] || {
+            echo "::error::server_url must be the workflow-compute DigitalOcean staging origin"
+            exit 1
+          }
+          [[ "$PROVIDER_IMAGE_REF" =~ ^[^[:space:]@]+@sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error::provider_image_ref must be an exact digest-pinned image"
+            exit 1
+          }
+          [[ "$WORKER_ID" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || {
+            echo "::error::worker_id is invalid"
+            exit 1
+          }
+          [[ "$PRODUCT_URL" =~ ^https:// ]] || {
+            echo "::error::product_url must use HTTPS"
+            exit 1
+          }
+          [[ "$ALLOWED_HOST" =~ ^[a-zA-Z0-9.-]+$ ]] || {
+            echo "::error::allowed_host is invalid"
+            exit 1
+          }
+          if [ -n "$BROWSER_DIAGNOSTIC_URL" ]; then
+            [[ "$BROWSER_DIAGNOSTIC_URL" =~ ^https:// ]] || {
+              echo "::error::browser_diagnostic_url must use HTTPS"
+              exit 1
+            }
+          fi
+          [ -n "$WORKFLOW_COMPUTE_TASK_TOKEN" ] || {
+            echo "::error::WORKFLOW_COMPUTE_TASK_TOKEN environment secret is required"
+            exit 1
+          }
+      - name: Run product capture staging proof
+        env:
+          WORKFLOW_COMPUTE_TASK_TOKEN: ${{ secrets.WORKFLOW_COMPUTE_TASK_TOKEN }}
+          SERVER_URL: ${{ inputs.server_url }}
+          ORG_ID: ${{ inputs.org_id }}
+          POOL_ID: ${{ inputs.pool_id }}
+          PRODUCT_ID: ${{ inputs.product_id }}
+          POLICY_ID: ${{ inputs.policy_id }}
+          WORKER_ID: ${{ inputs.worker_id }}
+          PRODUCT_URL: ${{ inputs.product_url }}
+          ALLOWED_HOST: ${{ inputs.allowed_host }}
+          BROWSER_DIAGNOSTIC_URL: ${{ inputs.browser_diagnostic_url }}
+          PROVIDER_IMAGE_REF: ${{ inputs.provider_image_ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p proof-output
+          set +e
+          GOWORK=off go run ./cmd/product-capture-staging-proof \
+            --server "$SERVER_URL" \
+            --org "$ORG_ID" \
+            --pool "$POOL_ID" \
+            --product "$PRODUCT_ID" \
+            --policy "$POLICY_ID" \
+            --worker-id "$WORKER_ID" \
+            --product-url "$PRODUCT_URL" \
+            --allowed-host "$ALLOWED_HOST" \
+            --browser-diagnostic-url "$BROWSER_DIAGNOSTIC_URL" \
+            --provider-image-ref "$PROVIDER_IMAGE_REF" \
+            --capacity-timeout 30m \
+            --result-timeout 20m \
+            --artifact-timeout 5m \
+            --output proof-output/product-capture-staging-proof.json \
+            2>&1 | tee proof-output/raw.log
+          proof_status=${PIPESTATUS[0]}
+          set -e
+          head -c 65536 proof-output/raw.log > proof-output/product-capture-staging-proof.log
+          rm -f proof-output/raw.log
+          exit "$proof_status"
+      - name: Assert accepted product result
+        run: |
+          set -euo pipefail
+          jq -e '
+            .schema_version == "product-capture-staging-proof.v1" and
+            .task_status == "succeeded" and
+            .proof_status == "accepted" and
+            .capacity.matching_online_agents == 1 and
+            .capacity.retained_worker_matching == true and
+            (.product.title | length > 0) and
+            (.product.image_url | length > 0) and
+            (.product.price | length > 0)
+          ' proof-output/product-capture-staging-proof.json
+      - name: Upload bounded proof evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: product-capture-staging-proof-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            proof-output/product-capture-staging-proof.json
+            proof-output/product-capture-staging-proof.log
+          if-no-files-found: warn
+          retention-days: 7
