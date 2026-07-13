@@ -32,8 +32,7 @@ func (linuxBrowserProcessPolicy) TerminateGroup(cmd *exec.Cmd, grace time.Durati
 		return fmt.Errorf("terminate browser process group: %w", termErr)
 	}
 	if grace > 0 {
-		timer := time.NewTimer(grace)
-		<-timer.C
+		time.Sleep(grace)
 	}
 	killErr := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	if killErr != nil && !errors.Is(killErr, syscall.ESRCH) {

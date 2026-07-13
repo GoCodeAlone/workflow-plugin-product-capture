@@ -117,6 +117,37 @@ func TestRunCompletesGenericProductCaptureRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRunCapsProviderAndComputeTaskTimeoutTogether(t *testing.T) {
+	fixture := newComputeFixture(t)
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.TaskTimeoutSeconds = 600
+
+	if _, err := Run(t.Context(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if len(fixture.submitted) != 1 {
+		t.Fatalf("submitted tasks = %d, want 1", len(fixture.submitted))
+	}
+	submitted := fixture.submitted[0]
+	if submitted.TimeoutSeconds != 300 {
+		t.Fatalf("compute task timeout = %d, want 300", submitted.TimeoutSeconds)
+	}
+	var input struct {
+		TimeoutSeconds int `json:"timeout_seconds"`
+	}
+	if err := json.Unmarshal(submitted.Workload.Provider.Input, &input); err != nil {
+		t.Fatalf("decode provider input: %v", err)
+	}
+	if input.TimeoutSeconds != submitted.TimeoutSeconds {
+		t.Fatalf("provider timeout = %d, compute task timeout = %d", input.TimeoutSeconds, submitted.TimeoutSeconds)
+	}
+}
+
 func TestRunRejectsInvalidImageReferencesBeforeNetworkAccess(t *testing.T) {
 	for _, ref := range []string{
 		"ghcr.io/gocodealone/product-capture:latest",

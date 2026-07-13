@@ -732,6 +732,32 @@ process.stdout.write('propagated');
 	}
 }
 
+func TestLinuxProcessGroupMembersIgnoresNamespaceRelativeZeroProcessGroup(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+const nativeReaddirSync = fs.readdirSync;
+fs.readdirSync = (path, ...args) => String(path) === '/proc' ? ['10', '11'] : nativeReaddirSync(path, ...args);
+fs.readFileSync = (path, ...args) => {
+  if (String(path) === '/proc/10/stat') return '10 (runner) S 1 0 0 0 0';
+  if (String(path) === '/proc/11/stat') return '11 (chrome) S 1 54321 54321 0 0';
+  return nativeReadFileSync(path, ...args);
+};
+try {
+  const members = linuxProcessGroupMembers(54321);
+  if (members.size !== 1 || members.get(11) !== 'S') {
+    throw new Error('namespace-relative process group changed target membership');
+  }
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+  fs.readdirSync = nativeReaddirSync;
+}
+process.stdout.write('ignored');
+`)
+	if err != nil || stdout.String() != "ignored" {
+		t.Fatalf("namespace-relative process-group check failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
 func TestBrowserScriptRejectsForeignLinuxListener(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("procfs listener ownership is Linux-specific")

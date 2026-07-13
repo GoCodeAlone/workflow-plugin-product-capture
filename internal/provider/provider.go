@@ -1075,7 +1075,7 @@ function linuxProcessStat(processID) {
   if (close < 0) throw new Error('malformed procfs stat for PID ' + processID);
   const fields = stat.slice(close + 2).trim().split(/\s+/);
   const processGroupID = Number(fields[2]);
-  if (!fields[0] || !Number.isInteger(processGroupID) || processGroupID <= 0) {
+  if (!fields[0] || !Number.isInteger(processGroupID) || processGroupID < 0) {
     throw new Error('malformed procfs process group for PID ' + processID);
   }
   return { state: fields[0], processGroupID };

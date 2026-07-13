@@ -38,8 +38,7 @@ func (otherBrowserProcessPolicy) TerminateGroup(cmd *exec.Cmd, grace time.Durati
 		return nil
 	}
 	if grace > 0 {
-		timer := time.NewTimer(grace)
-		<-timer.C
+		time.Sleep(grace)
 	}
 	killErr := cmd.Process.Kill()
 	if errors.Is(killErr, os.ErrProcessDone) {

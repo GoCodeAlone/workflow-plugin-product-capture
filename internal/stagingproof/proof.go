@@ -26,6 +26,7 @@ const (
 	defaultResultTimeout          = 30 * time.Minute
 	defaultArtifactTimeout        = 5 * time.Minute
 	defaultTaskTimeoutSeconds     = 300
+	maxTaskTimeoutSeconds         = 300
 	maxSummaryTitleBytes          = 512
 	maxSummaryImageURLBytes       = 2048
 	maxSummaryPriceBytes          = 128
@@ -217,6 +218,8 @@ func withDefaults(cfg Config) Config {
 	}
 	if cfg.TaskTimeoutSeconds <= 0 {
 		cfg.TaskTimeoutSeconds = defaultTaskTimeoutSeconds
+	} else if cfg.TaskTimeoutSeconds > maxTaskTimeoutSeconds {
+		cfg.TaskTimeoutSeconds = maxTaskTimeoutSeconds
 	}
 	return cfg
 }
@@ -432,7 +435,7 @@ func submitProductTask(ctx context.Context, client *protocol.Client, cfg Config)
 		"url":             cfg.ProductURL,
 		"allowed_hosts":   []string{cfg.AllowedHost},
 		"capture_mode":    string(protocol.ProductCaptureModeBrowser),
-		"timeout_seconds": min(cfg.TaskTimeoutSeconds, 300),
+		"timeout_seconds": cfg.TaskTimeoutSeconds,
 		"max_html_bytes":  1 << 20,
 		"max_image_count": 8,
 	})
