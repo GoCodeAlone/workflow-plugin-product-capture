@@ -4,10 +4,11 @@ go 1.26.4
 
 require (
 	github.com/GoCodeAlone/workflow v0.74.5
-	github.com/GoCodeAlone/workflow-plugin-compute-core v0.5.0
+	github.com/GoCodeAlone/workflow-plugin-compute-core v0.8.4
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	golang.org/x/mod v0.36.0
 	golang.org/x/net v0.54.0
+	golang.org/x/sys v0.45.0
 )
 
 require (
@@ -138,7 +139,6 @@ require (
 	golang.org/x/crypto v0.52.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.15.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260511170946-3700d4141b60 // indirect

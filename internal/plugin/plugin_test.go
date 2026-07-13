@@ -157,6 +157,12 @@ func TestProductCaptureStepDispatchesDynamicURLAndReturnsPreview(t *testing.T) {
 	if result.Output["error"] != nil {
 		t.Fatalf("preview error key should not be promoted: %+v", result.Output)
 	}
+	if result.Output["provider_image_ref"] != testProviderImageRef {
+		t.Fatalf("provider image provenance: %+v", result.Output)
+	}
+	if result.Output["provider_component_ref"] != "" || result.Output["provider_component_digest"] != "" {
+		t.Fatalf("unexpected component provenance: %+v", result.Output)
+	}
 }
 
 func TestProductCaptureStepDispatchesPromotedComponentRuntime(t *testing.T) {
@@ -221,6 +227,50 @@ func TestProductCaptureStepDispatchesPromotedComponentRuntime(t *testing.T) {
 	}
 	if submitted.Workload.Provider.ComponentDigest != testProviderComponentDigest {
 		t.Fatalf("component digest: %q", submitted.Workload.Provider.ComponentDigest)
+	}
+	if result.Output["provider_image_ref"] != "" ||
+		result.Output["provider_component_ref"] != testProviderComponentRef ||
+		result.Output["provider_component_digest"] != testProviderComponentDigest {
+		t.Fatalf("provider component provenance: %+v", result.Output)
+	}
+}
+
+func TestProductCaptureStepReturnsCanceledTaskWithProvenance(t *testing.T) {
+	var submitted protocol.Task
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/v1/tasks":
+			if err := json.NewDecoder(r.Body).Decode(&submitted); err != nil {
+				t.Fatalf("decode task: %v", err)
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"task": submitted})
+		case r.Method == http.MethodGet && r.URL.Path == "/v1/tasks":
+			_ = json.NewEncoder(w).Encode(map[string]any{"tasks": []protocol.Task{{
+				ID: submitted.ID, OrgID: submitted.OrgID, PoolID: submitted.PoolID, Status: protocol.TaskCanceled,
+			}}, "stalls": []any{}})
+		default:
+			t.Fatalf("unexpected request after cancellation: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer srv.Close()
+
+	cfg := productCaptureConfigMap(srv.URL)
+	cfg["poll_interval"] = "1ms"
+	cfg["wait_timeout"] = "50ms"
+	step, err := newProductCaptureStep("capture", cfg)
+	if err != nil {
+		t.Fatalf("newProductCaptureStep: %v", err)
+	}
+	result, err := step.Execute(context.Background(), nil, nil, nil, nil, runtimeSecrets())
+	if err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !result.StopPipeline || !strings.Contains(result.Output["error"].(string), "canceled") {
+		t.Fatalf("canceled task result = %+v", result)
+	}
+	if result.Output["provider_image_ref"] != testProviderImageRef {
+		t.Fatalf("canceled task omitted provider provenance: %+v", result.Output)
 	}
 }
 

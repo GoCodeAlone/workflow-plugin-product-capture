@@ -8,7 +8,9 @@
     "url": {
       "type": "string",
       "format": "uri",
-      "description": "HTTP or HTTPS controlled diagnostic endpoint URL."
+      "pattern": "^[hH][tT][tT][pP][sS]://",
+      "maxLength": 2048,
+      "description": "HTTPS controlled diagnostic endpoint URL."
     }
   },
   "required": ["url"]

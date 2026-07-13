@@ -819,6 +819,19 @@ func asinFromURL(raw string) string {
 	return ""
 }
 
+// AmazonASINFromURL returns the normalized ASIN from a supported Amazon product path.
+func AmazonASINFromURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	host := strings.TrimSuffix(strings.ToLower(parsed.Hostname()), ".")
+	if host != "amazon.com" && host != "www.amazon.com" {
+		return ""
+	}
+	return asinFromURL(raw)
+}
+
 func normalizeASIN(value string) string {
 	value = strings.ToUpper(strings.TrimSpace(value))
 	if matched, _ := regexp.MatchString(`^[A-Z0-9]{10}$`, value); !matched {

@@ -4,6 +4,7 @@ ENV NODE_PATH=/usr/local/lib/node_modules \
     HOME=/tmp \
     XDG_CACHE_HOME=/tmp/.cache \
     XDG_CONFIG_HOME=/tmp/.config \
+    PRODUCT_CAPTURE_BROWSER_HEADLESS=false \
     PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 RUN set -eux; \

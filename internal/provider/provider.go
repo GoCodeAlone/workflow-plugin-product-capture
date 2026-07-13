@@ -9,17 +9,23 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	coreprotocol "github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
 	"github.com/GoCodeAlone/workflow-plugin-product-capture/internal/snapshot"
+	providerschemas "github.com/GoCodeAlone/workflow-plugin-product-capture/schemas"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 const (
@@ -34,9 +40,57 @@ const (
 	CaptureModeMeta               = "metadata"
 	ComputeProtocolVersion        = "compute.v1alpha1"
 	productArtifactMode           = 0o644
+	browserCommandStopGrace       = 3 * time.Second
+	maxBrowserDiagnosticBytes     = 1 << 20
 )
 
 var Version = "0.1.0"
+
+type browserProcessPolicy interface {
+	Configure(*exec.Cmd)
+	TerminateGroup(*exec.Cmd, time.Duration) error
+}
+
+type browserDiagnosticLookup func(context.Context, string) ([]net.IPAddr, error)
+
+type browserDiagnosticTarget struct {
+	allowedOrigin string
+	resolverRules string
+}
+
+var browserProcesses browserProcessPolicy = newBrowserProcessPolicy()
+var browserCommandCleanupStates sync.Map
+var browserDiagnosticSchemaOnce sync.Once
+var browserDiagnosticSchema *jsonschema.Schema
+var browserDiagnosticSchemaErr error
+
+type boundedDiagnosticBuffer struct {
+	bytes.Buffer
+}
+
+func (b *boundedDiagnosticBuffer) Write(data []byte) (int, error) {
+	if len(data) > maxBrowserDiagnosticBytes-b.Len() {
+		return 0, fmt.Errorf("browser diagnostic output exceeds %d bytes", maxBrowserDiagnosticBytes)
+	}
+	return b.Buffer.Write(data)
+}
+
+type browserCommandCleanupState struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (s *browserCommandCleanupState) record(err error) {
+	s.mu.Lock()
+	s.err = err
+	s.mu.Unlock()
+}
+
+func (s *browserCommandCleanupState) load() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
 
 var supportedAmazonHosts = map[string]struct{}{
 	"amazon.com":     {},
@@ -571,6 +625,9 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	timeout := time.Duration(timeoutSeconds(w.TimeoutSeconds)) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
 	defer cancel()
+	if err := browserDisplayPreflight(runtime.GOOS, browserHeadlessEnabled(), strings.TrimSpace(os.Getenv("DISPLAY")), exec.LookPath); err != nil {
+		return "", err
+	}
 
 	scriptPath, err := writeBrowserCaptureScript()
 	if err != nil {
@@ -579,8 +636,11 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	defer os.RemoveAll(filepath.Dir(scriptPath))
 
 	cmd := browserNodeCommand(ctx, scriptPath, w.URL, fmt.Sprintf("%d", timeout.Milliseconds()))
+	defer browserCommandCleanupStates.Delete(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", "")
 	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
 		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
 	}
@@ -597,21 +657,22 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		cleanupErr := cleanupBrowserCommandAfterError(ctx, cmd)
 		if stdout.err != nil {
-			return "", fmt.Errorf("browser capture failed: %w", stdout.err)
+			return "", errors.Join(fmt.Errorf("browser capture failed: %w", stdout.err), cleanupErr)
 		}
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			msg := strings.TrimSpace(stderr.String())
 			if msg != "" {
-				return "", fmt.Errorf("browser capture timed out after %s; last browser stderr: %s", timeout, msg)
+				return "", errors.Join(fmt.Errorf("browser capture timed out after %s; last browser stderr: %s", timeout, msg), cleanupErr)
 			}
-			return "", fmt.Errorf("browser capture timed out after %s", timeout)
+			return "", errors.Join(fmt.Errorf("browser capture timed out after %s", timeout), cleanupErr)
 		}
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", fmt.Errorf("browser capture failed: %s", msg)
+		return "", errors.Join(fmt.Errorf("browser capture failed: %s", msg), cleanupErr)
 	}
 	if stdout.err != nil {
 		return "", fmt.Errorf("browser capture failed: %w", stdout.err)
@@ -664,56 +725,223 @@ func writeBrowserCaptureScript() (string, error) {
 }
 
 func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("parse diagnostic url: %w", err)
-	}
-	if parsed.Scheme != "https" && parsed.Scheme != "http" {
-		return fmt.Errorf("unsupported diagnostic url scheme %q", parsed.Scheme)
-	}
-	if parsed.Hostname() == "" {
-		return errors.New("diagnostic url host is required")
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	if err := browserDisplayPreflight(runtime.GOOS, browserHeadlessEnabled(), strings.TrimSpace(os.Getenv("DISPLAY")), exec.LookPath); err != nil {
+		return err
+	}
+	target, err := resolveBrowserDiagnosticTarget(
+		ctx,
+		rawURL,
+		os.Getenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS"),
+		net.DefaultResolver.LookupIPAddr,
+	)
+	if err != nil {
+		return err
+	}
 	scriptPath, err := writeBrowserDiagnosticScript()
 	if err != nil {
 		return err
 	}
 	defer os.RemoveAll(filepath.Dir(scriptPath))
 	cmd := browserNodeCommand(ctx, scriptPath, rawURL)
+	defer browserCommandCleanupStates.Delete(cmd)
 	cmd.WaitDelay = 2 * time.Second
 	cmd.Env = os.Environ()
-	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
-		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
-	}
-	var stderr, out bytes.Buffer
-	cmd.Stdout = io.MultiWriter(stdout, &out)
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", target.allowedOrigin)
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", target.resolverRules)
+	var diagnosticOutput boundedDiagnosticBuffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &diagnosticOutput
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && browserDiagnosticOutputSucceeded(out.Bytes()) {
-			return nil
-		}
+		cleanupErr := cleanupBrowserCommandAfterError(ctx, cmd)
 		msg := strings.TrimSpace(stderr.String())
 		if msg == "" {
 			msg = err.Error()
 		}
-		return fmt.Errorf("browser diagnostic failed: %s", msg)
+		return errors.Join(fmt.Errorf("browser diagnostic failed: %s", msg), cleanupErr)
+	}
+	if err := validateBrowserDiagnosticArtifact(diagnosticOutput.Bytes()); err != nil {
+		return fmt.Errorf("browser diagnostic output schema: %w", err)
+	}
+	if _, err := stdout.Write(diagnosticOutput.Bytes()); err != nil {
+		return fmt.Errorf("write browser diagnostic output: %w", err)
 	}
 	return nil
 }
 
-func browserDiagnosticOutputSucceeded(data []byte) bool {
-	var result struct {
-		FinalURL       string `json:"final_url"`
-		PostedToOrigin bool   `json:"posted_to_origin"`
-		PostError      string `json:"post_error"`
+func validateBrowserDiagnosticArtifact(data []byte) error {
+	var artifact any
+	if err := json.Unmarshal(data, &artifact); err != nil {
+		return fmt.Errorf("decode: %w", err)
 	}
-	if err := json.Unmarshal(data, &result); err != nil {
+	schema, err := compiledBrowserDiagnosticSchema()
+	if err != nil {
+		return err
+	}
+	return schema.Validate(artifact)
+}
+
+func compiledBrowserDiagnosticSchema() (*jsonschema.Schema, error) {
+	browserDiagnosticSchemaOnce.Do(func() {
+		var document any
+		if err := json.Unmarshal(providerschemas.BrowserDiagnosticResult(), &document); err != nil {
+			browserDiagnosticSchemaErr = fmt.Errorf("decode embedded browser diagnostic schema: %w", err)
+			return
+		}
+		const resource = "https://provider.invalid/browser-diagnostic-result.schema.json"
+		compiler := jsonschema.NewCompiler()
+		compiler.AssertFormat()
+		if err := compiler.AddResource(resource, document); err != nil {
+			browserDiagnosticSchemaErr = fmt.Errorf("load embedded browser diagnostic schema: %w", err)
+			return
+		}
+		browserDiagnosticSchema, browserDiagnosticSchemaErr = compiler.Compile(resource)
+	})
+	return browserDiagnosticSchema, browserDiagnosticSchemaErr
+}
+
+func cleanupBrowserCommandAfterError(_ context.Context, cmd *exec.Cmd) error {
+	if stateValue, ok := browserCommandCleanupStates.Load(cmd); ok {
+		if cleanupErr := stateValue.(*browserCommandCleanupState).load(); cleanupErr != nil {
+			return fmt.Errorf("terminate browser process group after command error: %w", cleanupErr)
+		}
+	}
+	if cmd == nil || cmd.Process == nil || cmd.ProcessState != nil {
+		return nil
+	}
+	if err := browserProcesses.TerminateGroup(cmd, browserCommandStopGrace); err != nil {
+		return fmt.Errorf("terminate browser process group after command error: %w", err)
+	}
+	return nil
+}
+
+func runBoundedBrowserCleanupCommand(timeout time.Duration, name string, args ...string) error {
+	if timeout <= 0 {
+		timeout = 500 * time.Millisecond
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.WaitDelay = timeout
+	err := cmd.Run()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("browser cleanup command %q timed out after %s: %w", name, timeout, ctxErr)
+	}
+	return err
+}
+
+func resolveBrowserDiagnosticTarget(ctx context.Context, rawURL, allowedOrigins string, lookup browserDiagnosticLookup) (browserDiagnosticTarget, error) {
+	if utf8.RuneCountInString(rawURL) > 2048 {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostic URL exceeds 2048 characters")
+	}
+	if strings.TrimSpace(allowedOrigins) == "" {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostics are disabled; PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS is unset")
+	}
+	parts := strings.Split(allowedOrigins, ",")
+	if len(parts) != 1 || strings.TrimSpace(parts[0]) == "" {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostics require exactly one allowed origin")
+	}
+
+	allowed, err := url.Parse(strings.TrimSpace(parts[0]))
+	if err != nil {
+		return browserDiagnosticTarget{}, fmt.Errorf("parse diagnostic allowed origin: %w", err)
+	}
+	if allowed.Scheme != "https" || allowed.Hostname() == "" {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostic allowlist must contain one exact HTTPS origin")
+	}
+	if allowed.User != nil || (allowed.Path != "" && allowed.Path != "/") || allowed.RawQuery != "" || allowed.Fragment != "" {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostic allowlist entry must be an origin without credentials, path, query, or fragment")
+	}
+	allowed.Path = ""
+	allowed.RawPath = ""
+
+	requested, err := url.Parse(rawURL)
+	if err != nil {
+		return browserDiagnosticTarget{}, fmt.Errorf("parse diagnostic url: %w", err)
+	}
+	if requested.Scheme != "https" || requested.Hostname() == "" || requested.User != nil {
+		return browserDiagnosticTarget{}, errors.New("browser diagnostic URL must use HTTPS and include a host without credentials")
+	}
+	if !sameOriginURL(requested, allowed) {
+		return browserDiagnosticTarget{}, fmt.Errorf("browser diagnostic URL origin %q does not match allowed origin %q", browserURLOrigin(requested), browserURLOrigin(allowed))
+	}
+
+	host := canonicalHost(allowed.Hostname())
+	addresses := []net.IPAddr(nil)
+	if literal := net.ParseIP(host); literal != nil {
+		addresses = []net.IPAddr{{IP: literal}}
+	} else {
+		if lookup == nil {
+			return browserDiagnosticTarget{}, errors.New("browser diagnostic DNS resolver is unavailable")
+		}
+		addresses, err = lookup(ctx, host)
+		if err != nil {
+			return browserDiagnosticTarget{}, fmt.Errorf("resolve browser diagnostic host %q: %w", host, err)
+		}
+	}
+	if len(addresses) == 0 {
+		return browserDiagnosticTarget{}, fmt.Errorf("resolve browser diagnostic host %q: no addresses", host)
+	}
+	var selected netip.Addr
+	for _, address := range addresses {
+		candidate, ok := netip.AddrFromSlice(address.IP)
+		if !ok || !isPublicDiagnosticIP(candidate) {
+			return browserDiagnosticTarget{}, fmt.Errorf("browser diagnostic host %q resolved to non-public address %q", host, address.IP.String())
+		}
+		if !selected.IsValid() {
+			selected = candidate.Unmap()
+		}
+	}
+	resolverAddress := selected.String()
+	if selected.Is6() {
+		resolverAddress = "[" + resolverAddress + "]"
+	}
+	return browserDiagnosticTarget{
+		allowedOrigin: browserURLOrigin(allowed),
+		resolverRules: "MAP " + host + " " + resolverAddress,
+	}, nil
+}
+
+func browserURLOrigin(value *url.URL) string {
+	host := canonicalHost(value.Hostname())
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	port := value.Port()
+	isDefaultPort := (strings.EqualFold(value.Scheme, "https") && port == "443") ||
+		(strings.EqualFold(value.Scheme, "http") && port == "80")
+	if port != "" && !isDefaultPort {
+		host += ":" + port
+	}
+	return strings.ToLower(value.Scheme) + "://" + host
+}
+
+func isPublicDiagnosticIP(address netip.Addr) bool {
+	address = address.Unmap()
+	if !address.IsValid() || !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() || address.IsLinkLocalUnicast() {
 		return false
 	}
-	return result.FinalURL != "" && result.PostedToOrigin && strings.TrimSpace(result.PostError) == ""
+	for _, prefix := range []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/8"),
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("192.88.99.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+		netip.MustParsePrefix("100::/64"),
+		netip.MustParsePrefix("2001:db8::/32"),
+	} {
+		if prefix.Contains(address) {
+			return false
+		}
+	}
+	return true
 }
 
 func writeBrowserDiagnosticScript() (string, error) {
@@ -731,11 +959,22 @@ func writeBrowserDiagnosticScript() (string, error) {
 
 func browserNodeCommand(ctx context.Context, scriptPath string, args ...string) *exec.Cmd {
 	nodeArgs := append([]string{scriptPath}, args...)
+	var cmd *exec.Cmd
 	if browserShouldUseXvfb() {
 		xvfbArgs := append([]string{"-a", "node"}, nodeArgs...)
-		return exec.CommandContext(ctx, "xvfb-run", xvfbArgs...)
+		cmd = exec.CommandContext(ctx, "xvfb-run", xvfbArgs...)
+	} else {
+		cmd = exec.CommandContext(ctx, "node", nodeArgs...)
 	}
-	return exec.CommandContext(ctx, "node", nodeArgs...)
+	browserProcesses.Configure(cmd)
+	cleanupState := &browserCommandCleanupState{}
+	browserCommandCleanupStates.Store(cmd, cleanupState)
+	cmd.Cancel = func() error {
+		err := browserProcesses.TerminateGroup(cmd, browserCommandStopGrace)
+		cleanupState.record(err)
+		return err
+	}
+	return cmd
 }
 
 func browserShouldUseXvfb() bool {
@@ -744,6 +983,16 @@ func browserShouldUseXvfb() bool {
 	}
 	_, err := exec.LookPath("xvfb-run")
 	return err == nil
+}
+
+func browserDisplayPreflight(goos string, headless bool, display string, lookup func(string) (string, error)) error {
+	if goos != "linux" || headless || strings.TrimSpace(display) != "" {
+		return nil
+	}
+	if _, err := lookup("xvfb-run"); err != nil {
+		return fmt.Errorf("headed browser requires DISPLAY or xvfb-run on Linux: %w", err)
+	}
+	return nil
 }
 
 func browserHeadlessEnabled() bool {
@@ -817,78 +1066,18 @@ func supportedHosts() []string {
 
 const playwrightBrowserPrelude = `
 const { chromium, errors } = require('playwright');
-
-const productCaptureBrowserIdentity = {
-  userAgentPlatform: 'X11; Linux x86_64',
-  navigatorPlatform: 'Linux x86_64',
-  userAgentDataPlatform: 'Linux',
-  platformVersion: '',
-  language: 'en-US',
-  languages: ['en-US', 'en'],
-};
-
-function normalizeChromeVersion(rawVersion) {
-  const fallback = '149.0.0.0';
-  const match = String(rawVersion || '').match(/(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:\.(\d+))?/);
-  if (!match) return fallback;
-  return [
-    match[1],
-    match[2] || '0',
-    match[3] || '0',
-    match[4] || '0',
-  ].join('.');
-}
-
-function chromeMajorVersion(chromeVersion) {
-  return String(chromeVersion || '').split('.')[0] || '149';
-}
-
-function chromeUserAgent(chromeVersion) {
-  return 'Mozilla/5.0 (' + productCaptureBrowserIdentity.userAgentPlatform + ') AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + chromeVersion + ' Safari/537.36';
-}
-
-function chromeBrandList(chromeMajor) {
-  return [
-    { brand: 'Google Chrome', version: chromeMajor },
-    { brand: 'Chromium', version: chromeMajor },
-    { brand: 'Not)A;Brand', version: '24' },
-  ];
-}
-
-function chromeFullVersionList(chromeVersion) {
-  return [
-    { brand: 'Google Chrome', version: chromeVersion },
-    { brand: 'Chromium', version: chromeVersion },
-    { brand: 'Not)A;Brand', version: '24.0.0.0' },
-  ];
-}
-
-function chromeUserAgentMetadata(chromeVersion) {
-  const chromeMajor = chromeMajorVersion(chromeVersion);
-  return {
-    brands: chromeBrandList(chromeMajor),
-    fullVersionList: chromeFullVersionList(chromeVersion),
-    fullVersion: chromeVersion,
-    platform: productCaptureBrowserIdentity.userAgentDataPlatform,
-    platformVersion: productCaptureBrowserIdentity.platformVersion,
-    architecture: 'x86',
-    model: '',
-    mobile: false,
-    bitness: '64',
-  };
-}
-
-function browserRuntimeVersion(browser) {
-  try {
-    if (browser && typeof browser.version === 'function') {
-      return browser.version();
-    }
-  } catch {}
-  return '';
-}
+const fs = require('fs');
+const http = require('http');
+const net = require('net');
+const path = require('path');
+const { spawn } = require('child_process');
 
 function remainingTimeout(deadline) {
   return Math.max(0, deadline - Date.now());
+}
+
+function monotonicMilliseconds() {
+  return Number(process.hrtime.bigint() / 1000000n);
 }
 
 function isTransientNavigationError(err) {
@@ -916,6 +1105,10 @@ function isBrowserTargetCrashError(err) {
   ].some((needle) => normalized.includes(needle));
 }
 
+function errorMessage(err) {
+  return err && (err.message || err.stack) ? String(err.message || err.stack) : String(err);
+}
+
 function diagnosticErrorToken(err) {
   return errorMessage(err).replace(/[^A-Za-z0-9_.:-]/g, '_').slice(0, 80);
 }
@@ -938,146 +1131,755 @@ function parseBrowserHeadless() {
   return !['0', 'false', 'no', 'off', 'headed'].includes(raw);
 }
 
-async function installCaptureBrowserIdentity(page, rawChromeVersion) {
-  const chromeVersion = normalizeChromeVersion(rawChromeVersion);
-  const chromeMajor = chromeMajorVersion(chromeVersion);
-  const userAgent = chromeUserAgent(chromeVersion);
-  const userAgentMetadata = chromeUserAgentMetadata(chromeVersion);
-  try {
-    const context = page && typeof page.context === 'function' ? page.context() : null;
-    const session = context && typeof context.newCDPSession === 'function' ? await context.newCDPSession(page) : null;
-    if (session && typeof session.send === 'function') {
-      await session.send('Network.setUserAgentOverride', {
-        userAgent,
-        acceptLanguage: productCaptureBrowserIdentity.languages.join(','),
-        platform: productCaptureBrowserIdentity.navigatorPlatform,
-        userAgentMetadata,
-      });
-    }
-  } catch {}
-  await page.addInitScript((identity) => {
-    if (typeof navigator === 'undefined') return;
-    try {
-      Object.defineProperty(navigator, 'webdriver', { configurable: true, get: () => undefined });
-    } catch {}
-    try {
-      Object.defineProperty(navigator, 'platform', { configurable: true, get: () => identity.navigatorPlatform });
-    } catch {}
-    try {
-      Object.defineProperty(navigator, 'language', { configurable: true, get: () => identity.language });
-    } catch {}
-    try {
-      Object.defineProperty(navigator, 'languages', { configurable: true, get: () => Object.freeze([...identity.languages]) });
-    } catch {}
-    const highEntropyValues = {
-      architecture: 'x86',
-      bitness: '64',
-      brands: identity.brands,
-      fullVersionList: identity.fullVersionList,
-      mobile: false,
-      model: '',
-      platform: identity.userAgentDataPlatform,
-      platformVersion: identity.platformVersion,
-      uaFullVersion: identity.chromeVersion,
-      wow64: false,
-    };
-    const userAgentData = {
-      brands: identity.brands,
-      mobile: false,
-      platform: identity.userAgentDataPlatform,
-      getHighEntropyValues: async (hints) => {
-        const result = {
-          brands: identity.brands,
-          mobile: false,
-          platform: identity.userAgentDataPlatform,
-        };
-        for (const hint of Array.from(hints || [])) {
-          if (Object.prototype.hasOwnProperty.call(highEntropyValues, hint)) {
-            result[hint] = highEntropyValues[hint];
-          }
-        }
-        return result;
-      },
-      toJSON: () => ({
-        brands: identity.brands,
-        mobile: false,
-        platform: identity.userAgentDataPlatform,
-      }),
-    };
-    try {
-      Object.defineProperty(navigator, 'userAgentData', { configurable: true, get: () => userAgentData });
-    } catch {}
-  }, {
-    chromeVersion,
-    chromeMajorVersion: chromeMajor,
-    navigatorPlatform: productCaptureBrowserIdentity.navigatorPlatform,
-    userAgentDataPlatform: productCaptureBrowserIdentity.userAgentDataPlatform,
-    platformVersion: productCaptureBrowserIdentity.platformVersion,
-    language: productCaptureBrowserIdentity.language,
-    languages: productCaptureBrowserIdentity.languages,
-    brands: chromeBrandList(chromeMajor),
-    fullVersionList: chromeFullVersionList(chromeVersion),
-  });
+function delay(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function launchChromeBrowser() {
-  const launchOptions = {
-    channel: 'chrome',
-    headless: parseBrowserHeadless(),
-    args: [
-      '--disable-blink-features=AutomationControlled',
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--enable-webgl',
-      '--use-gl=swiftshader',
-      '--enable-unsafe-swiftshader',
-    ],
-  };
-  const contextOptions = {
-    viewport: parseBrowserViewport(),
-    locale: productCaptureBrowserIdentity.language,
-    timezoneId: 'America/New_York',
-  };
-  const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();
-  if (profileDir) {
-    const context = await chromium.launchPersistentContext(profileDir, {
-      ...launchOptions,
-      ...contextOptions,
-    });
-    return {
-      newPage: () => context.newPage(),
-      version: () => browserRuntimeVersion(context && typeof context.browser === 'function' ? context.browser() : null),
-      close: () => context.close(),
-    };
-  }
-  const browser = await chromium.launch({ ...launchOptions });
-  return {
-    newPage: () => browser.newPage(contextOptions),
-    version: () => browserRuntimeVersion(browser),
-    close: () => browser.close(),
-  };
-}
-
-async function newCapturePage(browser) {
-  const page = await browser.newPage();
-  await installCaptureBrowserIdentity(page, browser.version());
-  return page;
-}
-
-async function closeCaptureBrowser(browser) {
+async function waitForChromeExit(chrome, timeoutMilliseconds) {
   let timer;
   try {
     await Promise.race([
-      browser.close(),
+      chrome.exited,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, timeoutMilliseconds);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function fileSystemEntryExists(entryPath) {
+  try {
+    fs.lstatSync(entryPath);
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ENOENT') return false;
+    throw err;
+  }
+}
+
+let activeChromeChild = null;
+let browserShutdownStarted = false;
+
+function chromeProcessAlive(chrome) {
+  if (!chrome || !chrome.pid || chrome.chromeExit !== null) return false;
+  assertChromeProcessIdentity(chrome, 'during liveness check');
+  return processIsRunning(chrome.pid);
+}
+
+function processIsRunning(processID) {
+  try {
+    process.kill(processID, 0);
+  } catch (err) {
+    if (err && err.code === 'ESRCH') return false;
+    throw err;
+  }
+  if (process.platform === 'linux') {
+    const stat = linuxProcessStat(processID);
+    if (!stat || stat.state === 'Z') return false;
+  }
+  return true;
+}
+
+function linuxProcessStat(processID) {
+  let malformedError;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    let stat;
+    try {
+      stat = fs.readFileSync('/proc/' + processID + '/stat', 'utf8');
+    } catch (err) {
+      if (err && err.code === 'ENOENT') return null;
+      throw err;
+    }
+    const close = stat.lastIndexOf(')');
+    if (close < 0) {
+      malformedError = new Error('malformed procfs stat for PID ' + processID);
+      continue;
+    }
+    const fields = stat.slice(close + 2).trim().split(/\s+/);
+    const parentProcessID = Number(fields[1]);
+    const processGroupID = Number(fields[2]);
+    const sessionID = Number(fields[3]);
+    const startTime = fields[19];
+    if (
+      fields.length < 20 ||
+      !/^[A-Za-z]$/.test(fields[0] || '') ||
+      !Number.isInteger(parentProcessID) || parentProcessID < 0 ||
+      !Number.isInteger(processGroupID) || processGroupID < 0 ||
+      !Number.isInteger(sessionID) || sessionID < 0 ||
+      !/^\d+$/.test(startTime || '')
+    ) {
+      malformedError = new Error('malformed procfs process group for PID ' + processID);
+      continue;
+    }
+    return { state: fields[0], processGroupID, startTime };
+  }
+  throw malformedError;
+}
+
+function captureChromeProcessIdentity(chrome) {
+  if (process.platform !== 'linux') return;
+  if (!chrome || !Number.isInteger(chrome.pid) || chrome.pid <= 0) {
+    throw new Error('google-chrome did not expose a valid Linux process ID');
+  }
+  const stat = linuxProcessStat(chrome.pid);
+  if (!stat || stat.state === 'Z') {
+    throw new Error('google-chrome exited before its Linux process identity was captured');
+  }
+  if (stat.processGroupID !== chrome.pid) {
+    throw new Error('google-chrome is not the leader of its dedicated Linux process group');
+  }
+  chrome.linuxStartTime = stat.startTime;
+}
+
+function captureChromeBrowserProcessIdentity(chrome) {
+  if (process.platform !== 'linux') {
+    chrome.browserPID = chrome.pid;
+    return;
+  }
+  if (!Number.isInteger(chrome.browserPID) || chrome.browserPID <= 0) {
+    throw new Error('google-chrome supervisor did not expose a valid browser process ID');
+  }
+  const stat = linuxProcessStat(chrome.browserPID);
+  if (!stat || stat.state === 'Z') {
+    throw new Error('google-chrome exited before its Linux browser identity was captured');
+  }
+  if (stat.processGroupID !== chrome.pid) {
+    throw new Error('google-chrome browser is outside its dedicated Linux process group');
+  }
+  chrome.linuxBrowserStartTime = stat.startTime;
+}
+
+function chromeBrowserProcessAlive(chrome) {
+  if (process.platform !== 'linux') return chromeProcessAlive(chrome);
+  if (!chrome || !chrome.linuxBrowserStartTime || !Number.isInteger(chrome.browserPID)) return false;
+  const browserProcess = linuxProcessStat(chrome.browserPID);
+  if (!browserProcess || browserProcess.state === 'Z') return false;
+  if (browserProcess.startTime !== chrome.linuxBrowserStartTime) {
+    const err = new Error('Chrome browser process identity changed during liveness check');
+    err.code = 'PRODUCT_CAPTURE_CHROME_IDENTITY_CHANGED';
+    throw err;
+  }
+  if (browserProcess.processGroupID !== chrome.pid) {
+    throw new Error('Chrome browser left its dedicated Linux process group');
+  }
+  return true;
+}
+
+function readLinuxChromeBrowserPID(chrome, timeoutMilliseconds) {
+  if (!chrome || !chrome.stdout) return Promise.reject(new Error('google-chrome supervisor stdout is unavailable'));
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let output = '';
+    let timer;
+    const finish = (err, processID) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      chrome.stdout.off('data', onData);
+      chrome.stdout.off('error', onError);
+      chrome.stdout.off('end', onEnd);
+      if (err) reject(err); else resolve(processID);
+    };
+    const onData = (chunk) => {
+      output += String(chunk);
+      if (output.length > 64) return finish(new Error('google-chrome supervisor PID output is too large'));
+      const newline = output.indexOf('\n');
+      if (newline < 0) return;
+      const value = output.slice(0, newline).trim();
+      if (!/^[1-9]\d*$/.test(value)) return finish(new Error('google-chrome supervisor emitted an invalid browser PID'));
+      const processID = Number(value);
+      if (!Number.isSafeInteger(processID)) return finish(new Error('google-chrome supervisor browser PID is out of range'));
+      finish(null, processID);
+    };
+    const onError = (err) => finish(new Error('google-chrome supervisor stdout failed: ' + boundedBrowserErrorMessage(err), { cause: err }));
+    const onEnd = () => finish(new Error('google-chrome supervisor exited before emitting its browser PID'));
+    chrome.stdout.on('data', onData);
+    chrome.stdout.once('error', onError);
+    chrome.stdout.once('end', onEnd);
+    timer = setTimeout(() => finish(new Error('google-chrome supervisor PID timed out')), timeoutMilliseconds);
+  });
+}
+
+function assertChromeProcessIdentity(chrome, operation) {
+  if (process.platform !== 'linux') return;
+  if (!chrome || !chrome.linuxStartTime) {
+    const err = new Error('Chrome process identity is unavailable ' + operation);
+    err.code = 'PRODUCT_CAPTURE_CHROME_IDENTITY_UNAVAILABLE';
+    throw err;
+  }
+  const leader = linuxProcessStat(chrome.pid);
+  if (!leader) {
+    const err = new Error('Chrome process identity is unavailable ' + operation);
+    err.code = 'PRODUCT_CAPTURE_CHROME_IDENTITY_UNAVAILABLE';
+    throw err;
+  }
+  if (leader.startTime !== chrome.linuxStartTime) {
+    const err = new Error('Chrome process identity changed ' + operation);
+    err.code = 'PRODUCT_CAPTURE_CHROME_IDENTITY_CHANGED';
+    throw err;
+  }
+}
+
+function linuxProcessGroupMembers(processGroupID) {
+  const members = new Map();
+  for (const entry of fs.readdirSync('/proc')) {
+    const processID = Number(entry);
+    if (!Number.isInteger(processID) || processID <= 0) continue;
+    try {
+      const stat = linuxProcessStat(processID);
+      if (stat && stat.processGroupID === processGroupID) members.set(processID, stat.state);
+    } catch (err) {
+      if (err && err.code === 'ENOENT') continue;
+      throw err;
+    }
+  }
+  return members;
+}
+
+function listeningSocketInodes(port) {
+  const inodes = new Set();
+  for (const procPath of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    try {
+      for (const line of fs.readFileSync(procPath, 'utf8').split('\n')) {
+        const fields = line.trim().split(/\s+/);
+        if (fields.length < 10 || fields[3] !== '0A') continue;
+        const separator = fields[1].lastIndexOf(':');
+        if (separator < 0 || Number.parseInt(fields[1].slice(separator + 1), 16) !== port) continue;
+        const address = fields[1].slice(0, separator);
+        if (address !== '0100007F' && address !== '00000000000000000000000001000000') continue;
+        inodes.add(fields[9]);
+      }
+    } catch {}
+  }
+  return inodes;
+}
+
+function ownsChromeListeningPort(rootPID, port) {
+  if (process.platform !== 'linux') return null;
+  const inodes = listeningSocketInodes(port);
+  if (inodes.size === 0) return false;
+  for (const processID of linuxProcessGroupMembers(rootPID).keys()) {
+    let descriptors = [];
+    try {
+      descriptors = fs.readdirSync('/proc/' + processID + '/fd');
+    } catch {
+      continue;
+    }
+    for (const descriptor of descriptors) {
+      try {
+        const target = fs.readlinkSync('/proc/' + processID + '/fd/' + descriptor);
+        const match = target.match(/^socket:\[(\d+)\]$/);
+        if (match && inodes.has(match[1])) return true;
+      } catch {}
+    }
+  }
+  return false;
+}
+
+async function selectLoopbackPort() {
+  const server = net.createServer();
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  const port = address && typeof address === 'object' ? address.port : 0;
+  await new Promise((resolve, reject) => server.close((err) => err ? reject(err) : resolve()));
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error('failed to select Chrome CDP loopback port');
+  }
+  return port;
+}
+
+function chromeEndpointReady(port, absoluteDeadline) {
+  const remaining = Math.max(0, Number(absoluteDeadline || 0) - monotonicMilliseconds());
+  if (remaining <= 0) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    let absoluteTimer;
+    const finish = (ready) => {
+      if (settled) return;
+      settled = true;
+      if (absoluteTimer) clearTimeout(absoluteTimer);
+      resolve(ready);
+    };
+    const request = http.get({ host: '127.0.0.1', port, path: '/json/version' }, (response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => {
+        body += chunk;
+        if (body.length > 65536) request.destroy(new Error('Chrome version response is too large'));
+      });
+      response.on('end', () => {
+        if (response.statusCode !== 200) return finish(false);
+        try {
+          const version = JSON.parse(body);
+          const endpoint = new URL(String(version.webSocketDebuggerUrl || ''));
+          finish(
+            endpoint.protocol === 'ws:' &&
+            ['127.0.0.1', 'localhost'].includes(endpoint.hostname) &&
+            Number(endpoint.port) === port &&
+            endpoint.pathname.startsWith('/devtools/browser/')
+          );
+        } catch {
+          finish(false);
+        }
+      });
+    });
+    absoluteTimer = setTimeout(
+      () => request.destroy(new Error('Chrome version request timed out')),
+      Math.max(1, Math.min(500, remaining)),
+    );
+    request.on('error', () => finish(false));
+  });
+}
+
+async function waitForChromeEndpoint(chrome, cdpPort) {
+  const deadline = monotonicMilliseconds() + 15000;
+  while (monotonicMilliseconds() < deadline) {
+    if (chrome.startError) throw chrome.startError;
+    if (chrome.chromeExit !== null) {
+      throw new Error('google-chrome exited before opening its CDP listener');
+    }
+    const childAlive = chromeProcessAlive(chrome);
+    const browserAlive = childAlive && chromeBrowserProcessAlive(chrome);
+    if (childAlive && !browserAlive) throw new Error('google-chrome exited before opening its CDP listener');
+    const ownsListener = browserAlive ? ownsChromeListeningPort(chrome.pid, cdpPort) : false;
+    if (
+      browserAlive &&
+      (process.platform !== 'linux' || ownsListener) &&
+      await chromeEndpointReady(cdpPort, deadline)
+    ) {
+      return 'http://127.0.0.1:' + cdpPort;
+    }
+    await delay(25);
+  }
+  throw new Error('timed out waiting for google-chrome CDP listener ownership');
+}
+
+async function verifyAttachedBrowserProcess(browser, chrome) {
+  if (!chromeProcessAlive(chrome)) throw new Error('spawned Chrome supervisor exited before CDP identity verification');
+  if (!chromeBrowserProcessAlive(chrome)) throw new Error('spawned Chrome child exited before CDP identity verification');
+  const session = await boundedBrowserStartupPromise(
+    browser.newBrowserCDPSession(),
+    1000,
+    'CDP identity session creation timed out',
+  );
+  try {
+    const result = await boundedBrowserStartupPromise(
+      session.send('SystemInfo.getProcessInfo'),
+      1000,
+      'CDP identity verification timed out',
+    );
+    const processes = Array.isArray(result && result.processInfo) ? result.processInfo : [];
+    const browserProcesses = processes.filter((entry) => entry.type === 'browser');
+    if (browserProcesses.length !== 1 || Number(browserProcesses[0].id) !== chrome.browserPID) {
+      throw new Error('attached CDP browser is not the spawned Chrome child');
+    }
+  } finally {
+    await boundedBrowserStartupPromise(session.detach(), 1000, 'CDP identity session detach timed out');
+  }
+  if (!chromeProcessAlive(chrome)) throw new Error('spawned Chrome supervisor exited during CDP identity verification');
+  if (!chromeBrowserProcessAlive(chrome)) throw new Error('spawned Chrome child exited during CDP identity verification');
+}
+
+async function boundedBrowserStartupPromise(promise, timeoutMilliseconds, message) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('browser close timed out')), 2000);
+        timer = setTimeout(() => reject(new Error(message)), timeoutMilliseconds);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function chromeProcessBoundaryAlive(chrome) {
+  if (process.platform !== 'linux') return chromeProcessAlive(chrome);
+  if (!chrome || !Number.isInteger(chrome.pid) || chrome.pid <= 0) return false;
+  assertChromeProcessIdentity(chrome, 'during process-group inspection');
+  try {
+    process.kill(-chrome.pid, 0);
+  } catch (err) {
+    if (err && err.code === 'ESRCH') return false;
+    throw err;
+  }
+  for (const state of linuxProcessGroupMembers(chrome.pid).values()) {
+    if (state !== 'Z') return true;
+  }
+  return false;
+}
+
+function chromeProcessBoundaryAliveAfterKill(chrome) {
+  if (process.platform !== 'linux') return chromeProcessAlive(chrome);
+  if (!chrome || !Number.isInteger(chrome.pid) || chrome.pid <= 0) return false;
+  for (const state of linuxProcessGroupMembers(chrome.pid).values()) {
+    if (state !== 'Z') return true;
+  }
+  return false;
+}
+
+function signalChromeProcessBoundary(chrome, signal) {
+  if (!chrome || !Number.isInteger(chrome.pid) || chrome.pid <= 0) return false;
+  if (process.platform !== 'linux') return chrome.kill(signal);
+  assertChromeProcessIdentity(chrome, 'before process-group signal');
+  const target = -chrome.pid;
+  try {
+    process.kill(target, signal);
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ESRCH') return false;
+    throw err;
+  }
+}
+
+function killFreshChromeProcessBoundary(chrome) {
+  // This marker is created by detached spawn and consumed before the first event-loop yield.
+  if (
+    process.platform !== 'linux' ||
+    !chrome ||
+    !Number.isInteger(chrome.pid) ||
+    chrome.pid <= 0 ||
+    chrome.linuxFreshProcessBoundary !== true
+  ) {
+    throw new Error('fresh Chrome process boundary is unavailable');
+  }
+  chrome.linuxFreshProcessBoundary = false;
+  try {
+    process.kill(-chrome.pid, 'SIGKILL');
+    return true;
+  } catch (err) {
+    if (err && err.code === 'ESRCH') return false;
+    throw err;
+  }
+}
+
+async function captureChromeProcessIdentityOrAbort(chrome, graceMilliseconds) {
+  try {
+    captureChromeProcessIdentity(chrome);
+    chrome.linuxFreshProcessBoundary = false;
+  } catch (identityError) {
+    let abortError = null;
+    try {
+      killFreshChromeProcessBoundary(chrome);
+      chrome.linuxProcessBoundaryTerminated = true;
+      if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
+      if (chrome.chromeExit === null) {
+        throw new Error('fresh google-chrome process-group leader was not reaped after SIGKILL');
+      }
+    } catch (err) {
+      abortError = err;
+    }
+    if (abortError) {
+      const combined = new AggregateError(
+        [identityError, abortError],
+        errorMessage(identityError) + '; fresh Chrome abort failed: ' + errorMessage(abortError),
+        { cause: identityError },
+      );
+      combined.browserCleanupFailed = true;
+      throw combined;
+    }
+    throw identityError;
+  }
+}
+
+async function waitForChromeProcessBoundaryExit(chrome, graceMilliseconds) {
+  const deadline = monotonicMilliseconds() + Math.max(0, graceMilliseconds);
+  while (monotonicMilliseconds() < deadline) {
+    if (!chromeProcessBoundaryAlive(chrome)) return true;
+    await delay(25);
+  }
+  return !chromeProcessBoundaryAlive(chrome);
+}
+
+async function waitForChromeProcessBoundaryExitAfterKill(chrome, graceMilliseconds) {
+  const deadline = monotonicMilliseconds() + Math.max(0, graceMilliseconds);
+  while (monotonicMilliseconds() < deadline) {
+    if (!chromeProcessBoundaryAliveAfterKill(chrome)) return true;
+    await delay(25);
+  }
+  return !chromeProcessBoundaryAliveAfterKill(chrome);
+}
+
+async function terminateChromeChild(chrome, graceMilliseconds) {
+  if (!chrome) return;
+  if (process.platform === 'linux') {
+    if (chrome.linuxProcessBoundaryTerminated === true) {
+      if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
+      if (chrome.chromeExit === null) throw new Error('terminated google-chrome process-group leader was not reaped');
+      return;
+    }
+    let termSent = false;
+    let killSent = false;
+    try {
+      termSent = signalChromeProcessBoundary(chrome, 'SIGTERM');
+      if (termSent && !await waitForChromeProcessBoundaryExit(chrome, graceMilliseconds)) {
+        killSent = signalChromeProcessBoundary(chrome, 'SIGKILL');
+        if (killSent && !await waitForChromeProcessBoundaryExitAfterKill(chrome, graceMilliseconds)) {
+          throw new Error('Chrome process group survived SIGKILL');
+        }
+      }
+    } catch (inspectionError) {
+      if (killSent) throw inspectionError;
+      if (termSent && (!inspectionError || inspectionError.code !== 'PRODUCT_CAPTURE_CHROME_IDENTITY_CHANGED')) {
+        let fallbackError = null;
+        try {
+          const fallbackKillSent = signalChromeProcessBoundary(chrome, 'SIGKILL');
+          if (fallbackKillSent && !await waitForChromeProcessBoundaryExitAfterKill(chrome, graceMilliseconds)) {
+            throw new Error('Chrome process group survived fallback SIGKILL');
+          }
+          if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
+          if (chrome.chromeExit === null) {
+            throw new Error('google-chrome process-group leader was not reaped after fallback SIGKILL');
+          }
+        } catch (err) {
+          fallbackError = err;
+        }
+        if (fallbackError) {
+          throw new AggregateError(
+            [inspectionError, fallbackError],
+            errorMessage(inspectionError) + '; fallback SIGKILL failed: ' + errorMessage(fallbackError),
+            { cause: inspectionError },
+          );
+        }
+      }
+      throw inspectionError;
+    }
+    if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
+    if (chrome.chromeExit === null) throw new Error('google-chrome process-group leader was not reaped');
+    return;
+  }
+  if (chrome.chromeExit === null && chrome.pid) signalChromeProcessBoundary(chrome, 'SIGTERM');
+  if (chrome.chromeExit === null) await waitForChromeExit(chrome, graceMilliseconds);
+  if (chrome.chromeExit === null && chrome.pid) {
+    signalChromeProcessBoundary(chrome, 'SIGKILL');
+    await waitForChromeExit(chrome, graceMilliseconds);
+  }
+  if (chrome.chromeExit === null) throw new Error('google-chrome did not exit after SIGKILL');
+}
+
+async function shutdownBrowserProcess(exitCode) {
+  if (browserShutdownStarted) return;
+  browserShutdownStarted = true;
+  try {
+    await terminateChromeChild(activeChromeChild, 500);
+  } catch (err) {
+    console.error('browser signal cleanup warning: ' + errorMessage(err));
+  } finally {
+    process.exit(exitCode);
+  }
+}
+
+process.once('SIGTERM', () => { void shutdownBrowserProcess(143); });
+process.once('SIGINT', () => { void shutdownBrowserProcess(130); });
+
+const linuxChromeSupervisorScript = [
+  "trap '' TERM HUP",
+  '(trap - TERM HUP; exec "$@") >/dev/null &',
+  'browser_pid=$!',
+  "printf '%s\\n' \"$browser_pid\"",
+  'wait "$browser_pid"',
+  'while :; do sleep 3600 & wait $!; done',
+].join('\n');
+
+function spawnChromeProcess(chromeExecutable, chromeArgs) {
+  if (process.platform === 'linux') {
+    return spawn('/bin/sh', [
+      '-c',
+      linuxChromeSupervisorScript,
+      'product-capture-chrome-supervisor',
+      chromeExecutable,
+      ...chromeArgs,
+    ], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  }
+  return spawn(chromeExecutable, chromeArgs, {
+    detached: false,
+    stdio: ['ignore', 'ignore', 'pipe'],
+  });
+}
+
+async function launchChromeBrowserAttempt(profileDir, viewport) {
+  const cdpPort = await selectLoopbackPort();
+  const chromeArgs = [
+    '--remote-debugging-port=' + cdpPort,
+    '--remote-debugging-address=127.0.0.1',
+    '--user-data-dir=' + profileDir,
+    '--window-size=' + viewport.width + ',' + viewport.height,
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-dev-shm-usage',
+  ];
+  if (parseBrowserHeadless()) chromeArgs.push('--headless=new');
+  const resolverRules = String(process.env.PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES || '').trim();
+  if (resolverRules) chromeArgs.push('--host-resolver-rules=' + resolverRules);
+  chromeArgs.push('about:blank');
+
+  const chromeExecutable = 'google-chrome';
+  const chrome = spawnChromeProcess(chromeExecutable, chromeArgs);
+  activeChromeChild = chrome;
+  chrome.linuxFreshProcessBoundary = process.platform === 'linux';
+  chrome.chromeExit = null;
+  chrome.startError = null;
+  chrome.exited = new Promise((resolve) => {
+    chrome.once('error', (err) => {
+      chrome.startError = new Error('google-chrome failed to spawn: ' + boundedBrowserErrorMessage(err), { cause: err });
+      chrome.chromeExit = { code: null, signal: null, spawnError: true };
+      resolve();
+    });
+    chrome.once('exit', (code, signal) => {
+      chrome.chromeExit = { code, signal };
+      resolve();
+    });
+  });
+  if (chrome.stderr) chrome.stderr.on('data', (chunk) => process.stderr.write(chunk));
+
+  let browser;
+  try {
+    await captureChromeProcessIdentityOrAbort(chrome, 500);
+    if (process.platform === 'linux') {
+      chrome.browserPID = await readLinuxChromeBrowserPID(chrome, 1000);
+    }
+    captureChromeBrowserProcessIdentity(chrome);
+    const cdpEndpoint = await waitForChromeEndpoint(chrome, cdpPort);
+    browser = await chromium.connectOverCDP(cdpEndpoint, { timeout: 10000 });
+    const contexts = browser.contexts();
+    if (!contexts || contexts.length !== 1) throw new Error('native Chrome default context is unavailable');
+    const context = contexts[0];
+    const pages = context.pages();
+    if (!pages || pages.length !== 1) throw new Error('native Chrome initial page is unavailable');
+    const initialPage = pages[0];
+    if (initialPage.url() !== 'about:blank') throw new Error('native Chrome initial page is not blank');
+    await verifyAttachedBrowserProcess(browser, chrome);
+    return {
+      browser,
+      context,
+      chrome,
+      initialPage,
+      initialPageConsumed: false,
+    };
+  } catch (err) {
+    await closeCaptureBrowserAfterOperation({
+      browser: browser || { close: async () => {} },
+      chrome,
+    }, err);
+    throw err;
+  }
+}
+
+async function launchChromeBrowser() {
+  const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();
+  if (!profileDir) throw new Error('PRODUCT_CAPTURE_BROWSER_PROFILE_DIR is required');
+  fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+  for (const lockName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+    if (fileSystemEntryExists(path.join(profileDir, lockName))) {
+      throw new Error('Chrome profile is already active: ' + lockName);
+    }
+  }
+  const viewport = parseBrowserViewport();
+  const startupErrors = [];
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await launchChromeBrowserAttempt(profileDir, viewport);
+    } catch (err) {
+      if (err && err.browserCleanupFailed) throw err;
+      if (activeChromeChild && chromeProcessAlive(activeChromeChild)) {
+        throw new AggregateError([err], 'native Chrome startup cleanup left a live child', { cause: err });
+      }
+      for (const lockName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
+        if (fileSystemEntryExists(path.join(profileDir, lockName))) {
+          throw new AggregateError([err], 'native Chrome startup cleanup left profile lock ' + lockName, { cause: err });
+        }
+      }
+      startupErrors.push(err);
+      if (attempt < 2) await delay(50);
+    }
+  }
+  throw new AggregateError(
+    startupErrors,
+    'native Chrome startup failed after 3 attempts: ' + browserErrorSummary(startupErrors),
+    { cause: startupErrors[0] },
+  );
+}
+
+async function newCapturePage(browser) {
+  if (browser.initialPageConsumed) throw new Error('native Chrome initial page is already in use');
+  if (!browser.initialPage || browser.initialPage.url() !== 'about:blank') {
+    throw new Error('native Chrome initial page is unavailable');
+  }
+  browser.initialPageConsumed = true;
+  return browser.initialPage;
+}
+
+function boundedBrowserErrorMessage(err) {
+  const message = err && err.message ? err.message : err;
+  return String(message || 'unknown error').replace(/\s+/g, ' ').slice(0, 400);
+}
+
+function browserErrorSummary(errors) {
+  return Array.from(errors || []).map(boundedBrowserErrorMessage).join('; ').slice(0, 800);
+}
+
+async function closeCaptureBrowser(browser) {
+  const cleanupErrors = [];
+  let closeTimer;
+  try {
+    await Promise.race([
+      browser.browser.close(),
+      new Promise((_, reject) => {
+        closeTimer = setTimeout(() => reject(new Error('browser close timed out')), 2000);
       }),
     ]);
   } catch (err) {
-    console.error('browser close warning: ' + errorMessage(err));
+    cleanupErrors.push(err);
   } finally {
-    if (timer) clearTimeout(timer);
+    if (closeTimer) clearTimeout(closeTimer);
+  }
+  let terminationComplete = false;
+  try {
+    await terminateChromeChild(browser.chrome, 1000);
+    terminationComplete = true;
+  } catch (err) {
+    cleanupErrors.push(err);
+  } finally {
+    if (terminationComplete && activeChromeChild === browser.chrome) activeChromeChild = null;
+  }
+  if (cleanupErrors.length > 0) {
+    throw new AggregateError(
+      cleanupErrors,
+      'browser cleanup failed: ' + browserErrorSummary(cleanupErrors),
+      { cause: cleanupErrors[0] },
+    );
+  }
+}
+
+async function closeCaptureBrowserAfterOperation(browser, operationError) {
+  try {
+    await closeCaptureBrowser(browser);
+  } catch (cleanupError) {
+    if (!operationError) throw cleanupError;
+    const cleanupErrors = cleanupError instanceof AggregateError && cleanupError.errors
+      ? Array.from(cleanupError.errors)
+      : [cleanupError];
+    const combinedError = new AggregateError(
+      [operationError, ...cleanupErrors],
+      (
+        'browser operation failed: ' + boundedBrowserErrorMessage(operationError) +
+        '; browser cleanup failed: ' + browserErrorSummary(cleanupErrors)
+      ).slice(0, 1200),
+      { cause: operationError },
+    );
+    combinedError.browserCleanupFailed = true;
+    throw combinedError;
   }
 }
 
@@ -1258,10 +2060,6 @@ async function safeProductTitleReady(page) {
 
 async function safeProductDomTitleReady(page) {
   return await productDomTitleReady(page).catch(() => false);
-}
-
-function errorMessage(err) {
-  return err && (err.message || err.stack) ? String(err.message || err.stack) : String(err);
 }
 
 async function requireProductTitleReady(page, requestedURL) {
@@ -1820,9 +2618,10 @@ async function main() {
 }
 
 async function captureMain(url, deadline) {
+  let operationError = null;
   const browser = await launchChromeBrowser();
-  const page = await newCapturePage(browser);
   try {
+    const page = await newCapturePage(browser);
     await gotoTargetWithOptionalWarmup(page, url, deadline);
     if (await hasAmazonInterstitial(page, url, deadline)) {
       throw await amazonManualReviewError(page, url);
@@ -1877,8 +2676,11 @@ async function captureMain(url, deadline) {
     }
     await clearAmazonContinuationMarkers(page);
     process.stdout.write(await page.content());
+  } catch (err) {
+    operationError = err;
+    throw err;
   } finally {
-    await closeCaptureBrowser(browser);
+    await closeCaptureBrowserAfterOperation(browser, operationError);
   }
 }
 
@@ -1917,10 +2719,22 @@ async function gotoWithTransientRetry(page, url, deadline) {
 
 async function main() {
   const url = process.argv[2];
-  const requestedOrigin = new URL(url).origin;
+  const allowedOrigin = String(process.env.PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN || '').trim();
+  if (!allowedOrigin || new URL(url).origin !== allowedOrigin) {
+    throw new Error('diagnostic target does not match the configured allowed origin');
+  }
+  let operationError = null;
   const browser = await launchChromeBrowser();
-  const page = await newCapturePage(browser);
   try {
+    await browser.context.route('**/*', async (route) => {
+      const requestURL = new URL(route.request().url());
+      if ((requestURL.protocol === 'http:' || requestURL.protocol === 'https:') && requestURL.origin !== allowedOrigin) {
+        await route.abort('blockedbyclient');
+        return;
+      }
+      await route.continue();
+    });
+    const page = await newCapturePage(browser);
     await gotoTargetWithOptionalWarmup(page, url, Date.now() + 30000);
     const result = await page.evaluate(async (diagnosticOptions) => {
       const diagnosticErrorMessage = (err) => err && (err.stack || err.message) ? String(err.stack || err.message) : String(err);
@@ -2055,7 +2869,7 @@ async function main() {
         post_error,
         browser_signals: browserSignals,
       };
-    }, { requestedOrigin });
+    }, { requestedOrigin: allowedOrigin });
     process.stdout.write(JSON.stringify({
       target_url: url,
       final_url: result.final_url,
@@ -2063,8 +2877,11 @@ async function main() {
       post_error: result.post_error,
       browser_signals: result.browser_signals,
     }, null, 2) + '\n');
+  } catch (err) {
+    operationError = err;
+    throw err;
   } finally {
-    await closeCaptureBrowser(browser);
+    await closeCaptureBrowserAfterOperation(browser, operationError);
   }
 }
 
