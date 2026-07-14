@@ -522,6 +522,7 @@ func submitProviderTask(ctx context.Context, client *protocol.Client, cfg Config
 			ExecutionSecurityTier: protocol.ExecutionSandboxedContainer,
 			ProofTier:             protocol.ProofArtifactHash,
 		},
+		NetworkPolicy:  protocol.NetworkPolicy{Mode: protocol.NetworkModeDirect},
 		InputHash:      inputHash,
 		RequestedAt:    now,
 		TimeoutSeconds: cfg.TaskTimeoutSeconds,
