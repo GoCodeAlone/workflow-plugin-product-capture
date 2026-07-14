@@ -360,6 +360,14 @@ digests; accepted proof validation continues to require the exact executor
 snapshot plus task and dependency-closure hashes that bind the provider image.
 This does not change the Scope Manifest.
 
+**Execution backport 2026-07-14 (network policy):** The BMW network product
+canonicalizes an omitted task network mode to its admitted `direct` mode,
+changing the immutable task binding returned by `POST /v1/tasks`. Provider
+proof tasks now declare `direct` before submission; the regression fixture
+reproduces server canonicalization. Evidence: staging run `29350736038` failed
+with `submitted task response does not match requested provider task`. This
+does not change the Scope Manifest.
+
 **Step 3: Add staging workflow**
 
 The workflow runs from `main`, validates image ref/URL/worker inputs, uses a

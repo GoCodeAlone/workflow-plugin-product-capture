@@ -117,6 +117,32 @@ func TestRunCompletesGenericProductCaptureRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRunMatchesNetworkProductDirectModeCanonicalization(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.mutateSubmittedResponse = func(task *protocol.Task) {
+		task.NetworkPolicy.Mode = protocol.NetworkModeDirect
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.CapacityTimeout = 5 * time.Second
+	cfg.ResultTimeout = 5 * time.Second
+	cfg.ArtifactTimeout = 5 * time.Second
+
+	if _, err := Run(t.Context(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if len(fixture.submitted) != 1 {
+		t.Fatalf("submitted tasks = %d, want 1", len(fixture.submitted))
+	}
+	if fixture.submitted[0].NetworkPolicy.Mode != protocol.NetworkModeDirect {
+		t.Fatalf("submitted network mode = %q, want %q", fixture.submitted[0].NetworkPolicy.Mode, protocol.NetworkModeDirect)
+	}
+}
+
 func TestRunSeparatesSandboxProvenanceFromProviderImage(t *testing.T) {
 	fixture := newComputeFixture(t)
 	sandboxImageDigest := "sha256:" + strings.Repeat("c", 64)
@@ -361,14 +387,20 @@ func TestRunRejectsMismatchedTerminalRequirements(t *testing.T) {
 }
 
 func TestRunRejectsMismatchedSubmittedTaskFields(t *testing.T) {
-	fixture := newComputeFixture(t)
-	fixture.mutateSubmittedResponse = func(task *protocol.Task) {
-		task.TimeoutSeconds++
+	tests := map[string]func(*protocol.Task){
+		"timeout":        func(task *protocol.Task) { task.TimeoutSeconds++ },
+		"network policy": func(task *protocol.Task) { task.NetworkPolicy.Mode = protocol.NetworkModeRelay },
 	}
-	server := httptest.NewServer(fixture)
-	t.Cleanup(server.Close)
-	if _, err := Run(t.Context(), testConfig(t, server.URL)); err == nil || !strings.Contains(err.Error(), "submitted task response") {
-		t.Fatalf("Run error = %v, want submitted task response rejection", err)
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := newComputeFixture(t)
+			fixture.mutateSubmittedResponse = mutate
+			server := httptest.NewServer(fixture)
+			t.Cleanup(server.Close)
+			if _, err := Run(t.Context(), testConfig(t, server.URL)); err == nil || !strings.Contains(err.Error(), "submitted task response") {
+				t.Fatalf("Run error = %v, want submitted task response rejection", err)
+			}
+		})
 	}
 }
 
@@ -630,6 +662,11 @@ func TestRunOptionallyCapturesAcceptedBrowserDiagnostic(t *testing.T) {
 	if fixture.submitted[0].Workload.Provider.Operation != "capture_product" ||
 		fixture.submitted[1].Workload.Provider.Operation != "browser_diagnostic" {
 		t.Fatalf("submitted operations = %q, %q", fixture.submitted[0].Workload.Provider.Operation, fixture.submitted[1].Workload.Provider.Operation)
+	}
+	for _, task := range fixture.submitted {
+		if task.NetworkPolicy.Mode != protocol.NetworkModeDirect {
+			t.Fatalf("submitted %q network mode = %q, want %q", task.Workload.Provider.Operation, task.NetworkPolicy.Mode, protocol.NetworkModeDirect)
+		}
 	}
 	var input map[string]any
 	if err := json.Unmarshal(fixture.submitted[1].Workload.Provider.Input, &input); err != nil {
