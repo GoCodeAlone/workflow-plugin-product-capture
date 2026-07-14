@@ -117,6 +117,39 @@ func TestRunCompletesGenericProductCaptureRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRunSeparatesSandboxProvenanceFromProviderImage(t *testing.T) {
+	fixture := newComputeFixture(t)
+	sandboxImageDigest := "sha256:" + strings.Repeat("c", 64)
+	fixture.agents[0].Capabilities.Executors[0].ImageDigest = sandboxImageDigest
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.Executor.ImageDigest = sandboxImageDigest
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	if _, ok := compatibleExecutor(fixture.agents[0], cfg); !ok {
+		t.Fatal("valid sandbox executor rejected because its image digest differs from the provider workload image")
+	}
+
+	summary, err := Run(t.Context(), cfg)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if summary.ProviderImageRef != testImageRef {
+		t.Fatalf("provider image ref = %q, want %q", summary.ProviderImageRef, testImageRef)
+	}
+	if summary.Executor.ImageDigest != sandboxImageDigest {
+		t.Fatalf("sandbox image digest = %q, want %q", summary.Executor.ImageDigest, sandboxImageDigest)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if len(fixture.submitted) != 1 || fixture.submitted[0].Workload.Provider == nil ||
+		fixture.submitted[0].Workload.Provider.ImageRef != testImageRef {
+		t.Fatalf("submitted provider workload = %+v, want image %q", fixture.submitted, testImageRef)
+	}
+}
+
 func TestRunCapsProviderAndComputeTaskTimeoutTogether(t *testing.T) {
 	fixture := newComputeFixture(t)
 	server := httptest.NewServer(fixture)
@@ -196,7 +229,7 @@ func TestRunWaitsForExactIdleRetainedCapacity(t *testing.T) {
 			other := f.agents[0]
 			other.ID = "worker-2"
 			other.Capabilities.Executors = append([]protocol.ExecutorRef(nil), other.Capabilities.Executors...)
-			f.agents[0].Capabilities.Executors[0].ImageDigest = "sha256:" + strings.Repeat("c", 64)
+			f.agents[0].Capabilities.Executors[0].RootFSDigest = ""
 			f.agents = append(f.agents, other)
 		},
 		"active retained lease": func(f *computeFixture) {

@@ -131,7 +131,7 @@ type browserDiagnosticArtifact struct {
 
 func Run(ctx context.Context, cfg Config) (Summary, error) {
 	cfg = withDefaults(cfg)
-	productOperation, productSchema, imageDigest, err := validateConfig(cfg)
+	productOperation, productSchema, err := validateConfig(cfg)
 	if err != nil {
 		return Summary{}, err
 	}
@@ -151,7 +151,7 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		return Summary{}, fmt.Errorf("create compute client: %w", err)
 	}
 
-	capacity, executor, err := waitForCapacity(ctx, client, cfg, imageDigest)
+	capacity, executor, err := waitForCapacity(ctx, client, cfg)
 	if err != nil {
 		return Summary{}, err
 	}
@@ -169,7 +169,7 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 	}
 	var diagnostic *DiagnosticSummary
 	if cfg.BrowserDiagnosticURL != "" {
-		_, diagnosticExecutor, err := waitForCapacity(ctx, client, cfg, imageDigest)
+		_, diagnosticExecutor, err := waitForCapacity(ctx, client, cfg)
 		if err != nil {
 			return Summary{}, fmt.Errorf("wait for diagnostic capacity: %w", err)
 		}
@@ -231,7 +231,7 @@ func withDefaults(cfg Config) Config {
 	return cfg
 }
 
-func validateConfig(cfg Config) (protocol.ProviderOperation, *jsonschema.Schema, string, error) {
+func validateConfig(cfg Config) (protocol.ProviderOperation, *jsonschema.Schema, error) {
 	for name, value := range map[string]string{
 		"server_url":   cfg.ServerURL,
 		"token":        cfg.Token,
@@ -244,79 +244,78 @@ func validateConfig(cfg Config) (protocol.ProviderOperation, *jsonschema.Schema,
 		"allowed_host": cfg.AllowedHost,
 	} {
 		if strings.TrimSpace(value) == "" {
-			return protocol.ProviderOperation{}, nil, "", fmt.Errorf("%s is required", name)
+			return protocol.ProviderOperation{}, nil, fmt.Errorf("%s is required", name)
 		}
 	}
-	imageDigest, err := digestFromImageRef(cfg.ProviderImageRef)
-	if err != nil {
-		return protocol.ProviderOperation{}, nil, "", err
+	if err := validateImageRef(cfg.ProviderImageRef); err != nil {
+		return protocol.ProviderOperation{}, nil, err
 	}
 	parsedProductURL, err := url.ParseRequestURI(cfg.ProductURL)
 	if err != nil || (parsedProductURL.Scheme != "http" && parsedProductURL.Scheme != "https") || parsedProductURL.Hostname() == "" || parsedProductURL.User != nil {
-		return protocol.ProviderOperation{}, nil, "", errors.New("product_url must be an absolute http(s) URL without user info")
+		return protocol.ProviderOperation{}, nil, errors.New("product_url must be an absolute http(s) URL without user info")
 	}
 	if !strings.EqualFold(parsedProductURL.Hostname(), cfg.AllowedHost) {
-		return protocol.ProviderOperation{}, nil, "", errors.New("allowed_host must exactly match product_url host")
+		return protocol.ProviderOperation{}, nil, errors.New("allowed_host must exactly match product_url host")
 	}
 	if snapshot.AmazonASINFromURL(cfg.ProductURL) == "" {
-		return protocol.ProviderOperation{}, nil, "", errors.New("product_url must contain a supported Amazon ASIN path")
+		return protocol.ProviderOperation{}, nil, errors.New("product_url must contain a supported Amazon ASIN path")
 	}
 	if cfg.BrowserDiagnosticURL != "" {
 		diagnosticURL, err := url.ParseRequestURI(cfg.BrowserDiagnosticURL)
 		if err != nil || diagnosticURL.Scheme != "https" || diagnosticURL.Hostname() == "" || diagnosticURL.User != nil {
-			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic_url must be an absolute HTTPS URL without user info")
+			return protocol.ProviderOperation{}, nil, errors.New("browser_diagnostic_url must be an absolute HTTPS URL without user info")
 		}
 		if sha256Ref(cfg.DiagnosticSchema) != browserDiagnosticSchemaSHA256 {
-			return protocol.ProviderOperation{}, nil, "", errors.New("diagnostic schema digest does not match the pinned artifact schema")
+			return protocol.ProviderOperation{}, nil, errors.New("diagnostic schema digest does not match the pinned artifact schema")
 		}
 	}
 	if err := cfg.Contract.Validate(); err != nil {
-		return protocol.ProviderOperation{}, nil, "", fmt.Errorf("provider contract: %w", err)
+		return protocol.ProviderOperation{}, nil, fmt.Errorf("provider contract: %w", err)
 	}
 	operation, ok := providerOperation(cfg.Contract, "capture_product")
 	if !ok {
-		return protocol.ProviderOperation{}, nil, "", errors.New("provider contract does not declare capture_product")
+		return protocol.ProviderOperation{}, nil, errors.New("provider contract does not declare capture_product")
 	}
 	if len(operation.ArtifactSpecs) == 0 {
-		return protocol.ProviderOperation{}, nil, "", errors.New("capture_product must declare bounded artifact_specs")
+		return protocol.ProviderOperation{}, nil, errors.New("capture_product must declare bounded artifact_specs")
 	}
 	if sha256Ref(cfg.ProductSchema) != operation.OutputSchemaDigest {
-		return protocol.ProviderOperation{}, nil, "", errors.New("product schema does not match capture_product output_schema_digest")
+		return protocol.ProviderOperation{}, nil, errors.New("product schema does not match capture_product output_schema_digest")
 	}
 	if cfg.BrowserDiagnosticURL != "" {
 		diagnostic, ok := providerOperation(cfg.Contract, "browser_diagnostic")
 		if !ok || len(diagnostic.ArtifactSpecs) == 0 {
-			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic must declare bounded artifact_specs")
+			return protocol.ProviderOperation{}, nil, errors.New("browser_diagnostic must declare bounded artifact_specs")
 		}
 		if diagnostic.InputSchemaRef != browserDiagnosticOperationInputSchemaRef {
-			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic input_schema_ref does not match the pinned operation input schema")
+			return protocol.ProviderOperation{}, nil, errors.New("browser_diagnostic input_schema_ref does not match the pinned operation input schema")
 		}
 		if diagnostic.InputSchemaDigest != browserDiagnosticOperationInputSchemaSHA256 {
-			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic input_schema_digest does not match the pinned operation input schema")
+			return protocol.ProviderOperation{}, nil, errors.New("browser_diagnostic input_schema_digest does not match the pinned operation input schema")
 		}
 		if diagnostic.OutputSchemaRef != browserDiagnosticOperationOutputSchemaRef {
-			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic output_schema_ref does not match the pinned operation output schema")
+			return protocol.ProviderOperation{}, nil, errors.New("browser_diagnostic output_schema_ref does not match the pinned operation output schema")
 		}
 		if diagnostic.OutputSchemaDigest != browserDiagnosticOperationOutputSchemaSHA256 {
-			return protocol.ProviderOperation{}, nil, "", errors.New("browser_diagnostic output_schema_digest does not match the pinned operation output schema")
+			return protocol.ProviderOperation{}, nil, errors.New("browser_diagnostic output_schema_digest does not match the pinned operation output schema")
 		}
 	}
 	schema, err := compileProductSchema(cfg.ProductSchema)
 	if err != nil {
-		return protocol.ProviderOperation{}, nil, "", fmt.Errorf("product schema: %w", err)
+		return protocol.ProviderOperation{}, nil, fmt.Errorf("product schema: %w", err)
 	}
-	return operation, schema, imageDigest, nil
+	return operation, schema, nil
 }
 
-func digestFromImageRef(ref string) (string, error) {
+func validateImageRef(ref string) error {
 	if strings.TrimSpace(ref) != ref || strings.ContainsAny(ref, " \t\r\n\x00") {
-		return "", errors.New("provider_image_ref must be digest-pinned without whitespace")
+		return errors.New("provider_image_ref must be digest-pinned without whitespace")
 	}
 	name, digest, ok := strings.Cut(ref, "@")
 	if !ok || name == "" || !validSHA256(digest) {
-		return "", errors.New("provider_image_ref must be digest-pinned with @sha256:<64 lowercase hex>")
+		return errors.New("provider_image_ref must be digest-pinned with @sha256:<64 lowercase hex>")
 	}
-	return digest, nil
+	return nil
 }
 
 func compileProductSchema(data []byte) (*jsonschema.Schema, error) {
@@ -353,7 +352,7 @@ func providerOperation(contract protocol.ProviderContract, id string) (protocol.
 	return protocol.ProviderOperation{}, false
 }
 
-func waitForCapacity(ctx context.Context, client *protocol.Client, cfg Config, imageDigest string) (CapacitySummary, protocol.ExecutorRef, error) {
+func waitForCapacity(ctx context.Context, client *protocol.Client, cfg Config) (CapacitySummary, protocol.ExecutorRef, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, cfg.CapacityTimeout)
 	defer cancel()
 	var last CapacitySummary
@@ -376,12 +375,12 @@ func waitForCapacity(ctx context.Context, client *protocol.Client, cfg Config, i
 		if err != nil {
 			return CapacitySummary{}, protocol.ExecutorRef{}, fmt.Errorf("list capacity tasks: %w", err)
 		}
-		last = summarizeCapacity(cfg, imageDigest, agents, leases, tasks.Tasks, time.Now().UTC())
+		last = summarizeCapacity(cfg, agents, leases, tasks.Tasks, time.Now().UTC())
 		if last.MatchingOnlineAgents == 1 && last.RetainedWorkerMatching && last.WorkerStatus == protocol.AgentOnline &&
 			last.ActiveMatchingLeases == 0 && last.QueuedMatchingTasks == 0 {
 			for _, agent := range agents {
 				if agent.ID == cfg.WorkerID {
-					if executor, ok := compatibleExecutor(agent, cfg, imageDigest); ok {
+					if executor, ok := compatibleExecutor(agent, cfg); ok {
 						return last, executor, nil
 					}
 				}
@@ -395,7 +394,7 @@ func waitForCapacity(ctx context.Context, client *protocol.Client, cfg Config, i
 	}
 }
 
-func summarizeCapacity(cfg Config, imageDigest string, agents []protocol.Agent, leases []protocol.Lease, tasks []protocol.Task, now time.Time) CapacitySummary {
+func summarizeCapacity(cfg Config, agents []protocol.Agent, leases []protocol.Lease, tasks []protocol.Task, now time.Time) CapacitySummary {
 	matchingIDs := map[string]struct{}{}
 	status := protocol.AgentUnknown
 	retainedWorkerMatching := false
@@ -403,7 +402,7 @@ func summarizeCapacity(cfg Config, imageDigest string, agents []protocol.Agent, 
 		if agent.ID == cfg.WorkerID {
 			status = agent.Status
 		}
-		if agentCompatible(agent, cfg, imageDigest) {
+		if agentCompatible(agent, cfg) {
 			matchingIDs[agent.ID] = struct{}{}
 			if agent.ID == cfg.WorkerID {
 				retainedWorkerMatching = true
@@ -435,12 +434,12 @@ func summarizeCapacity(cfg Config, imageDigest string, agents []protocol.Agent, 
 	return summary
 }
 
-func agentCompatible(agent protocol.Agent, cfg Config, imageDigest string) bool {
-	_, ok := compatibleExecutor(agent, cfg, imageDigest)
+func agentCompatible(agent protocol.Agent, cfg Config) bool {
+	_, ok := compatibleExecutor(agent, cfg)
 	return ok
 }
 
-func compatibleExecutor(agent protocol.Agent, cfg Config, imageDigest string) (protocol.ExecutorRef, bool) {
+func compatibleExecutor(agent protocol.Agent, cfg Config) (protocol.ExecutorRef, bool) {
 	if agent.Status != protocol.AgentOnline {
 		return protocol.ExecutorRef{}, false
 	}
@@ -455,7 +454,7 @@ func compatibleExecutor(agent protocol.Agent, cfg Config, imageDigest string) (p
 		return protocol.ExecutorRef{}, false
 	}
 	for _, executor := range caps.Executors {
-		if executor.Provider == "product-capture-browser" && executor.ImageDigest == imageDigest &&
+		if executor.Provider == "product-capture-browser" &&
 			executor.ExecutionSecurityTier == protocol.ExecutionSandboxedContainer && executor.ProofTier == protocol.ProofArtifactHash &&
 			executor.Version != "" && strings.TrimSpace(executor.Version) == executor.Version && !strings.ContainsAny(executor.Version, " \t\r\n\x00") &&
 			validSHA256(executor.ImageDigest) && validSHA256(executor.RootFSDigest) {
