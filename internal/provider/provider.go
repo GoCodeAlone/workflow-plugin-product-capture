@@ -29,19 +29,21 @@ import (
 )
 
 const (
-	ProviderName                  = "workflow-plugin-product-capture"
-	ExecutorProvider              = "product-capture-browser"
-	WorkloadKind                  = "provider"
-	CaptureOperation              = "capture_product"
-	ProductJSONArtifact           = "product_json"
-	BrowserDiagnosticOperation    = "browser_diagnostic"
-	BrowserDiagnosticJSONArtifact = "browser_diagnostic_json"
-	CaptureModeBrowser            = "browser"
-	CaptureModeMeta               = "metadata"
-	ComputeProtocolVersion        = "compute.v1alpha1"
-	productArtifactMode           = 0o644
-	browserCommandStopGrace       = 3 * time.Second
-	maxBrowserDiagnosticBytes     = 1 << 20
+	ProviderName                      = "workflow-plugin-product-capture"
+	ExecutorProvider                  = "product-capture-browser"
+	WorkloadKind                      = "provider"
+	CaptureOperation                  = "capture_product"
+	ProductJSONArtifact               = "product_json"
+	BrowserDiagnosticOperation        = "browser_diagnostic"
+	BrowserDiagnosticJSONArtifact     = "browser_diagnostic_json"
+	CaptureModeBrowser                = "browser"
+	CaptureModeMeta                   = "metadata"
+	ComputeProtocolVersion            = "compute.v1alpha1"
+	productArtifactMode               = 0o644
+	browserCommandStopGrace           = 3 * time.Second
+	browserDiagnosticDNSRetryWindow   = 15 * time.Second
+	browserDiagnosticDNSRetryInterval = 250 * time.Millisecond
+	maxBrowserDiagnosticBytes         = 1 << 20
 )
 
 var Version = "0.1.0"
@@ -877,7 +879,13 @@ func resolveBrowserDiagnosticTarget(ctx context.Context, rawURL, allowedOrigins 
 		if lookup == nil {
 			return browserDiagnosticTarget{}, errors.New("browser diagnostic DNS resolver is unavailable")
 		}
-		addresses, err = lookup(ctx, host)
+		addresses, err = lookupBrowserDiagnosticAddresses(
+			ctx,
+			host,
+			lookup,
+			browserDiagnosticDNSRetryWindow,
+			browserDiagnosticDNSRetryInterval,
+		)
 		if err != nil {
 			return browserDiagnosticTarget{}, fmt.Errorf("resolve browser diagnostic host %q: %w", host, err)
 		}
@@ -903,6 +911,67 @@ func resolveBrowserDiagnosticTarget(ctx context.Context, rawURL, allowedOrigins 
 		allowedOrigin: browserURLOrigin(allowed),
 		resolverRules: "MAP " + host + " " + resolverAddress,
 	}, nil
+}
+
+func lookupBrowserDiagnosticAddresses(
+	ctx context.Context,
+	host string,
+	lookup browserDiagnosticLookup,
+	retryWindow time.Duration,
+	retryInterval time.Duration,
+) ([]net.IPAddr, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if lookup == nil {
+		return nil, errors.New("browser diagnostic DNS resolver is unavailable")
+	}
+	if retryInterval <= 0 {
+		return nil, errors.New("browser diagnostic DNS retry interval must be positive")
+	}
+	if retryWindow <= 0 {
+		addresses, err := lookup(ctx, host)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, errors.Join(err, ctxErr)
+		}
+		return addresses, err
+	}
+
+	retryCtx, cancel := context.WithTimeout(ctx, retryWindow)
+	defer cancel()
+	var lastErr error
+	for {
+		if err := retryCtx.Err(); err != nil {
+			return nil, errors.Join(lastErr, err)
+		}
+		addresses, err := lookup(retryCtx, host)
+		if ctxErr := retryCtx.Err(); ctxErr != nil {
+			return nil, errors.Join(err, ctxErr)
+		}
+		if err == nil {
+			return addresses, nil
+		}
+		if !isRetryableBrowserDiagnosticDNSError(err) {
+			return nil, err
+		}
+		lastErr = err
+
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			return nil, errors.Join(lastErr, retryCtx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func isRetryableBrowserDiagnosticDNSError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && (dnsErr.IsNotFound || dnsErr.IsTimeout || dnsErr.IsTemporary)
 }
 
 func browserURLOrigin(value *url.URL) string {

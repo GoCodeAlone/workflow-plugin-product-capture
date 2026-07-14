@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	coreprotocol "github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
@@ -2478,6 +2479,262 @@ func TestBrowserDiagnosticRequiresOneExactHTTPSOriginAndPublicDNSPin(t *testing.
 			_, err := resolveBrowserDiagnosticTarget(context.Background(), tc.url, tc.allowed, resolver)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBrowserDiagnosticRetriesDNSPropagationBeforePinning(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var attempts atomic.Int32
+		started := time.Now()
+		target, err := resolveBrowserDiagnosticTarget(
+			context.Background(),
+			"https://diagnostic.example/probe",
+			"https://diagnostic.example",
+			func(_ context.Context, host string) ([]net.IPAddr, error) {
+				if host != "diagnostic.example" {
+					t.Fatalf("lookup host = %q", host)
+				}
+				if attempts.Add(1) < 3 {
+					return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+				}
+				return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+			},
+		)
+		if err != nil {
+			t.Fatalf("resolve diagnostic target after DNS propagation: %v", err)
+		}
+		if got := attempts.Load(); got != 3 {
+			t.Fatalf("DNS lookup attempts = %d, want 3", got)
+		}
+		if elapsed := time.Since(started); elapsed != 2*browserDiagnosticDNSRetryInterval {
+			t.Fatalf("DNS propagation retry elapsed = %s, want %s", elapsed, 2*browserDiagnosticDNSRetryInterval)
+		}
+		if target.resolverRules != "MAP diagnostic.example 93.184.216.34" {
+			t.Fatalf("resolver rules = %q", target.resolverRules)
+		}
+	})
+}
+
+func TestBrowserDiagnosticDNSRetryIsBounded(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var attempts atomic.Int32
+		started := time.Now()
+		_, err := lookupBrowserDiagnosticAddresses(
+			context.Background(),
+			"diagnostic.example",
+			func(_ context.Context, host string) ([]net.IPAddr, error) {
+				attempts.Add(1)
+				return nil, &net.DNSError{Err: "no such host", Name: host, IsNotFound: true}
+			},
+			52*time.Millisecond,
+			5*time.Millisecond,
+		)
+		if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("bounded DNS lookup error = %v, want deadline exceeded", err)
+		}
+		var dnsErr *net.DNSError
+		if !errors.As(err, &dnsErr) || !dnsErr.IsNotFound {
+			t.Fatalf("bounded DNS lookup error = %v, want preserved not-found DNS error", err)
+		}
+		if got := attempts.Load(); got != 11 {
+			t.Fatalf("DNS lookup attempts = %d, want 11", got)
+		}
+		if elapsed := time.Since(started); elapsed != 52*time.Millisecond {
+			t.Fatalf("bounded DNS lookup ran for %s, want 52ms", elapsed)
+		}
+	})
+}
+
+func TestBrowserDiagnosticDNSRetryHonorsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var attempts atomic.Int32
+	_, err := lookupBrowserDiagnosticAddresses(
+		ctx,
+		"diagnostic.example",
+		func(context.Context, string) ([]net.IPAddr, error) {
+			attempts.Add(1)
+			return nil, errors.New("unexpected lookup")
+		},
+		time.Second,
+		time.Millisecond,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled DNS lookup error = %v, want context canceled", err)
+	}
+	if got := attempts.Load(); got != 0 {
+		t.Fatalf("DNS lookup attempts = %d, want 0", got)
+	}
+}
+
+func TestBrowserDiagnosticDNSRetryRejectsLateSuccessAfterCancellation(t *testing.T) {
+	for _, retryWindow := range []time.Duration{time.Second, 0} {
+		t.Run(retryWindow.String(), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			_, err := lookupBrowserDiagnosticAddresses(
+				ctx,
+				"diagnostic.example",
+				func(context.Context, string) ([]net.IPAddr, error) {
+					cancel()
+					return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+				},
+				retryWindow,
+				time.Millisecond,
+			)
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("late DNS success error = %v, want context canceled", err)
+			}
+		})
+	}
+}
+
+func TestBrowserDiagnosticDNSRetryAcceptsClassifiedTransientErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  *net.DNSError
+	}{
+		{name: "not found", err: &net.DNSError{Err: "no such host", Name: "diagnostic.example", IsNotFound: true}},
+		{name: "timeout", err: &net.DNSError{Err: "timeout", Name: "diagnostic.example", IsTimeout: true}},
+		{name: "temporary", err: &net.DNSError{Err: "temporary failure", Name: "diagnostic.example", IsTemporary: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				var attempts atomic.Int32
+				addresses, err := lookupBrowserDiagnosticAddresses(
+					context.Background(),
+					"diagnostic.example",
+					func(context.Context, string) ([]net.IPAddr, error) {
+						if attempts.Add(1) == 1 {
+							return nil, tc.err
+						}
+						return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+					},
+					time.Second,
+					time.Millisecond,
+				)
+				if err != nil {
+					t.Fatalf("DNS lookup after transient error: %v", err)
+				}
+				if got := attempts.Load(); got != 2 {
+					t.Fatalf("DNS lookup attempts = %d, want 2", got)
+				}
+				if len(addresses) != 1 || !addresses[0].IP.Equal(net.ParseIP("93.184.216.34")) {
+					t.Fatalf("DNS lookup addresses = %v", addresses)
+				}
+			})
+		})
+	}
+}
+
+func TestBrowserDiagnosticDNSRetryRejectsNonRetryableErrorsImmediately(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "non DNS", err: errors.New("resolver unavailable")},
+		{name: "permanent DNS", err: &net.DNSError{Err: "server misbehaving", Name: "diagnostic.example"}},
+		{
+			name: "canceled DNS",
+			err: &net.DNSError{
+				Err:         "operation canceled",
+				Name:        "diagnostic.example",
+				UnwrapErr:   context.Canceled,
+				IsTemporary: true,
+			},
+		},
+		{
+			name: "deadline DNS",
+			err: &net.DNSError{
+				Err:       "operation timed out",
+				Name:      "diagnostic.example",
+				UnwrapErr: context.DeadlineExceeded,
+				IsTimeout: true,
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			_, err := lookupBrowserDiagnosticAddresses(
+				context.Background(),
+				"diagnostic.example",
+				func(context.Context, string) ([]net.IPAddr, error) {
+					if got := attempts.Add(1); got > 1 {
+						t.Fatalf("DNS lookup attempts = %d, want 1", got)
+					}
+					return nil, tc.err
+				},
+				time.Second,
+				time.Millisecond,
+			)
+			if !errors.Is(err, tc.err) {
+				t.Fatalf("DNS lookup error = %v, want %v", err, tc.err)
+			}
+			if got := attempts.Load(); got != 1 {
+				t.Fatalf("DNS lookup attempts = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestBrowserDiagnosticDNSRetryRejectsNonpositiveInterval(t *testing.T) {
+	for _, retryWindow := range []time.Duration{time.Second, 0} {
+		t.Run(retryWindow.String(), func(t *testing.T) {
+			var attempts atomic.Int32
+			_, err := lookupBrowserDiagnosticAddresses(
+				context.Background(),
+				"diagnostic.example",
+				func(context.Context, string) ([]net.IPAddr, error) {
+					attempts.Add(1)
+					return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+				},
+				retryWindow,
+				0,
+			)
+			if err == nil || !strings.Contains(err.Error(), "retry interval must be positive") {
+				t.Fatalf("nonpositive retry interval error = %v", err)
+			}
+			if got := attempts.Load(); got != 0 {
+				t.Fatalf("DNS lookup attempts = %d, want 0", got)
+			}
+		})
+	}
+}
+
+func TestBrowserDiagnosticDoesNotRetryResolvedAddressValidationFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		addresses []net.IPAddr
+		want      string
+	}{
+		{name: "empty", want: "no addresses"},
+		{name: "private", addresses: []net.IPAddr{{IP: net.ParseIP("10.0.0.8")}}, want: "non-public"},
+		{
+			name: "mixed public and private",
+			addresses: []net.IPAddr{
+				{IP: net.ParseIP("93.184.216.34")},
+				{IP: net.ParseIP("10.0.0.8")},
+			},
+			want: "non-public",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			_, err := resolveBrowserDiagnosticTarget(
+				context.Background(),
+				"https://diagnostic.example/probe",
+				"https://diagnostic.example",
+				func(context.Context, string) ([]net.IPAddr, error) {
+					attempts.Add(1)
+					return tc.addresses, nil
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("resolve diagnostic target error = %v, want containing %q", err, tc.want)
+			}
+			if got := attempts.Load(); got != 1 {
+				t.Fatalf("DNS lookup attempts = %d, want 1", got)
 			}
 		})
 	}
