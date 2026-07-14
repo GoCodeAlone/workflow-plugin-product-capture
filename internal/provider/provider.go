@@ -1258,7 +1258,7 @@ function linuxProcessStat(processID) {
     try {
       stat = fs.readFileSync('/proc/' + processID + '/stat', 'utf8');
     } catch (err) {
-      if (err && err.code === 'ENOENT') return null;
+      if (err && (err.code === 'ENOENT' || err.code === 'ESRCH')) return null;
       throw err;
     }
     const close = stat.lastIndexOf(')');
