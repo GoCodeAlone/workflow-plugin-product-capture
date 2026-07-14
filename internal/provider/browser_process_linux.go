@@ -28,6 +28,11 @@ type linuxBrowserProcessPolicy struct {
 	sleep               func(time.Duration)
 }
 
+const (
+	processGroupExitInitialPollInterval = 10 * time.Millisecond
+	processGroupExitMaxPollInterval     = 100 * time.Millisecond
+)
+
 func newBrowserProcessPolicy() browserProcessPolicy {
 	return linuxBrowserProcessPolicy{}
 }
@@ -140,6 +145,7 @@ func (p linuxBrowserProcessPolicy) processGroupHasLiveMembers(processGroupID int
 
 func (p linuxBrowserProcessPolicy) waitForExitedProcessGroup(processGroupID int, grace time.Duration) error {
 	deadline := time.Now().Add(grace)
+	pollInterval := processGroupExitInitialPollInterval
 	for {
 		live, err := p.processGroupHasLiveMembers(processGroupID)
 		if err != nil {
@@ -152,7 +158,8 @@ func (p linuxBrowserProcessPolicy) waitForExitedProcessGroup(processGroupID int,
 		if remaining <= 0 {
 			return errors.New("browser process group survived SIGKILL")
 		}
-		p.sleepFor(min(10*time.Millisecond, remaining))
+		p.sleepFor(min(pollInterval, remaining))
+		pollInterval = min(2*pollInterval, processGroupExitMaxPollInterval)
 	}
 }
 

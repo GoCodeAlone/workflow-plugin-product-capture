@@ -97,14 +97,14 @@ func TestLinuxBrowserProcessPolicyAcceptsMissingLeaderAfterGroupExit(t *testing.
 	}
 }
 
-func TestLinuxBrowserProcessPolicyWaitsForKilledGroupToStop(t *testing.T) {
+func TestLinuxBrowserProcessPolicyBacksOffWhileWaitingForKilledGroup(t *testing.T) {
 	identities := []linuxProcessIdentity{
 		{processGroupID: 10, startTime: "100"},
 		{processGroupID: 10, startTime: "100"},
 	}
 	var signals []syscall.Signal
 	liveChecks := 0
-	sleeps := 0
+	var sleeps []time.Duration
 	policy := linuxBrowserProcessPolicy{
 		readIdentity: func(int) (linuxProcessIdentity, bool, error) {
 			identity := identities[0]
@@ -113,13 +113,13 @@ func TestLinuxBrowserProcessPolicyWaitsForKilledGroupToStop(t *testing.T) {
 		},
 		groupHasLiveMembers: func(int) (bool, error) {
 			liveChecks++
-			return liveChecks == 1, nil
+			return liveChecks <= 4, nil
 		},
 		signalGroup: func(_ int, signal syscall.Signal) error {
 			signals = append(signals, signal)
 			return nil
 		},
-		sleep: func(time.Duration) { sleeps++ },
+		sleep: func(duration time.Duration) { sleeps = append(sleeps, duration) },
 	}
 
 	if err := policy.TerminateGroup(&exec.Cmd{Process: &os.Process{Pid: 10}}, time.Second); err != nil {
@@ -128,11 +128,12 @@ func TestLinuxBrowserProcessPolicyWaitsForKilledGroupToStop(t *testing.T) {
 	if !reflect.DeepEqual(signals, []syscall.Signal{syscall.SIGTERM, syscall.SIGKILL}) {
 		t.Fatalf("signals = %v, want TERM then KILL", signals)
 	}
-	if liveChecks != 2 {
-		t.Fatalf("live group checks = %d, want 2", liveChecks)
+	if liveChecks != 5 {
+		t.Fatalf("live group checks = %d, want 5", liveChecks)
 	}
-	if sleeps != 2 {
-		t.Fatalf("sleeps = %d, want TERM grace plus one KILL poll", sleeps)
+	wantSleeps := []time.Duration{time.Second, 10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond, 80 * time.Millisecond}
+	if !reflect.DeepEqual(sleeps, wantSleeps) {
+		t.Fatalf("sleeps = %v, want TERM grace then KILL backoff %v", sleeps, wantSleeps)
 	}
 }
 
