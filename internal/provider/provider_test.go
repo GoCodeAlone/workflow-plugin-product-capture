@@ -747,6 +747,33 @@ exit 1
 	}
 }
 
+func TestRunBrowserDiagnosticPreservesProcessErrorWithBrowserStderr(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\nprintf 'chrome warning\\n' >&2\nexit 17\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
+
+	var stdout bytes.Buffer
+	err := runBrowserDiagnostic("https://93.184.216.34/", &stdout)
+	if err == nil {
+		t.Fatal("expected browser diagnostic process failure")
+	}
+	if !strings.Contains(err.Error(), "exit status 17") || !strings.Contains(err.Error(), "chrome warning") {
+		t.Fatalf("error = %v, want process error and browser stderr", err)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 17 {
+		t.Fatalf("error chain = %v, want exit code 17", err)
+	}
+}
+
 func TestBrowserDiagnosticScriptSharesNativeChromeLaunchPath(t *testing.T) {
 	if !strings.Contains(playwrightBrowserDiagnosticScript, "launchChromeBrowser") {
 		t.Fatalf("diagnostic script must use the shared browser launcher")
@@ -3468,6 +3495,35 @@ func TestCaptureHTMLWithPlaywrightReportsOutputLimitBeforeNodePipeNoise(t *testi
 	}
 }
 
+func TestCaptureHTMLWithPlaywrightPreservesProcessErrorWithBrowserStderr(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\nprintf 'chrome warning\\n' >&2\nexit 17\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	_, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err == nil {
+		t.Fatal("expected browser process failure")
+	}
+	if !strings.Contains(err.Error(), "exit status 17") || !strings.Contains(err.Error(), "chrome warning") {
+		t.Fatalf("error = %v, want process error and browser stderr", err)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 17 {
+		t.Fatalf("error chain = %v, want exit code 17", err)
+	}
+}
+
 func TestCaptureHTMLWithPlaywrightPassesWarmupURLToBrowserRuntime(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake node executable uses a POSIX shell script")
@@ -3645,27 +3701,19 @@ printf '<html></html>'
 	}
 }
 
-func TestCaptureHTMLWithPlaywrightRunsHeadedBrowserThroughXvfbWhenNoDisplay(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("fake node executable uses a POSIX shell script")
+func TestCaptureHTMLWithPlaywrightRunsHeadedBrowserThroughManagedXvfbWhenNoDisplay(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("managed Xvfb is Linux-only")
 	}
 	dir := t.TempDir()
 	node := filepath.Join(dir, "node")
 	if err := os.WriteFile(node, []byte(`#!/bin/sh
-[ "$PRODUCT_CAPTURE_XVFB_WRAPPED" = "1" ] || { echo "node was not launched through xvfb-run" >&2; exit 25; }
+[ "$DISPLAY" = ":77" ] || { echo "node did not receive managed Xvfb display: $DISPLAY" >&2; exit 25; }
 printf '<html></html>'
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	xvfbRun := filepath.Join(dir, "xvfb-run")
-	if err := os.WriteFile(xvfbRun, []byte(`#!/bin/sh
-[ "$1" = "-a" ] || { echo "xvfb-run missing -a" >&2; exit 26; }
-shift
-export PRODUCT_CAPTURE_XVFB_WRAPPED=1
-exec "$@"
-`), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeManagedXvfb(t, dir)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "0")
 	t.Setenv("DISPLAY", "")
@@ -3699,7 +3747,7 @@ func TestCaptureHTMLWithPlaywrightRejectsHeadedLinuxWithoutDisplayOrXvfb(t *test
 		TimeoutSeconds: 1,
 		MaxHTMLBytes:   1024,
 	})
-	if err == nil || !strings.Contains(err.Error(), "headed browser requires DISPLAY or xvfb-run on Linux") {
+	if err == nil || !strings.Contains(err.Error(), "headed browser requires DISPLAY or Xvfb on Linux") {
 		t.Fatalf("captureHTMLWithPlaywright error = %v, want missing display provider", err)
 	}
 }
@@ -3710,10 +3758,7 @@ func TestCaptureHTMLWithPlaywrightRunsHeadedBrowserDirectlyOnNativeGUI(t *testin
 	}
 	dir := t.TempDir()
 	node := filepath.Join(dir, "node")
-	if err := os.WriteFile(node, []byte(`#!/bin/sh
-[ -z "${PRODUCT_CAPTURE_XVFB_WRAPPED:-}" ] || { echo "node unexpectedly launched through xvfb-run" >&2; exit 25; }
-printf '<html></html>'
-`), 0o700); err != nil {
+	if err := os.WriteFile(node, []byte("#!/bin/sh\nprintf '<html></html>'\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir)
@@ -3736,8 +3781,8 @@ printf '<html></html>'
 
 func TestBrowserDisplayPreflightRequiresXvfbOnHeadedLinux(t *testing.T) {
 	missing := func(string) (string, error) { return "", exec.ErrNotFound }
-	if err := browserDisplayPreflight("linux", false, "", missing); err == nil || !strings.Contains(err.Error(), "xvfb-run") {
-		t.Fatalf("headed Linux preflight error = %v, want missing xvfb-run", err)
+	if err := browserDisplayPreflight("linux", false, "", missing); err == nil || !strings.Contains(err.Error(), "Xvfb") {
+		t.Fatalf("headed Linux preflight error = %v, want missing Xvfb", err)
 	}
 	for _, test := range []struct {
 		name     string
@@ -3758,27 +3803,37 @@ func TestBrowserDisplayPreflightRequiresXvfbOnHeadedLinux(t *testing.T) {
 	}
 }
 
-func TestRunBrowserDiagnosticRunsHeadedBrowserThroughXvfbWhenNoDisplay(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("fake node executable uses a POSIX shell script")
+func TestBrowserShouldUseXvfbRejectsNonLinuxHosts(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("non-Linux Xvfb selection regression")
+	}
+	dir := t.TempDir()
+	xvfb := filepath.Join(dir, "Xvfb")
+	if err := os.WriteFile(xvfb, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "0")
+	t.Setenv("DISPLAY", "")
+
+	if browserShouldUseXvfb() {
+		t.Fatal("non-Linux host selected managed Xvfb")
+	}
+}
+
+func TestRunBrowserDiagnosticRunsHeadedBrowserThroughManagedXvfbWhenNoDisplay(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("managed Xvfb is Linux-only")
 	}
 	dir := t.TempDir()
 	node := filepath.Join(dir, "node")
 	if err := os.WriteFile(node, []byte(`#!/bin/sh
-[ "$PRODUCT_CAPTURE_XVFB_WRAPPED" = "1" ] || { echo "node was not launched through xvfb-run" >&2; exit 25; }
+[ "$DISPLAY" = ":77" ] || { echo "node did not receive managed Xvfb display: $DISPLAY" >&2; exit 25; }
 /bin/cat "$PRODUCT_CAPTURE_TEST_DIAGNOSTIC_JSON_PATH"
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	xvfbRun := filepath.Join(dir, "xvfb-run")
-	if err := os.WriteFile(xvfbRun, []byte(`#!/bin/sh
-[ "$1" = "-a" ] || { echo "xvfb-run missing -a" >&2; exit 26; }
-shift
-export PRODUCT_CAPTURE_XVFB_WRAPPED=1
-exec "$@"
-`), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	writeFakeManagedXvfb(t, dir)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "0")
 	t.Setenv("DISPLAY", "")
@@ -3791,6 +3846,20 @@ exec "$@"
 	}
 	if !strings.Contains(stdout.String(), `"target_url":"https://93.184.216.34/"`) {
 		t.Fatalf("unexpected diagnostic output: %s", stdout.String())
+	}
+}
+
+func writeFakeManagedXvfb(t *testing.T, dir string) {
+	t.Helper()
+	xvfb := filepath.Join(dir, "Xvfb")
+	if err := os.WriteFile(xvfb, []byte(`#!/bin/sh
+[ "$1" = "-displayfd" ] && [ "$2" = "3" ] || { echo "Xvfb missing displayfd" >&2; exit 26; }
+shift 2
+[ "$*" = "-screen 0 1920x1080x24 -nolisten tcp" ] || { echo "unexpected Xvfb args: $*" >&2; exit 27; }
+printf '77\n' >&3
+exec /bin/sleep 60
+`), 0o700); err != nil {
+		t.Fatal(err)
 	}
 }
 

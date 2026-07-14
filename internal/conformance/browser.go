@@ -1370,10 +1370,8 @@ func attachedProviderContainerArgs(image, target string) []string {
 		"run", "--rm", "--platform", "linux/amd64", "--name", "product-capture-attached-" + mustRandomSuffix(),
 		"-e", "PRODUCT_CAPTURE_BROWSER_HEADLESS=false",
 		"-e", "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS=" + origin,
-		"-e", "PRODUCT_CAPTURE_XVFB_READY_TIMEOUT=10",
-		"-e", "PRODUCT_CAPTURE_CHILD_STOP_TIMEOUT=10",
-		"--entrypoint", "/bin/sh", image,
-		"-c", headedContainerScript, "--", "/usr/local/bin/product-capture-provider", "--browser-diagnostic-url", target,
+		"--entrypoint", "/usr/local/bin/product-capture-provider", image,
+		"--browser-diagnostic-url", target,
 	}
 }
 

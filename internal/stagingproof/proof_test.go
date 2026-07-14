@@ -90,6 +90,12 @@ func TestRunCompletesGenericProductCaptureRoundTrip(t *testing.T) {
 	if input["url"] != cfg.ProductURL || !slices.Equal(input["allowed_hosts"].([]any), []any{cfg.AllowedHost}) {
 		t.Fatalf("provider input = %#v", input)
 	}
+	if stagingCaptureMaxHTMLBytes != 10<<20 {
+		t.Fatalf("staging capture max HTML bytes = %d, want %d", stagingCaptureMaxHTMLBytes, 10<<20)
+	}
+	if input["max_html_bytes"] != float64(stagingCaptureMaxHTMLBytes) {
+		t.Fatalf("max_html_bytes = %v, want %d", input["max_html_bytes"], stagingCaptureMaxHTMLBytes)
+	}
 
 	allowed := map[string]bool{
 		"GET /v1/agents": true,
@@ -176,7 +182,7 @@ func TestRunSeparatesSandboxProvenanceFromProviderImage(t *testing.T) {
 	}
 }
 
-func TestRunCapsProviderAndComputeTaskTimeoutTogether(t *testing.T) {
+func TestRunReservesComputeTaskTimeoutForProviderResult(t *testing.T) {
 	fixture := newComputeFixture(t)
 	server := httptest.NewServer(fixture)
 	t.Cleanup(server.Close)
@@ -202,8 +208,61 @@ func TestRunCapsProviderAndComputeTaskTimeoutTogether(t *testing.T) {
 	if err := json.Unmarshal(submitted.Workload.Provider.Input, &input); err != nil {
 		t.Fatalf("decode provider input: %v", err)
 	}
-	if input.TimeoutSeconds != submitted.TimeoutSeconds {
-		t.Fatalf("provider timeout = %d, compute task timeout = %d", input.TimeoutSeconds, submitted.TimeoutSeconds)
+	if input.TimeoutSeconds != 240 {
+		t.Fatalf("provider timeout = %d, want 240", input.TimeoutSeconds)
+	}
+	if got := submitted.TimeoutSeconds - input.TimeoutSeconds; got != 60 {
+		t.Fatalf("provider result margin = %d, want 60", got)
+	}
+}
+
+func TestRunAcceptsFirstTaskTimeoutAboveProviderResultMargin(t *testing.T) {
+	fixture := newComputeFixture(t)
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.TaskTimeoutSeconds = 61
+
+	if _, err := Run(t.Context(), cfg); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if len(fixture.submitted) != 1 {
+		t.Fatalf("submitted tasks = %d, want 1", len(fixture.submitted))
+	}
+	submitted := fixture.submitted[0]
+	if submitted.TimeoutSeconds != 61 {
+		t.Fatalf("compute task timeout = %d, want 61", submitted.TimeoutSeconds)
+	}
+	var input struct {
+		TimeoutSeconds int `json:"timeout_seconds"`
+	}
+	if err := json.Unmarshal(submitted.Workload.Provider.Input, &input); err != nil {
+		t.Fatalf("decode provider input: %v", err)
+	}
+	if input.TimeoutSeconds != 1 {
+		t.Fatalf("provider timeout = %d, want 1", input.TimeoutSeconds)
+	}
+}
+
+func TestRunRejectsTaskTimeoutWithoutProviderResultMarginBeforeNetworkAccess(t *testing.T) {
+	for _, timeout := range []int{-1, 0, 1, 60} {
+		t.Run(fmt.Sprintf("timeout_%d", timeout), func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+			t.Cleanup(server.Close)
+			cfg := testConfig(t, server.URL)
+			cfg.TaskTimeoutSeconds = timeout
+
+			if _, err := Run(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "provider result reporting") {
+				t.Fatalf("Run error = %v, want provider result reporting rejection", err)
+			}
+			if calls != 0 {
+				t.Fatalf("network calls = %d, want 0", calls)
+			}
+		})
 	}
 }
 

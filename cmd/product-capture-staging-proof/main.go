@@ -52,7 +52,7 @@ func run(ctx context.Context, args []string, stdout io.Writer, getenv func(strin
 	capacityTimeout := fs.Duration("capacity-timeout", 30*time.Minute, "capacity wait timeout")
 	resultTimeout := fs.Duration("result-timeout", 30*time.Minute, "per-task result timeout")
 	artifactTimeout := fs.Duration("artifact-timeout", 5*time.Minute, "per-task artifact validation timeout")
-	taskTimeout := fs.Int("task-timeout-seconds", 300, "provider task timeout in seconds")
+	taskTimeout := fs.Int("task-timeout-seconds", 300, "compute task timeout in seconds, including provider result reporting")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

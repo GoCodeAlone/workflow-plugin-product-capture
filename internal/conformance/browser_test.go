@@ -888,32 +888,21 @@ func TestDirectChromeContainerArgsUseHeadedChromeWithoutCDPOrPlaywright(t *testi
 	}
 }
 
-func TestHeadedContainerArgsUseBoundedXvfbSocketReadiness(t *testing.T) {
-	for _, test := range []struct {
-		name string
-		args []string
-		want string
-	}{
-		{name: "direct", args: directChromeContainerArgs("candidate:test", "https://diagnostic.example/direct", "/tmp/profile"), want: "google-chrome"},
-		{name: "attached", args: attachedProviderContainerArgs("candidate:test", "https://diagnostic.example/attached"), want: "/usr/local/bin/product-capture-provider"},
+func TestDirectChromeContainerArgsUseBoundedXvfbSocketReadiness(t *testing.T) {
+	joined := strings.Join(directChromeContainerArgs("candidate:test", "https://diagnostic.example/direct", "/tmp/profile"), " ")
+	for _, required := range []string{
+		"--entrypoint /bin/sh",
+		"Xvfb :99",
+		"/tmp/.X11-unix/X99",
+		"PRODUCT_CAPTURE_XVFB_READY_TIMEOUT",
+		"google-chrome",
 	} {
-		t.Run(test.name, func(t *testing.T) {
-			joined := strings.Join(test.args, " ")
-			for _, required := range []string{
-				"--entrypoint /bin/sh",
-				"Xvfb :99",
-				"/tmp/.X11-unix/X99",
-				"PRODUCT_CAPTURE_XVFB_READY_TIMEOUT",
-				test.want,
-			} {
-				if !strings.Contains(joined, required) {
-					t.Errorf("headed %s args missing %q: %s", test.name, required, joined)
-				}
-			}
-			if strings.Contains(joined, "xvfb-run") {
-				t.Fatalf("headed %s args retain xvfb-run signal handshake: %s", test.name, joined)
-			}
-		})
+		if !strings.Contains(joined, required) {
+			t.Errorf("direct headed args missing %q: %s", required, joined)
+		}
+	}
+	if strings.Contains(joined, "xvfb-run") {
+		t.Fatalf("direct headed args retain xvfb-run signal handshake: %s", joined)
 	}
 }
 
@@ -956,14 +945,17 @@ func TestAttachedContainerArgsRunRealProviderDiagnostic(t *testing.T) {
 		"run", "--rm", "--platform", "linux/amd64",
 		"-e", "PRODUCT_CAPTURE_BROWSER_HEADLESS=false",
 		"-e", "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS=https://diagnostic.example",
-		"-e", "PRODUCT_CAPTURE_XVFB_READY_TIMEOUT=10",
-		"-e", "PRODUCT_CAPTURE_CHILD_STOP_TIMEOUT=10",
-		"--entrypoint", "/bin/sh", "candidate:test",
-		"-c", headedContainerScript, "--", "/usr/local/bin/product-capture-provider",
+		"--entrypoint", "/usr/local/bin/product-capture-provider", "candidate:test",
 		"--browser-diagnostic-url", "https://diagnostic.example/runs/run/attached",
 	}
 	if !reflect.DeepEqual(stripContainerName(got), want) {
 		t.Fatalf("attached args = %#v, want %#v", stripContainerName(got), want)
+	}
+	joined := strings.Join(got, " ")
+	for _, forbidden := range []string{"DISPLAY=", "Xvfb :99", headedContainerScript} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("attached provider must own its headed display; args contain %q", forbidden)
+		}
 	}
 }
 
@@ -1795,8 +1787,8 @@ func TestCandidateReleaseMetadataAndDocumentation(t *testing.T) {
 		t.Fatal("runtime image must default to headed Chrome")
 	}
 	manifest := readRepositoryFile(t, "plugin.json")
-	if !strings.Contains(manifest, `"version": "0.1.60"`) || strings.Contains(manifest, "/v0.1.59/") {
-		t.Fatal("plugin manifest must be prepared for v0.1.60")
+	if !strings.Contains(manifest, `"version": "0.1.61"`) || strings.Contains(manifest, "/v0.1.60/") {
+		t.Fatal("plugin manifest must be prepared for v0.1.61")
 	}
 	readme := readRepositoryFile(t, "README.md")
 	for _, want := range []string{

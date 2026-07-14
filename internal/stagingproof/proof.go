@@ -25,8 +25,9 @@ const (
 	defaultCapacityTimeout                       = 30 * time.Minute
 	defaultResultTimeout                         = 30 * time.Minute
 	defaultArtifactTimeout                       = 5 * time.Minute
-	defaultTaskTimeoutSeconds                    = 300
 	maxTaskTimeoutSeconds                        = 300
+	providerResultMarginSeconds                  = 60
+	stagingCaptureMaxHTMLBytes                   = 10 << 20
 	maxSummaryTitleBytes                         = 512
 	maxSummaryImageURLBytes                      = 2048
 	maxSummaryPriceBytes                         = 128
@@ -223,9 +224,7 @@ func withDefaults(cfg Config) Config {
 	if cfg.ArtifactTimeout <= 0 {
 		cfg.ArtifactTimeout = defaultArtifactTimeout
 	}
-	if cfg.TaskTimeoutSeconds <= 0 {
-		cfg.TaskTimeoutSeconds = defaultTaskTimeoutSeconds
-	} else if cfg.TaskTimeoutSeconds > maxTaskTimeoutSeconds {
+	if cfg.TaskTimeoutSeconds > maxTaskTimeoutSeconds {
 		cfg.TaskTimeoutSeconds = maxTaskTimeoutSeconds
 	}
 	return cfg
@@ -246,6 +245,9 @@ func validateConfig(cfg Config) (protocol.ProviderOperation, *jsonschema.Schema,
 		if strings.TrimSpace(value) == "" {
 			return protocol.ProviderOperation{}, nil, fmt.Errorf("%s is required", name)
 		}
+	}
+	if cfg.TaskTimeoutSeconds <= providerResultMarginSeconds {
+		return protocol.ProviderOperation{}, nil, fmt.Errorf("task timeout must be greater than %d seconds to reserve provider result reporting time", providerResultMarginSeconds)
 	}
 	if err := validateImageRef(cfg.ProviderImageRef); err != nil {
 		return protocol.ProviderOperation{}, nil, err
@@ -471,8 +473,8 @@ func submitProductTask(ctx context.Context, client *protocol.Client, cfg Config)
 		"url":             cfg.ProductURL,
 		"allowed_hosts":   []string{cfg.AllowedHost},
 		"capture_mode":    string(protocol.ProductCaptureModeBrowser),
-		"timeout_seconds": cfg.TaskTimeoutSeconds,
-		"max_html_bytes":  1 << 20,
+		"timeout_seconds": cfg.TaskTimeoutSeconds - providerResultMarginSeconds,
+		"max_html_bytes":  stagingCaptureMaxHTMLBytes,
 		"max_image_count": 8,
 	})
 	if err != nil {
