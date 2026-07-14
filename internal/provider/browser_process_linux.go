@@ -17,14 +17,21 @@ import (
 type linuxProcessIdentity struct {
 	processGroupID int
 	startTime      string
+	state          byte
 }
 
 type linuxBrowserProcessPolicy struct {
-	readIdentity func(int) (linuxProcessIdentity, bool, error)
-	groupExists  func(int) (bool, error)
-	signalGroup  func(int, syscall.Signal) error
-	sleep        func(time.Duration)
+	readIdentity        func(int) (linuxProcessIdentity, bool, error)
+	groupExists         func(int) (bool, error)
+	groupHasLiveMembers func(int) (bool, error)
+	signalGroup         func(int, syscall.Signal) error
+	sleep               func(time.Duration)
 }
+
+const (
+	processGroupExitInitialPollInterval = 10 * time.Millisecond
+	processGroupExitMaxPollInterval     = 100 * time.Millisecond
+)
 
 func newBrowserProcessPolicy() browserProcessPolicy {
 	return linuxBrowserProcessPolicy{}
@@ -73,7 +80,10 @@ func (p linuxBrowserProcessPolicy) TerminateGroup(cmd *exec.Cmd, grace time.Dura
 	if killErr != nil && !errors.Is(killErr, syscall.ESRCH) {
 		return fmt.Errorf("kill browser process group: %w", killErr)
 	}
-	return nil
+	if errors.Is(killErr, syscall.ESRCH) {
+		return nil
+	}
+	return p.waitForExitedProcessGroup(processID, grace)
 }
 
 func (p linuxBrowserProcessPolicy) readProcessIdentity(processID int) (linuxProcessIdentity, bool, error) {
@@ -109,6 +119,50 @@ func (p linuxBrowserProcessPolicy) requireExitedProcessGroup(processID int) erro
 	return nil
 }
 
+func (p linuxBrowserProcessPolicy) processGroupHasLiveMembers(processGroupID int) (bool, error) {
+	if p.groupHasLiveMembers != nil {
+		return p.groupHasLiveMembers(processGroupID)
+	}
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		processID, err := strconv.Atoi(entry.Name())
+		if err != nil || processID <= 0 {
+			continue
+		}
+		identity, exists, err := readLinuxProcessIdentity(processID)
+		if err != nil {
+			return false, err
+		}
+		if exists && identity.processGroupID == processGroupID && identity.state != 'Z' && identity.state != 'X' && identity.state != 'x' {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (p linuxBrowserProcessPolicy) waitForExitedProcessGroup(processGroupID int, grace time.Duration) error {
+	deadline := time.Now().Add(grace)
+	pollInterval := processGroupExitInitialPollInterval
+	for {
+		live, err := p.processGroupHasLiveMembers(processGroupID)
+		if err != nil {
+			return fmt.Errorf("inspect browser process group after SIGKILL: %w", err)
+		}
+		if !live {
+			return nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return errors.New("browser process group survived SIGKILL")
+		}
+		p.sleepFor(min(pollInterval, remaining))
+		pollInterval = min(2*pollInterval, processGroupExitMaxPollInterval)
+	}
+}
+
 func (p linuxBrowserProcessPolicy) signalProcessGroup(processID int, signal syscall.Signal) error {
 	if p.signalGroup != nil {
 		return p.signalGroup(processID, signal)
@@ -129,7 +183,7 @@ func readLinuxProcessIdentity(processID int) (linuxProcessIdentity, bool, error)
 	for range 3 {
 		data, err := os.ReadFile("/proc/" + strconv.Itoa(processID) + "/stat")
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
+			if linuxProcessDisappeared(err) {
 				return linuxProcessIdentity{}, false, nil
 			}
 			return linuxProcessIdentity{}, false, err
@@ -151,9 +205,13 @@ func readLinuxProcessIdentity(processID int) (linuxProcessIdentity, bool, error)
 			malformed = errors.New("malformed procfs process identity")
 			continue
 		}
-		return linuxProcessIdentity{processGroupID: processGroupID, startTime: fields[19]}, true, nil
+		return linuxProcessIdentity{processGroupID: processGroupID, startTime: fields[19], state: fields[0][0]}, true, nil
 	}
 	return linuxProcessIdentity{}, false, malformed
+}
+
+func linuxProcessDisappeared(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ESRCH)
 }
 
 func decimalDigits(value string) bool {
