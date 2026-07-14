@@ -1028,8 +1028,8 @@ func writeBrowserDiagnosticScript() (string, error) {
 
 const managedXvfbScript = `
 set -eu
-display_file="$(mktemp "${TMPDIR:-/tmp}/product-capture-xvfb-display.XXXXXX")"
-log_file="$(mktemp "${TMPDIR:-/tmp}/product-capture-xvfb-log.XXXXXX")"
+display_file=""
+log_file=""
 xvfb_pid=""
 cleanup() {
   if [ -n "$xvfb_pid" ]; then
@@ -1047,9 +1047,12 @@ cleanup() {
     wait "$xvfb_pid" 2>/dev/null || true
     xvfb_pid=""
   fi
-  rm -f "$display_file" "$log_file"
+  if [ -n "$display_file" ]; then rm -f "$display_file"; fi
+  if [ -n "$log_file" ]; then rm -f "$log_file"; fi
 }
 trap cleanup EXIT HUP INT TERM
+display_file="$(mktemp "${TMPDIR:-/tmp}/product-capture-xvfb-display.XXXXXX")"
+log_file="$(mktemp "${TMPDIR:-/tmp}/product-capture-xvfb-log.XXXXXX")"
 Xvfb -displayfd 3 -screen 0 1920x1080x24 -nolisten tcp 3>"$display_file" >"$log_file" 2>&1 &
 xvfb_pid=$!
 attempt=0

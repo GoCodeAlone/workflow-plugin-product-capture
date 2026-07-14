@@ -90,8 +90,11 @@ func TestRunCompletesGenericProductCaptureRoundTrip(t *testing.T) {
 	if input["url"] != cfg.ProductURL || !slices.Equal(input["allowed_hosts"].([]any), []any{cfg.AllowedHost}) {
 		t.Fatalf("provider input = %#v", input)
 	}
-	if input["max_html_bytes"] != float64(10<<20) {
-		t.Fatalf("max_html_bytes = %v, want %d", input["max_html_bytes"], 10<<20)
+	if stagingCaptureMaxHTMLBytes != 10<<20 {
+		t.Fatalf("staging capture max HTML bytes = %d, want %d", stagingCaptureMaxHTMLBytes, 10<<20)
+	}
+	if input["max_html_bytes"] != float64(stagingCaptureMaxHTMLBytes) {
+		t.Fatalf("max_html_bytes = %v, want %d", input["max_html_bytes"], stagingCaptureMaxHTMLBytes)
 	}
 
 	allowed := map[string]bool{

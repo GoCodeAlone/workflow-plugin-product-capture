@@ -3857,8 +3857,7 @@ func writeFakeManagedXvfb(t *testing.T, dir string) {
 shift 2
 [ "$*" = "-screen 0 1920x1080x24 -nolisten tcp" ] || { echo "unexpected Xvfb args: $*" >&2; exit 27; }
 printf '77\n' >&3
-trap 'exit 0' TERM INT
-while :; do :; done
+exec /bin/sleep 60
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}

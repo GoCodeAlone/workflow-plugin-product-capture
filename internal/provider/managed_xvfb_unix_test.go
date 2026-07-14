@@ -16,6 +16,38 @@ import (
 	"time"
 )
 
+func TestManagedXvfbScriptRemovesDisplayFileWhenLogFileCreationFails(t *testing.T) {
+	dir := t.TempDir()
+	displayPath := filepath.Join(dir, "display")
+	countPath := filepath.Join(dir, "mktemp-count")
+	mktemp := filepath.Join(dir, "mktemp")
+	if err := os.WriteFile(mktemp, []byte(`#!/bin/sh
+if [ ! -e "$PRODUCT_CAPTURE_TEST_MKTEMP_COUNT" ]; then
+  : > "$PRODUCT_CAPTURE_TEST_MKTEMP_COUNT"
+  : > "$PRODUCT_CAPTURE_TEST_DISPLAY_FILE"
+  printf '%s\n' "$PRODUCT_CAPTURE_TEST_DISPLAY_FILE"
+  exit 0
+fi
+exit 42
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("/bin/sh", "-c", managedXvfbScript, "product-capture-xvfb", "true")
+	cmd.Env = append(os.Environ(),
+		"PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TMPDIR="+dir,
+		"PRODUCT_CAPTURE_TEST_MKTEMP_COUNT="+countPath,
+		"PRODUCT_CAPTURE_TEST_DISPLAY_FILE="+displayPath,
+	)
+	if err := cmd.Run(); err == nil {
+		t.Fatal("managed Xvfb script succeeded after log-file creation failure")
+	}
+	if _, err := os.Stat(displayPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("display file remains after partial setup: %v", err)
+	}
+}
+
 func TestManagedXvfbScriptEscalatesAndReapsUncooperativeServer(t *testing.T) {
 	dir := t.TempDir()
 	pidPath := filepath.Join(dir, "xvfb.pid")
@@ -24,7 +56,7 @@ func TestManagedXvfbScriptEscalatesAndReapsUncooperativeServer(t *testing.T) {
 printf '%s\n' "$$" > "$PRODUCT_CAPTURE_TEST_XVFB_PID_PATH"
 printf '77\n' >&3
 trap '' TERM
-while :; do :; done
+exec /bin/sleep 60
 `), 0o700); err != nil {
 		t.Fatal(err)
 	}
