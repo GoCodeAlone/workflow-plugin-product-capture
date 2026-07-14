@@ -14,8 +14,8 @@ github.com/GoCodeAlone/modular/modules/eventbus/v2 v2.10.0 h1:2ljVafd/1LYchF47Wr
 github.com/GoCodeAlone/modular/modules/eventbus/v2 v2.10.0/go.mod h1:AKLcRGsw5gp2Q1zhuK0TBnMJOsaRe3aJ2OKnLFE2O5w=
 github.com/GoCodeAlone/workflow v0.74.5 h1:IAG/2Wq819+sxJPfWwKbx3hHbSuk/cTwE26VAFn4ues=
 github.com/GoCodeAlone/workflow v0.74.5/go.mod h1:x+PINiXBT6qfPzFtVk1qqzjgtMNLboNAxTA+2emRkpc=
-github.com/GoCodeAlone/workflow-plugin-compute-core v0.8.4 h1:c4lutjUo+KGSzCPTPv28qlcOJgXYCNoY2PZzWqTmKlo=
-github.com/GoCodeAlone/workflow-plugin-compute-core v0.8.4/go.mod h1:Dsw3miQN8eenpDaLzo/p0TolGtI7NyETkf9abAHZKSM=
+github.com/GoCodeAlone/workflow-plugin-compute-core v0.8.5 h1:i/DsD5n5EL64isrWyRffAR/hulA9cYHqdM6a82zb7c8=
+github.com/GoCodeAlone/workflow-plugin-compute-core v0.8.5/go.mod h1:Dsw3miQN8eenpDaLzo/p0TolGtI7NyETkf9abAHZKSM=
 github.com/GoCodeAlone/yaegi v0.17.2 h1:WK6Y6e0t1a6U7r+S2dN3CGWW1PizYD3zO0zneToZPxM=
 github.com/GoCodeAlone/yaegi v0.17.2/go.mod h1:z5Pr6Wse6QJcQvpgxTxzMAevFarH0N37TG88Y9dprx0=
 github.com/IBM/sarama v1.47.0 h1:GcQFEd12+KzfPYeLgN69Fh7vLCtYRhVIx0rO4TZO318=
