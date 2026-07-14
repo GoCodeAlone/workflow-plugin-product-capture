@@ -614,3 +614,22 @@ boundary.
 Evidence: staging run `29334045518` reached authenticated agent listing and
 failed on `created_at`; compute-core's live-shape regression, strict-decoder
 regression, race suite, build, and vet pass on `v0.8.5`.
+
+### Backport 2026-07-14: List-envelope schema parity
+
+Cause: after agent listing succeeded, compute-core `v0.8.5` strictly decoded
+task-list responses but omitted the server's additive `summary` envelope, so
+staging failed before task submission with `json: unknown field "summary"`.
+The same audit found the proof-list endpoint also returns a typed `summary`.
+
+Change: compute-core `v0.8.6` adds summary-aware task/proof list methods while
+preserving the existing public wrapper types and their encoded JSON shapes;
+product-capture consumes `v0.8.6` for the product-owned staging proof.
+
+Scope: no manifest change; Task 4 retains the same generic capacity, task,
+proof, and artifact boundaries.
+
+Evidence: staging run `29337266639` passed agent listing and failed on the
+task-list `summary`; compute-core's literal live-shape regressions, unknown
+field regressions, legacy API/JSON compatibility gates, race suite, build,
+vet, base CI, and CodeQL pass on `v0.8.6`.
