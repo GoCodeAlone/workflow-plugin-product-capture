@@ -150,12 +150,95 @@ type InformationalPair struct {
 	Attached any `json:"attached"`
 }
 
+type FailureClass string
+
+const (
+	failureClassObservationSchema         FailureClass = "observation.schema"
+	failureClassObservationRunCorrelation FailureClass = "observation.run_correlation"
+	failureClassObservationOrder          FailureClass = "observation.order"
+	failureClassDirectInvalidEvidence     FailureClass = "direct.invalid_stable_evidence"
+	failureClassAttachedInvalidEvidence   FailureClass = "attached.invalid_stable_evidence"
+	failureClassAutomationGlobalsPresent  FailureClass = "browser.automation.globals_present"
+	failureClassReportValidation          FailureClass = "report.validation"
+)
+
+const (
+	comparisonFieldNavigatorWebdriver        = "browser.navigator.webdriver"
+	comparisonFieldNavigatorUserAgent        = "browser.navigator.user_agent"
+	comparisonFieldNavigatorBrands           = "browser.navigator.user_agent_data.brands"
+	comparisonFieldNavigatorUAPlatform       = "browser.navigator.user_agent_data.platform"
+	comparisonFieldNavigatorLanguage         = "browser.navigator.language"
+	comparisonFieldNavigatorLanguages        = "browser.navigator.languages"
+	comparisonFieldNavigatorPlatform         = "browser.navigator.platform"
+	comparisonFieldPlaywrightBinding         = "browser.automation.playwright_binding_present"
+	comparisonFieldPlaywrightInitScripts     = "browser.automation.playwright_init_scripts_present"
+	comparisonFieldRequestUserAgent          = "request.user_agent"
+	comparisonFieldRequestClientHintBrands   = "request.client_hints.brands"
+	comparisonFieldRequestClientHintMobile   = "request.client_hints.mobile"
+	comparisonFieldRequestClientHintPlatform = "request.client_hints.platform"
+	comparisonFieldRequestSecFetchDest       = "request.sec_fetch.dest"
+	comparisonFieldRequestSecFetchMode       = "request.sec_fetch.mode"
+	comparisonFieldRequestSecFetchSite       = "request.sec_fetch.site"
+	comparisonFieldRequestSecFetchUser       = "request.sec_fetch.user"
+	comparisonFieldFirstNavigationOrigin     = "first_navigation_origin"
+	comparisonFieldWindowOuterWidth          = "browser.window.outer_width"
+	comparisonFieldWindowOuterHeight         = "browser.window.outer_height"
+	comparisonFieldWindowInnerWidth          = "browser.window.inner_width"
+	comparisonFieldWindowInnerHeight         = "browser.window.inner_height"
+)
+
+func validFailureClass(value FailureClass) bool {
+	switch value {
+	case failureClassObservationSchema,
+		failureClassObservationRunCorrelation,
+		failureClassObservationOrder,
+		failureClassDirectInvalidEvidence,
+		failureClassAttachedInvalidEvidence,
+		failureClassAutomationGlobalsPresent,
+		failureClassReportValidation:
+		return true
+	default:
+		return false
+	}
+}
+
+func validComparisonField(value string) bool {
+	switch value {
+	case comparisonFieldNavigatorWebdriver,
+		comparisonFieldNavigatorUserAgent,
+		comparisonFieldNavigatorBrands,
+		comparisonFieldNavigatorUAPlatform,
+		comparisonFieldNavigatorLanguage,
+		comparisonFieldNavigatorLanguages,
+		comparisonFieldNavigatorPlatform,
+		comparisonFieldPlaywrightBinding,
+		comparisonFieldPlaywrightInitScripts,
+		comparisonFieldRequestUserAgent,
+		comparisonFieldRequestClientHintBrands,
+		comparisonFieldRequestClientHintMobile,
+		comparisonFieldRequestClientHintPlatform,
+		comparisonFieldRequestSecFetchDest,
+		comparisonFieldRequestSecFetchMode,
+		comparisonFieldRequestSecFetchSite,
+		comparisonFieldRequestSecFetchUser,
+		comparisonFieldFirstNavigationOrigin,
+		comparisonFieldWindowOuterWidth,
+		comparisonFieldWindowOuterHeight,
+		comparisonFieldWindowInnerWidth,
+		comparisonFieldWindowInnerHeight:
+		return true
+	default:
+		return false
+	}
+}
+
 type Report struct {
 	Schema            string                       `json:"schema"`
 	Versions          Versions                     `json:"versions"`
 	StableComparisons []Comparison                 `json:"stable_comparisons"`
 	Informational     map[string]InformationalPair `json:"informational"`
 	Errors            []string                     `json:"errors,omitempty"`
+	FailureClasses    []FailureClass               `json:"failure_classes,omitempty"`
 	Verdict           string                       `json:"verdict"`
 }
 
@@ -260,6 +343,44 @@ func (r Report) ExitCode() int {
 	return 1
 }
 
+func conformanceFailureError(report Report) error {
+	const maxLabels = 12
+	labels := make([]string, 0, len(report.FailureClasses)+len(report.StableComparisons))
+	appendLabel := func(label string) {
+		if !slices.Contains(labels, label) {
+			labels = append(labels, label)
+		}
+	}
+	for _, failureClass := range report.FailureClasses {
+		if validFailureClass(failureClass) {
+			appendLabel(string(failureClass))
+		} else {
+			appendLabel(string(failureClassReportValidation))
+		}
+	}
+	if len(report.Errors) > 0 {
+		appendLabel(string(failureClassReportValidation))
+	}
+	for _, comparison := range report.StableComparisons {
+		if !comparison.Match {
+			if validComparisonField(comparison.Field) {
+				appendLabel(comparison.Field)
+			} else {
+				appendLabel(string(failureClassReportValidation))
+			}
+		}
+	}
+	if len(labels) > maxLabels {
+		visible := append([]string(nil), labels[:maxLabels-1]...)
+		visible = append(visible, fmt.Sprintf("additional_labels:%d", len(labels)-len(visible)))
+		labels = visible
+	}
+	if len(labels) == 0 {
+		return errors.New("browser runtime conformance failed")
+	}
+	return fmt.Errorf("browser runtime conformance failed: %s", strings.Join(labels, ", "))
+}
+
 func stableEvidenceErrors(label string, observation Observation) []string {
 	prefix := label + " observation has invalid "
 	var result []string
@@ -342,17 +463,33 @@ func Compare(direct, attached Observation, versions Versions) Report {
 		Informational: make(map[string]InformationalPair),
 		Verdict:       VerdictPass,
 	}
+	addFailureClass := func(failureClass FailureClass) {
+		if !slices.Contains(report.FailureClasses, failureClass) {
+			report.FailureClasses = append(report.FailureClasses, failureClass)
+		}
+	}
 	if direct.Schema != SchemaV1 || attached.Schema != SchemaV1 {
 		report.Errors = append(report.Errors, fmt.Sprintf("both observations must use schema %q", SchemaV1))
+		addFailureClass(failureClassObservationSchema)
 	}
 	if direct.RunID == "" || direct.RunID != attached.RunID {
 		report.Errors = append(report.Errors, "direct and attached observations must have the same nonempty run_id")
+		addFailureClass(failureClassObservationRunCorrelation)
 	}
 	if direct.Kind != "direct" || attached.Kind != "attached" {
 		report.Errors = append(report.Errors, "observations must be ordered direct then attached")
+		addFailureClass(failureClassObservationOrder)
 	}
-	report.Errors = append(report.Errors, stableEvidenceErrors("direct", direct)...)
-	report.Errors = append(report.Errors, stableEvidenceErrors("attached", attached)...)
+	directEvidenceErrors := stableEvidenceErrors("direct", direct)
+	report.Errors = append(report.Errors, directEvidenceErrors...)
+	if len(directEvidenceErrors) > 0 {
+		addFailureClass(failureClassDirectInvalidEvidence)
+	}
+	attachedEvidenceErrors := stableEvidenceErrors("attached", attached)
+	report.Errors = append(report.Errors, attachedEvidenceErrors...)
+	if len(attachedEvidenceErrors) > 0 {
+		addFailureClass(failureClassAttachedInvalidEvidence)
+	}
 
 	addExact := func(field string, directValue, attachedValue any) {
 		report.StableComparisons = append(report.StableComparisons, Comparison{
@@ -374,54 +511,54 @@ func Compare(direct, attached Observation, versions Versions) Report {
 		})
 	}
 
-	addExact("browser.navigator.webdriver", direct.Browser.Navigator.Webdriver, attached.Browser.Navigator.Webdriver)
-	addExact("browser.navigator.user_agent", direct.Browser.Navigator.UserAgent, attached.Browser.Navigator.UserAgent)
+	addExact(comparisonFieldNavigatorWebdriver, direct.Browser.Navigator.Webdriver, attached.Browser.Navigator.Webdriver)
+	addExact(comparisonFieldNavigatorUserAgent, direct.Browser.Navigator.UserAgent, attached.Browser.Navigator.UserAgent)
 	addSet(
-		"browser.navigator.user_agent_data.brands",
+		comparisonFieldNavigatorBrands,
 		direct.Browser.Navigator.UserAgentData.Brands,
 		attached.Browser.Navigator.UserAgentData.Brands,
 		normalizedBrandSet(direct.Browser.Navigator.UserAgentData.Brands),
 		normalizedBrandSet(attached.Browser.Navigator.UserAgentData.Brands),
 		true,
 	)
-	addExact("browser.navigator.user_agent_data.platform", direct.Browser.Navigator.UserAgentData.Platform, attached.Browser.Navigator.UserAgentData.Platform)
-	addExact("browser.navigator.language", direct.Browser.Navigator.Language, attached.Browser.Navigator.Language)
+	addExact(comparisonFieldNavigatorUAPlatform, direct.Browser.Navigator.UserAgentData.Platform, attached.Browser.Navigator.UserAgentData.Platform)
+	addExact(comparisonFieldNavigatorLanguage, direct.Browser.Navigator.Language, attached.Browser.Navigator.Language)
 	addSet(
-		"browser.navigator.languages",
+		comparisonFieldNavigatorLanguages,
 		direct.Browser.Navigator.Languages,
 		attached.Browser.Navigator.Languages,
 		normalizedStringSet(direct.Browser.Navigator.Languages),
 		normalizedStringSet(attached.Browser.Navigator.Languages),
 		true,
 	)
-	addExact("browser.navigator.platform", direct.Browser.Navigator.Platform, attached.Browser.Navigator.Platform)
-	addExact("browser.automation.playwright_binding_present", direct.Browser.Automation.PlaywrightBindingPresent, attached.Browser.Automation.PlaywrightBindingPresent)
-	addExact("browser.automation.playwright_init_scripts_present", direct.Browser.Automation.PlaywrightInitScriptsPresent, attached.Browser.Automation.PlaywrightInitScriptsPresent)
-	addExact("request.user_agent", direct.Request.UserAgent, attached.Request.UserAgent)
+	addExact(comparisonFieldNavigatorPlatform, direct.Browser.Navigator.Platform, attached.Browser.Navigator.Platform)
+	addExact(comparisonFieldPlaywrightBinding, direct.Browser.Automation.PlaywrightBindingPresent, attached.Browser.Automation.PlaywrightBindingPresent)
+	addExact(comparisonFieldPlaywrightInitScripts, direct.Browser.Automation.PlaywrightInitScriptsPresent, attached.Browser.Automation.PlaywrightInitScriptsPresent)
+	addExact(comparisonFieldRequestUserAgent, direct.Request.UserAgent, attached.Request.UserAgent)
 	directClientHintBrands, directClientHintBrandsValid := parseClientHintBrandSet(direct.Request.ClientHints.Brands)
 	attachedClientHintBrands, attachedClientHintBrandsValid := parseClientHintBrandSet(attached.Request.ClientHints.Brands)
 	addSet(
-		"request.client_hints.brands",
+		comparisonFieldRequestClientHintBrands,
 		direct.Request.ClientHints.Brands,
 		attached.Request.ClientHints.Brands,
 		directClientHintBrands,
 		attachedClientHintBrands,
 		directClientHintBrandsValid && attachedClientHintBrandsValid,
 	)
-	addExact("request.client_hints.mobile", direct.Request.ClientHints.Mobile, attached.Request.ClientHints.Mobile)
-	addExact("request.client_hints.platform", direct.Request.ClientHints.Platform, attached.Request.ClientHints.Platform)
-	addExact("request.sec_fetch.dest", direct.Request.SecFetch.Dest, attached.Request.SecFetch.Dest)
-	addExact("request.sec_fetch.mode", direct.Request.SecFetch.Mode, attached.Request.SecFetch.Mode)
-	addExact("request.sec_fetch.site", direct.Request.SecFetch.Site, attached.Request.SecFetch.Site)
-	addExact("request.sec_fetch.user", direct.Request.SecFetch.User, attached.Request.SecFetch.User)
+	addExact(comparisonFieldRequestClientHintMobile, direct.Request.ClientHints.Mobile, attached.Request.ClientHints.Mobile)
+	addExact(comparisonFieldRequestClientHintPlatform, direct.Request.ClientHints.Platform, attached.Request.ClientHints.Platform)
+	addExact(comparisonFieldRequestSecFetchDest, direct.Request.SecFetch.Dest, attached.Request.SecFetch.Dest)
+	addExact(comparisonFieldRequestSecFetchMode, direct.Request.SecFetch.Mode, attached.Request.SecFetch.Mode)
+	addExact(comparisonFieldRequestSecFetchSite, direct.Request.SecFetch.Site, attached.Request.SecFetch.Site)
+	addExact(comparisonFieldRequestSecFetchUser, direct.Request.SecFetch.User, attached.Request.SecFetch.User)
 	originMatch := direct.FirstNavigationOrigin == attached.FirstNavigationOrigin
 	report.StableComparisons = append(report.StableComparisons, Comparison{
-		Field: "first_navigation_origin", Direct: "<redacted-origin>", Attached: "<redacted-origin>", Match: originMatch,
+		Field: comparisonFieldFirstNavigationOrigin, Direct: "<redacted-origin>", Attached: "<redacted-origin>", Match: originMatch,
 	})
-	addWindow("browser.window.outer_width", direct.Browser.Window.OuterWidth, attached.Browser.Window.OuterWidth)
-	addWindow("browser.window.outer_height", direct.Browser.Window.OuterHeight, attached.Browser.Window.OuterHeight)
-	addWindow("browser.window.inner_width", direct.Browser.Window.InnerWidth, attached.Browser.Window.InnerWidth)
-	addWindow("browser.window.inner_height", direct.Browser.Window.InnerHeight, attached.Browser.Window.InnerHeight)
+	addWindow(comparisonFieldWindowOuterWidth, direct.Browser.Window.OuterWidth, attached.Browser.Window.OuterWidth)
+	addWindow(comparisonFieldWindowOuterHeight, direct.Browser.Window.OuterHeight, attached.Browser.Window.OuterHeight)
+	addWindow(comparisonFieldWindowInnerWidth, direct.Browser.Window.InnerWidth, attached.Browser.Window.InnerWidth)
+	addWindow(comparisonFieldWindowInnerHeight, direct.Browser.Window.InnerHeight, attached.Browser.Window.InnerHeight)
 
 	report.Informational["request.header_names"] = InformationalPair{Direct: direct.Request.HeaderNames, Attached: attached.Request.HeaderNames}
 	report.Informational["timing"] = InformationalPair{Direct: direct.Timing, Attached: attached.Timing}
@@ -439,6 +576,7 @@ func Compare(direct, attached Observation, versions Versions) Report {
 	if direct.Browser.Automation.PlaywrightBindingPresent || direct.Browser.Automation.PlaywrightInitScriptsPresent ||
 		attached.Browser.Automation.PlaywrightBindingPresent || attached.Browser.Automation.PlaywrightInitScriptsPresent {
 		report.Errors = append(report.Errors, "checked Playwright automation globals must be absent")
+		addFailureClass(failureClassAutomationGlobalsPresent)
 	}
 	if len(report.Errors) > 0 {
 		report.Verdict = VerdictFail
@@ -891,7 +1029,7 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 		return fmt.Errorf("write conformance report: %w", err)
 	}
 	if report.ExitCode() != 0 {
-		return errors.New("browser runtime conformance failed")
+		return conformanceFailureError(report)
 	}
 	return nil
 }
