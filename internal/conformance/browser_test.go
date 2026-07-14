@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -118,6 +119,103 @@ func TestCompareBrowserObservationsReturnsNonzeroForStableMismatch(t *testing.T)
 				t.Fatalf("comparison %q = %+v, found %v", tt.field, comparison, ok)
 			}
 		})
+	}
+}
+
+func TestConformanceFailureErrorPrioritizesValidationClassesAndReportsTruncation(t *testing.T) {
+	report := Compare(matchingObservation("direct"), matchingObservation("attached"), Versions{})
+	report.Errors = []string{`both observations must use schema "v1"`}
+	report.FailureClasses = []FailureClass{failureClassObservationSchema}
+	for index := range report.StableComparisons {
+		report.StableComparisons[index].Match = false
+	}
+
+	message := conformanceFailureError(report).Error()
+	if !strings.Contains(message, "observation.schema") {
+		t.Fatalf("failure message = %q, want validation class", message)
+	}
+	if !strings.Contains(message, "report.validation") {
+		t.Fatalf("failure message = %q, want prioritized generic validation class", message)
+	}
+	if !strings.Contains(message, "additional_labels:13") {
+		t.Fatalf("failure message = %q, want bounded truncation count", message)
+	}
+	labels := strings.Split(strings.TrimPrefix(message, "browser runtime conformance failed: "), ", ")
+	if len(labels) != 12 || labels[len(labels)-1] != "additional_labels:13" {
+		t.Fatalf("failure labels = %v, want exactly 12 with truncation marker", labels)
+	}
+}
+
+func TestConformanceFailureErrorRejectsUnknownFailureClassWithoutOtherErrors(t *testing.T) {
+	report := Report{FailureClasses: []FailureClass{"secret-observed-value"}}
+
+	message := conformanceFailureError(report).Error()
+	if !strings.Contains(message, "report.validation") {
+		t.Fatalf("failure message = %q, want generic validation class", message)
+	}
+	if strings.Contains(message, "secret-observed-value") {
+		t.Fatalf("failure message exposes unknown failure class: %q", message)
+	}
+}
+
+func TestConformanceFailureErrorRejectsUnknownComparisonFields(t *testing.T) {
+	report := Report{
+		StableComparisons: []Comparison{{Field: "secret-observed-value", Match: false}},
+	}
+
+	message := conformanceFailureError(report).Error()
+	if !strings.Contains(message, "report.validation") {
+		t.Fatalf("failure message = %q, want generic validation class", message)
+	}
+	if strings.Contains(message, "secret-observed-value") {
+		t.Fatalf("failure message exposes unknown comparison field: %q", message)
+	}
+}
+
+func TestConformanceFailureErrorRejectsUnknownClassesAndSignalsUnclassifiedErrors(t *testing.T) {
+	report := Report{
+		Errors:         []string{"known classified error", "future unclassified secret-value"},
+		FailureClasses: []FailureClass{failureClassObservationSchema, "secret-value"},
+	}
+
+	message := conformanceFailureError(report).Error()
+	if !strings.Contains(message, "observation.schema") || !strings.Contains(message, "report.validation") {
+		t.Fatalf("failure message = %q, want known and generic validation classes", message)
+	}
+	if strings.Contains(message, "secret-value") {
+		t.Fatalf("failure message exposes unknown class or report value: %q", message)
+	}
+}
+
+func TestCompareEmitsStableFailureClassesAtSource(t *testing.T) {
+	tests := []struct {
+		name  string
+		class FailureClass
+		apply func(*Observation, *Observation)
+	}{
+		{name: "schema", class: failureClassObservationSchema, apply: func(_, attached *Observation) { attached.Schema = "v2" }},
+		{name: "run correlation", class: failureClassObservationRunCorrelation, apply: func(_, attached *Observation) { attached.RunID = "other" }},
+		{name: "order", class: failureClassObservationOrder, apply: func(direct, _ *Observation) { direct.Kind = "attached" }},
+		{name: "direct evidence", class: failureClassDirectInvalidEvidence, apply: func(direct, _ *Observation) { direct.Request.UserAgent = "" }},
+		{name: "attached evidence", class: failureClassAttachedInvalidEvidence, apply: func(_, attached *Observation) { attached.Request.UserAgent = "" }},
+		{name: "automation globals", class: failureClassAutomationGlobalsPresent, apply: func(_, attached *Observation) { attached.Browser.Automation.PlaywrightBindingPresent = true }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			direct := matchingObservation("direct")
+			attached := matchingObservation("attached")
+			tt.apply(&direct, &attached)
+
+			report := Compare(direct, attached, Versions{})
+			if !reflect.DeepEqual(report.FailureClasses, []FailureClass{tt.class}) {
+				t.Fatalf("failure classes = %v, want exactly %q", report.FailureClasses, tt.class)
+			}
+		})
+	}
+	direct := matchingObservation("direct")
+	attached := matchingObservation("attached")
+	if report := Compare(direct, attached, Versions{}); len(report.FailureClasses) != 0 {
+		t.Fatalf("passing comparison failure classes = %v, want none", report.FailureClasses)
 	}
 }
 
@@ -574,11 +672,16 @@ func TestCollectorServesBoundedPageAndBuildsRunCorrelatedObservation(t *testing.
 	}
 }
 
-func TestRunnerWritesRedactedReportAndReturnsConformanceFailure(t *testing.T) {
+func TestMainWritesRedactedReportAndReturnsBoundedConformanceFailure(t *testing.T) {
 	client := &http.Client{}
 	tunnel := &proxyTunnel{client: client}
+	var targetMu sync.Mutex
+	var observedTargets []string
 	launch := func(kind string, mismatch bool) func(context.Context, string, string) error {
 		return func(ctx context.Context, image, target string) error {
+			targetMu.Lock()
+			observedTargets = append(observedTargets, target)
+			targetMu.Unlock()
 			if image != "candidate:test" {
 				return errors.New("unexpected image")
 			}
@@ -627,7 +730,7 @@ func TestRunnerWritesRedactedReportAndReturnsConformanceFailure(t *testing.T) {
 
 	output := filepath.Join(t.TempDir(), "conformance.json")
 	lifecycleCalls := 0
-	runner := Runner{Dependencies: Dependencies{
+	dependencies := Dependencies{
 		Tunnel:         tunnel,
 		HTTPClient:     client,
 		LaunchDirect:   launch("direct", false),
@@ -639,10 +742,41 @@ func TestRunnerWritesRedactedReportAndReturnsConformanceFailure(t *testing.T) {
 		InspectVersions: func(context.Context, string) (Versions, error) {
 			return Versions{ImageID: "sha256:image", Chrome: "Google Chrome 140", Playwright: "1.57.0", Xvfb: "1.20.14"}, nil
 		},
-	}}
-	err := runner.Run(context.Background(), Options{Image: "candidate:test", Output: output})
-	if err == nil || !strings.Contains(err.Error(), "conformance failed") {
-		t.Fatalf("Run error = %v, want conformance failure", err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := MainContext(context.Background(), []string{"--image", "candidate:test", "--output", output}, &stdout, &stderr, dependencies)
+	if code != 1 || !strings.Contains(stderr.String(), "conformance failed") {
+		t.Fatalf("Main code/stdout/stderr = %d/%q/%q, want conformance failure", code, stdout.String(), stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "browser.navigator.user_agent") {
+		t.Fatalf("Main stderr = %q, want mismatched stable field", stderr.String())
+	}
+	for _, observedValue := range []string{
+		"Mozilla/5.0 Chrome/140", "mismatched", "Google Chrome", "Chromium", "Linux", "en-US", "Win32", "diagnostic.example",
+	} {
+		if strings.Contains(stderr.String(), observedValue) {
+			t.Fatalf("Main stderr exposes observed value %q: %q", observedValue, stderr.String())
+		}
+	}
+	targetMu.Lock()
+	targets := append([]string(nil), observedTargets...)
+	targetMu.Unlock()
+	if len(targets) == 0 || tunnel.server == nil {
+		t.Fatalf("missing observed diagnostic targets: %v", targets)
+	}
+	parsedTarget, parseErr := url.Parse(targets[0])
+	if parseErr != nil {
+		t.Fatal(parseErr)
+	}
+	pathParts := strings.Split(strings.Trim(parsedTarget.Path, "/"), "/")
+	if len(pathParts) < 2 || pathParts[0] != "runs" {
+		t.Fatalf("diagnostic target path = %q, want run correlation", parsedTarget.Path)
+	}
+	correlatedValues := []string{tunnel.server.URL, parsedTarget.Host, pathParts[1]}
+	for _, correlatedValue := range correlatedValues {
+		if strings.Contains(stderr.String(), correlatedValue) {
+			t.Fatalf("Main stderr exposes correlated value %q: %q", correlatedValue, stderr.String())
+		}
 	}
 	if tunnel.stopCalls != 1 {
 		t.Fatalf("tunnel stop calls = %d, want 1", tunnel.stopCalls)
@@ -664,6 +798,11 @@ func TestRunnerWritesRedactedReportAndReturnsConformanceFailure(t *testing.T) {
 	for _, forbidden := range []string{"run-", "diagnostic.example", "trycloudflare.com", "remote_addr", "cookie_value"} {
 		if strings.Contains(string(data), forbidden) {
 			t.Fatalf("report contains unredacted %q: %s", forbidden, data)
+		}
+	}
+	for _, correlatedValue := range correlatedValues {
+		if strings.Contains(string(data), correlatedValue) {
+			t.Fatalf("report contains correlated value %q: %s", correlatedValue, data)
 		}
 	}
 }

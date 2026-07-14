@@ -182,6 +182,41 @@ func TestReleaseWorkflowBuildsRuntimeProviderBinaryBeforeImage(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflowRetainsFailedConformanceReport(t *testing.T) {
+	data, err := os.ReadFile(".github/workflows/release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(data)
+	runtimeStart := strings.Index(workflow, "  runtime-image:")
+	publishStart := strings.Index(workflow, "  publish-release:")
+	if runtimeStart < 0 || publishStart <= runtimeStart {
+		t.Fatal("release workflow runtime-image job boundaries are missing")
+	}
+	runtimeJob := workflow[runtimeStart:publishStart]
+	uploadStart := strings.Index(runtimeJob, "name: Upload redacted conformance report")
+	pushStart := strings.Index(runtimeJob, "name: Push exact tested browser image")
+	if uploadStart < 0 || pushStart <= uploadStart {
+		t.Fatal("failed conformance report upload must run before promotion in runtime-image")
+	}
+	uploadStep := runtimeJob[uploadStart:pushStart]
+	for _, want := range []string{
+		"always() && hashFiles('conformance.json') != ''",
+		"actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f",
+		"name: browser-runtime-conformance-${{ github.run_id }}-${{ github.run_attempt }}",
+		"path: conformance.json",
+		"if-no-files-found: error",
+	} {
+		if !strings.Contains(uploadStep, want) {
+			t.Errorf("release workflow missing failed-conformance evidence %q", want)
+		}
+	}
+	conformanceIndex := strings.Index(runtimeJob, "name: Run exact candidate browser conformance")
+	if conformanceIndex < 0 || uploadStart < conformanceIndex {
+		t.Fatal("failed conformance report upload must run after conformance and before promotion")
+	}
+}
+
 func assertWorkflowUsesPinnedActions(t *testing.T, path, workflow string) {
 	t.Helper()
 	for _, line := range strings.Split(workflow, "\n") {
