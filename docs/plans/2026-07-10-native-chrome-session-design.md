@@ -597,3 +597,20 @@ Evidence: the old cleanup budget fails an explicit bound invariant; a
 schema-valid multibyte URL fails before character-count enforcement; and an
 injected listener failure previously degrades into context timeout. Each
 focused control passes after restoration.
+
+### Backport 2026-07-14: Agent-list schema parity
+
+Cause: compute-core `v0.8.4` strictly decoded agent-list responses but omitted
+the server's additive `created_at` field, so staging failed before capacity
+selection with `json: unknown field "created_at"`.
+
+Change: compute-core `v0.8.5` adds the typed timestamp while preserving strict
+rejection of undeclared fields; product-capture consumes `v0.8.5` for the
+product-owned staging proof.
+
+Scope: no manifest change; Task 4 retains the same generic capacity and proof
+boundary.
+
+Evidence: staging run `29334045518` reached authenticated agent listing and
+failed on `created_at`; compute-core's live-shape regression, strict-decoder
+regression, race suite, build, and vet pass on `v0.8.5`.
