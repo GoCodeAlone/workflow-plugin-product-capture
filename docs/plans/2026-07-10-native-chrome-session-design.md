@@ -633,3 +633,55 @@ Evidence: staging run `29337266639` passed agent listing and failed on the
 task-list `summary`; compute-core's literal live-shape regressions, unknown
 field regressions, legacy API/JSON compatibility gates, race suite, build,
 vet, base CI, and CodeQL pass on `v0.8.6`.
+
+### Backport 2026-07-14: Provider result timeout margin
+
+Cause: staging runs `29350736038` and `29357974112` gave the browser operation
+and enclosing compute task the same 300-second deadline. The task canceled
+before the provider's bounded five-second cleanup could return its terminal
+result, leaving only a generic timeout proof.
+
+Change: keep the 300-second compute cap; submit a 240-second browser budget and
+reserve 60 seconds for cleanup, proof, and artifact reporting. Reject task
+timeouts that cannot preserve the margin before any control-plane request.
+
+Scope: no manifest change; Task 4 owns product-specific staging-proof timeout
+composition.
+
+Evidence: the regression fails with equal deadlines and passes with the margin;
+`go test ./...` and `golangci-lint run --new-from-rev=origin/main` pass.
+
+### Backport 2026-07-14: Managed headed display and bounded page input
+
+Cause: staging task
+`task-product-capture-capture-product-410e7544e5cbee32905f` returned an
+accepted exit-code-1 proof in eight seconds once the timeout margin exposed the
+provider result. The exact released image reproduced locally: the proof's 1 MiB
+raw-HTML limit rejected a rendered Amazon page, while Debian `xvfb-run` masked
+the command status behind Chrome stderr and its Xvfb lifecycle failed under the
+container runtime. An explicitly managed Xvfb process succeeded with the same
+browser, request, and 1280x1024 screen; headless mode also succeeded.
+
+Change: submit the provider schema's bounded 10 MiB raw-HTML ceiling while
+retaining the separate 1 MiB result-artifact contract; preserve the child
+process error alongside browser stderr; and replace `xvfb-run` with a
+provider-owned Xvfb process that selects a free display through `-displayfd`,
+uses a `1920x1080x24` screen, and is reaped on every exit path after a bounded
+TERM-to-KILL escalation. Browser diagnostics preserve the child-process status
+alongside Chrome stderr using the same error contract as product capture.
+
+Scope: no locked Scope Manifest, capability, or contract-shape change; Task 4
+retains product-capture ownership of its browser runtime and staging proof. The
+release metadata advances to `v0.1.61` for the corrected runtime image.
+
+Evidence: focused regressions have red/green/revert proof. The locally rebuilt
+headed amd64 runtime captured the real Amazon Xbox URL, emitted `product_json`,
+returned zero stderr, and left no container behind. Retained-agent diagnostics
+run `29366160504` found the service active/running, the exact failed task in a
+terminal error state, and no matching Docker or Podman container left behind;
+the removed ephemeral container exposed no additional stderr after the fact.
+The candidate conformance attached leg now runs the provider without `DISPLAY`,
+forcing its managed-Xvfb path; the exact local image passed direct-versus-attached
+comparison and all lifecycle scenarios with no residual container. The accepted
+exit-code-1 staging receipt is diagnostic evidence only: Task 4 remains open
+until the immutable `v0.1.61` digest returns an accepted successful staging proof.

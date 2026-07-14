@@ -671,10 +671,10 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 			return "", errors.Join(fmt.Errorf("browser capture timed out after %s", timeout), cleanupErr)
 		}
 		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
+		if msg != "" {
+			return "", errors.Join(fmt.Errorf("browser capture failed: %w; browser stderr: %s", err, msg), cleanupErr)
 		}
-		return "", errors.Join(fmt.Errorf("browser capture failed: %s", msg), cleanupErr)
+		return "", errors.Join(fmt.Errorf("browser capture failed: %w", err), cleanupErr)
 	}
 	if stdout.err != nil {
 		return "", fmt.Errorf("browser capture failed: %w", stdout.err)
@@ -760,10 +760,10 @@ func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
 	if err := cmd.Run(); err != nil {
 		cleanupErr := cleanupBrowserCommandAfterError(ctx, cmd)
 		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
+		if msg != "" {
+			return errors.Join(fmt.Errorf("browser diagnostic failed: %w; browser stderr: %s", err, msg), cleanupErr)
 		}
-		return errors.Join(fmt.Errorf("browser diagnostic failed: %s", msg), cleanupErr)
+		return errors.Join(fmt.Errorf("browser diagnostic failed: %w", err), cleanupErr)
 	}
 	if err := validateBrowserDiagnosticArtifact(diagnosticOutput.Bytes()); err != nil {
 		return fmt.Errorf("browser diagnostic output schema: %w", err)
@@ -1026,12 +1026,71 @@ func writeBrowserDiagnosticScript() (string, error) {
 	return path, nil
 }
 
+const managedXvfbScript = `
+set -eu
+display_file="$(mktemp "${TMPDIR:-/tmp}/product-capture-xvfb-display.XXXXXX")"
+log_file="$(mktemp "${TMPDIR:-/tmp}/product-capture-xvfb-log.XXXXXX")"
+xvfb_pid=""
+cleanup() {
+  if [ -n "$xvfb_pid" ]; then
+    if kill -0 "$xvfb_pid" 2>/dev/null; then
+      kill "$xvfb_pid" 2>/dev/null || true
+      stop_attempt=0
+      while kill -0 "$xvfb_pid" 2>/dev/null && [ "$stop_attempt" -lt 5 ]; do
+        stop_attempt=$((stop_attempt + 1))
+        sleep 0.05
+      done
+      if kill -0 "$xvfb_pid" 2>/dev/null; then
+        kill -KILL "$xvfb_pid" 2>/dev/null || true
+      fi
+    fi
+    wait "$xvfb_pid" 2>/dev/null || true
+    xvfb_pid=""
+  fi
+  rm -f "$display_file" "$log_file"
+}
+trap cleanup EXIT HUP INT TERM
+Xvfb -displayfd 3 -screen 0 1920x1080x24 -nolisten tcp 3>"$display_file" >"$log_file" 2>&1 &
+xvfb_pid=$!
+attempt=0
+while [ ! -s "$display_file" ]; do
+  if ! kill -0 "$xvfb_pid" 2>/dev/null; then
+    echo "managed Xvfb exited before reporting a display" >&2
+    tail -n 40 "$log_file" >&2 || true
+    exit 1
+  fi
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 100 ]; then
+    echo "managed Xvfb did not report a display within 5 seconds" >&2
+    tail -n 40 "$log_file" >&2 || true
+    exit 1
+  fi
+  sleep 0.05
+done
+display_number="$(cat "$display_file")"
+case "$display_number" in
+  ''|*[!0-9]*)
+    echo "managed Xvfb reported an invalid display number" >&2
+    exit 1
+    ;;
+esac
+set +e
+DISPLAY=":$display_number" "$@"
+command_status=$?
+set -e
+if [ "$command_status" -ne 0 ] && ! kill -0 "$xvfb_pid" 2>/dev/null; then
+  echo "managed Xvfb exited during browser execution" >&2
+  tail -n 40 "$log_file" >&2 || true
+fi
+exit "$command_status"
+`
+
 func browserNodeCommand(ctx context.Context, scriptPath string, args ...string) *exec.Cmd {
 	nodeArgs := append([]string{scriptPath}, args...)
 	var cmd *exec.Cmd
 	if browserShouldUseXvfb() {
-		xvfbArgs := append([]string{"-a", "node"}, nodeArgs...)
-		cmd = exec.CommandContext(ctx, "xvfb-run", xvfbArgs...)
+		xvfbArgs := append([]string{"-c", managedXvfbScript, "product-capture-xvfb", "node"}, nodeArgs...)
+		cmd = exec.CommandContext(ctx, "/bin/sh", xvfbArgs...)
 	} else {
 		cmd = exec.CommandContext(ctx, "node", nodeArgs...)
 	}
@@ -1047,10 +1106,10 @@ func browserNodeCommand(ctx context.Context, scriptPath string, args ...string) 
 }
 
 func browserShouldUseXvfb() bool {
-	if browserHeadlessEnabled() || strings.TrimSpace(os.Getenv("DISPLAY")) != "" {
+	if runtime.GOOS != "linux" || browserHeadlessEnabled() || strings.TrimSpace(os.Getenv("DISPLAY")) != "" {
 		return false
 	}
-	_, err := exec.LookPath("xvfb-run")
+	_, err := exec.LookPath("Xvfb")
 	return err == nil
 }
 
@@ -1058,8 +1117,8 @@ func browserDisplayPreflight(goos string, headless bool, display string, lookup 
 	if goos != "linux" || headless || strings.TrimSpace(display) != "" {
 		return nil
 	}
-	if _, err := lookup("xvfb-run"); err != nil {
-		return fmt.Errorf("headed browser requires DISPLAY or xvfb-run on Linux: %w", err)
+	if _, err := lookup("Xvfb"); err != nil {
+		return fmt.Errorf("headed browser requires DISPLAY or Xvfb on Linux: %w", err)
 	}
 	return nil
 }

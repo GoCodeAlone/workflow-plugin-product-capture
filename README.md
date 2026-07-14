@@ -90,7 +90,8 @@ default browser viewport is `1920x1080`; operators can override it with
 `PRODUCT_CAPTURE_BROWSER_VIEWPORT=<width>x<height>` within the supported
 desktop range. Standalone capture remains headless by default. Set
 `PRODUCT_CAPTURE_BROWSER_HEADLESS=false` for headed operation; when `DISPLAY`
-is unset, the provider uses `xvfb-run` when available.
+is unset, the provider starts and reaps a dedicated Xvfb display with a
+`1920x1080x24` virtual screen.
 
 ## Browser diagnostics
 
@@ -123,7 +124,7 @@ loaded amd64 image:
 
 ```sh
 go run ./cmd/browser-runtime-conformance \
-  --image product-capture:v0.1.60 \
+  --image product-capture:v0.1.61 \
   --output /tmp/product-capture-conformance.json
 ```
 
