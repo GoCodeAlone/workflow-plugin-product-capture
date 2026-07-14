@@ -1231,6 +1231,25 @@ process.stdout.write('rejected');
 	}
 }
 
+func TestLinuxProcessStatTreatsESRCHAsProcessDisappearance(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+const nativeReadFileSync = fs.readFileSync;
+fs.readFileSync = (path, ...args) => {
+  if (String(path) === '/proc/10/stat') { const err = new Error('no such process, read'); err.code = 'ESRCH'; throw err; }
+  return nativeReadFileSync(path, ...args);
+};
+try {
+  if (linuxProcessStat(10) !== null) throw new Error('disappeared process returned a stat');
+} finally {
+  fs.readFileSync = nativeReadFileSync;
+}
+process.stdout.write('disappeared');
+`)
+	if err != nil || stdout.String() != "disappeared" {
+		t.Fatalf("ESRCH procfs read was not treated as disappearance: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
+	}
+}
+
 func TestCaptureChromeProcessIdentityRecordsLinuxStartTime(t *testing.T) {
 	stdout, stderr, err := runBrowserPreludeSnippet(t, `
 const nativeReadFileSync = fs.readFileSync;
