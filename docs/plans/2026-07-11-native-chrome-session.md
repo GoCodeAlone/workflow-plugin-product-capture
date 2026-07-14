@@ -352,6 +352,14 @@ container/package. It downloads at most 1 MiB for each JSON result and writes a
 redacted summary with task/proof/artifact hash, runtime ref, title/image/price,
 and optional accepted browser diagnostic artifact.
 
+**Execution backport 2026-07-14:** A retained dynamic-provider worker's
+executor image/rootfs digests attest its protected sandbox runtime, while the
+provider image is independently digest-pinned in the submitted workload. The
+capacity preflight validates the sandbox executor without equating those two
+digests; accepted proof validation continues to require the exact executor
+snapshot plus task and dependency-closure hashes that bind the provider image.
+This does not change the Scope Manifest.
+
 **Step 3: Add staging workflow**
 
 The workflow runs from `main`, validates image ref/URL/worker inputs, uses a
