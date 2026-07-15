@@ -899,8 +899,9 @@ func resolveBrowserDiagnosticTarget(ctx context.Context, rawURL, allowedOrigins 
 		if !ok || !isPublicDiagnosticIP(candidate) {
 			return browserDiagnosticTarget{}, fmt.Errorf("browser diagnostic host %q resolved to non-public address %q", host, address.IP.String())
 		}
-		if !selected.IsValid() {
-			selected = candidate.Unmap()
+		candidate = candidate.Unmap()
+		if !selected.IsValid() || (selected.Is6() && candidate.Is4()) {
+			selected = candidate
 		}
 	}
 	resolverAddress := selected.String()
@@ -993,6 +994,32 @@ func isPublicDiagnosticIP(address netip.Addr) bool {
 	if !address.IsValid() || !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() || address.IsLinkLocalUnicast() {
 		return false
 	}
+	if address.Is6() {
+		if netip.MustParsePrefix("64:ff9b::/96").Contains(address) {
+			bytes := address.As16()
+			embedded := netip.AddrFrom4([4]byte{bytes[12], bytes[13], bytes[14], bytes[15]})
+			return isPublicDiagnosticIP(embedded)
+		}
+		if !netip.MustParsePrefix("2000::/3").Contains(address) {
+			return false
+		}
+	}
+	if netip.MustParsePrefix("2001::/23").Contains(address) {
+		for _, prefix := range []netip.Prefix{
+			netip.MustParsePrefix("2001:1::1/128"),
+			netip.MustParsePrefix("2001:1::2/128"),
+			netip.MustParsePrefix("2001:1::3/128"),
+			netip.MustParsePrefix("2001:3::/32"),
+			netip.MustParsePrefix("2001:4:112::/48"),
+			netip.MustParsePrefix("2001:20::/28"),
+			netip.MustParsePrefix("2001:30::/28"),
+		} {
+			if prefix.Contains(address) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, prefix := range []netip.Prefix{
 		netip.MustParsePrefix("0.0.0.0/8"),
 		netip.MustParsePrefix("100.64.0.0/10"),
@@ -1003,8 +1030,13 @@ func isPublicDiagnosticIP(address netip.Addr) bool {
 		netip.MustParsePrefix("198.51.100.0/24"),
 		netip.MustParsePrefix("203.0.113.0/24"),
 		netip.MustParsePrefix("240.0.0.0/4"),
+		netip.MustParsePrefix("64:ff9b:1::/48"),
 		netip.MustParsePrefix("100::/64"),
+		netip.MustParsePrefix("100:0:0:1::/64"),
 		netip.MustParsePrefix("2001:db8::/32"),
+		netip.MustParsePrefix("2002::/16"),
+		netip.MustParsePrefix("3fff::/20"),
+		netip.MustParsePrefix("5f00::/16"),
 	} {
 		if prefix.Contains(address) {
 			return false

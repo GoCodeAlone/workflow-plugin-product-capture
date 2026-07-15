@@ -684,4 +684,26 @@ The candidate conformance attached leg now runs the provider without `DISPLAY`,
 forcing its managed-Xvfb path; the exact local image passed direct-versus-attached
 comparison and all lifecycle scenarios with no residual container. The accepted
 exit-code-1 staging receipt is diagnostic evidence only: Task 4 remains open
-until the immutable `v0.1.61` digest returns an accepted successful staging proof.
+until the immutable `v0.1.62` digest returns an accepted successful staging proof.
+
+### Backport 2026-07-14: Dual-stack diagnostic pin selection
+
+Cause: release run `29375359362` attempts 1 and 2 proved the direct Chrome
+participant could reach each Quick Tunnel while the attached provider pinned
+the first dual-stack DNS answer and failed with `net::ERR_ADDRESS_UNREACHABLE`
+inside the IPv4-only Docker path.
+
+Change: validate every resolved address as public, reject IANA special-purpose
+IPv6 ranges that Go classifies as global unicast but that are not globally
+reachable, preserve IPv6-only targets, and prefer a public IPv4 pin when a
+diagnostic host offers both families. The corrected unpublished runtime advances
+to `v0.1.62`; `v0.1.61` is not repointed.
+
+Scope: no locked Scope Manifest change; Tasks 3-4 retain the same diagnostic
+security, release-conformance, and staging-proof boundaries.
+
+Evidence: `TestBrowserDiagnosticPrefersIPv4PinForDualStackHost` failed with an
+IPv6 resolver rule before the change, passed after it, failed with the fix
+reverted, and passed after restoration. The exact local `v0.1.61` provider
+entrypoint also reached the first failed tunnel through managed Xvfb in seven
+seconds, isolating the release-runner failure to family selection.
