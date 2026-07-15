@@ -233,8 +233,9 @@ Test schema `v1` classification and comparison:
 - stable exact fields: webdriver, UA, client-hint brands/platform, language,
   platform, checked Playwright globals, request UA/client hints/`Sec-Fetch-*`,
   first navigation origin;
-- window dimensions tolerate 2 px;
-- header order, timing, WebGL, hardware/memory, cookies are informational;
+- screen dimensions, outer window dimensions, and inner width tolerate 2 px;
+- inner height, header order, timing, WebGL, hardware/memory, cookies are
+  informational;
 - mismatch returns a nonzero conformance result.
 
 Add plugin tests requiring terminal output fields
@@ -265,6 +266,15 @@ three fresh two-minute attempts with full teardown between attempts; the CLI's
 default overall timeout is twelve minutes so all attempts and runtime checks fit. Retry only
 deadline/transient activation failure; origin or run-correlation rejection
 remains fail-closed. This does not change the Scope Manifest.
+
+**Execution backport 2026-07-15:** Chrome browser-owned warning UI can change
+the content height asynchronously: the exact Chrome `150.0.7871.124` release
+candidate produced direct/attached inner heights of 992/936 in CI and 936/936
+locally while outer geometry and inner width remained equal. Keep screen
+width/height, outer geometry, and inner width as 2 px stable gates; retain inner
+height as informational evidence. Do not suppress browser security UI or add
+identity overrides. Advance the unpublished correction to `v0.1.63` without
+repointing `v0.1.62`. This does not change the Scope Manifest.
 
 **Step 3: Add exact candidate runtime launch checks**
 
