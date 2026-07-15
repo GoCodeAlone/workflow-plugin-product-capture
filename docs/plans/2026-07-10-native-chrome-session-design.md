@@ -165,9 +165,11 @@ closed. This replaces captured-tree cleanup without changing the Scope Manifest.
   and platform, language set, platform, checked Playwright globals, request UA,
   request client hints, `Sec-Fetch-*`, and first top-level navigation origin.
 - Reject when attached and direct stable fields differ, an automation global is
-  present, or the attached run adds an identity override. Display dimensions may
-  differ by 2 px for window chrome. Header order, timings/sequence, WebGL,
-  hardware/memory, cookie length, and graphics renderer are informational only.
+  present, or the attached run adds an identity override. Screen dimensions,
+  outer window dimensions, and inner width may differ by 2 px. Inner height is
+  informational because browser-owned security UI can change the content area
+  asynchronously. Header order, timings/sequence, WebGL, hardware/memory,
+  cookie length, and graphics renderer are informational only.
 - The comparison diagnoses unintended differences; it does not optimize against
   retailer controls or claim that a site cannot identify automation.
 
@@ -191,8 +193,9 @@ closed. This replaces captured-tree cleanup without changing the Scope Manifest.
    controlled allowlisted echo endpoint. Record Chrome, Playwright, and Xvfb
    versions and compare direct versus CDP-attached sessions across request
    the versioned Native Baseline Contract. Only stable-field mismatches reject;
-   volatile headers/order, display metrics, WebGL, request sequence, and cookies
-   remain diagnostic evidence.
+   screen width/height, outer geometry, and inner width remain stable display
+   gates, while inner height, volatile headers/order, WebGL, request sequence,
+   and cookies remain diagnostic evidence.
 3. Kill the real image during startup, navigation timeout, SIGTERM, and parent
    exit; assert no Chrome/Xvfb process or profile lock survives the container.
 4. Release/promote the tested candidate digest, update/deploy BMW staging to its
@@ -684,7 +687,7 @@ The candidate conformance attached leg now runs the provider without `DISPLAY`,
 forcing its managed-Xvfb path; the exact local image passed direct-versus-attached
 comparison and all lifecycle scenarios with no residual container. The accepted
 exit-code-1 staging receipt is diagnostic evidence only: Task 4 remains open
-until the immutable `v0.1.62` digest returns an accepted successful staging proof.
+until the immutable `v0.1.63` digest returns an accepted successful staging proof.
 
 ### Backport 2026-07-14: Dual-stack diagnostic pin selection
 
@@ -707,3 +710,24 @@ IPv6 resolver rule before the change, passed after it, failed with the fix
 reverted, and passed after restoration. The exact local `v0.1.61` provider
 entrypoint also reached the first failed tunnel through managed Xvfb in seven
 seconds, isolating the release-runner failure to family selection.
+
+### Backport 2026-07-15: Browser-owned content-height variance
+
+Cause: release run `29379929220` built and tested one exact Chrome
+`150.0.7871.124` image. Twenty-one stable comparisons matched, but the direct
+content height was 992 px and the CDP-attached content height was 936 px while
+both participants retained identical 1919x1079 outer geometry and 1919 px inner
+width. The same image then passed locally with both content heights at 936 px.
+Chromium can add browser-owned warning UI asynchronously, so `innerHeight` is a
+timing-dependent content-area measurement rather than a display-resolution or
+browser-identity invariant.
+
+Change: retain fail-closed comparisons for screen width/height, outer window
+width/height, and inner width with the existing 2 px tolerance. Preserve
+`innerHeight` in the redacted report as informational evidence, but do not fail
+promotion when only that value differs. Do not suppress Chrome security UI,
+patch Chromium, or add identity overrides. The corrected unpublished runtime
+advances to `v0.1.63`; `v0.1.62` is not repointed.
+
+Scope: no locked Scope Manifest change; Tasks 3-4 retain the same diagnostic,
+release-conformance, and staging-proof boundaries.

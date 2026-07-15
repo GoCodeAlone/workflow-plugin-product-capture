@@ -33,7 +33,7 @@ func TestCompareBrowserObservationsClassifiesSchemaV1Fields(t *testing.T) {
 	direct := matchingObservation("direct")
 	attached := matchingObservation("attached")
 	attached.Browser.Window.OuterWidth += 2
-	attached.Browser.Window.InnerHeight -= 2
+	attached.Browser.Window.InnerHeight -= 56
 	attached.Browser.Navigator.HardwareConcurrency = 4
 	attached.Browser.Navigator.DeviceMemory = 2
 	attached.Browser.Document.CookiePresent = true
@@ -68,7 +68,8 @@ func TestCompareBrowserObservationsClassifiesSchemaV1Fields(t *testing.T) {
 		"browser.window.outer_width",
 		"browser.window.outer_height",
 		"browser.window.inner_width",
-		"browser.window.inner_height",
+		"browser.screen.width",
+		"browser.screen.height",
 	} {
 		if !hasComparison(report.StableComparisons, field) {
 			t.Errorf("stable comparisons missing %q: %+v", field, report.StableComparisons)
@@ -82,10 +83,88 @@ func TestCompareBrowserObservationsClassifiesSchemaV1Fields(t *testing.T) {
 		"browser.navigator.device_memory",
 		"browser.document.cookie_present",
 		"browser.document.cookie_length",
+		"browser.window.inner_height",
 	} {
 		if _, ok := report.Informational[field]; !ok {
 			t.Errorf("informational values missing %q: %+v", field, report.Informational)
 		}
+	}
+}
+
+func TestCompareBrowserObservationsTreatsBrowserChromeHeightAsInformational(t *testing.T) {
+	direct := matchingObservation("direct")
+	attached := matchingObservation("attached")
+	direct.Browser.Window.InnerHeight = 992
+	attached.Browser.Window.InnerHeight = 936
+
+	report := Compare(direct, attached, Versions{})
+	if report.Verdict != VerdictPass || report.ExitCode() != 0 {
+		t.Fatalf("report = %+v, want browser chrome height difference to pass", report)
+	}
+	if _, ok := findComparison(report.StableComparisons, "browser.window.inner_height"); ok {
+		t.Fatalf("inner height remained a stable comparison: %+v", report.StableComparisons)
+	}
+	pair, ok := report.Informational["browser.window.inner_height"]
+	if !ok || pair.Direct != 992 || pair.Attached != 936 {
+		t.Fatalf("inner height informational pair = %+v, found %v", pair, ok)
+	}
+}
+
+func TestCompareBrowserObservationsAllowsUnavailableInformationalInnerHeight(t *testing.T) {
+	tests := []struct {
+		name           string
+		directHeight   int
+		attachedHeight int
+	}{
+		{name: "direct unavailable", directHeight: 0, attachedHeight: 936},
+		{name: "attached unavailable", directHeight: 992, attachedHeight: 0},
+		{name: "both unavailable", directHeight: 0, attachedHeight: 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			direct := matchingObservation("direct")
+			attached := matchingObservation("attached")
+			direct.Browser.Window.InnerHeight = tt.directHeight
+			attached.Browser.Window.InnerHeight = tt.attachedHeight
+
+			report := Compare(direct, attached, Versions{})
+			if report.Verdict != VerdictPass || report.ExitCode() != 0 {
+				t.Fatalf("report = %+v, want unavailable informational height to pass", report)
+			}
+			pair, ok := report.Informational["browser.window.inner_height"]
+			if !ok || pair.Direct != tt.directHeight || pair.Attached != tt.attachedHeight {
+				t.Fatalf("inner height informational pair = %+v, found %v", pair, ok)
+			}
+		})
+	}
+}
+
+func TestCompareBrowserObservationsAllowsTwoPixelScreenTolerance(t *testing.T) {
+	tests := []struct {
+		name   string
+		field  string
+		mutate func(*Observation)
+	}{
+		{name: "width plus", field: "browser.screen.width", mutate: func(o *Observation) { o.Browser.Screen.Width += 2 }},
+		{name: "width minus", field: "browser.screen.width", mutate: func(o *Observation) { o.Browser.Screen.Width -= 2 }},
+		{name: "height plus", field: "browser.screen.height", mutate: func(o *Observation) { o.Browser.Screen.Height += 2 }},
+		{name: "height minus", field: "browser.screen.height", mutate: func(o *Observation) { o.Browser.Screen.Height -= 2 }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			direct := matchingObservation("direct")
+			attached := matchingObservation("attached")
+			tt.mutate(&attached)
+
+			report := Compare(direct, attached, Versions{})
+			if report.Verdict != VerdictPass || report.ExitCode() != 0 {
+				t.Fatalf("report = %+v, want two-pixel screen difference to pass", report)
+			}
+			comparison, ok := findComparison(report.StableComparisons, tt.field)
+			if !ok || !comparison.Match || comparison.Tolerance != 2 {
+				t.Fatalf("comparison %q = %+v, found %v", tt.field, comparison, ok)
+			}
+		})
 	}
 }
 
@@ -104,6 +183,11 @@ func TestCompareBrowserObservationsReturnsNonzeroForStableMismatch(t *testing.T)
 		{name: "fetch", field: "request.sec_fetch.mode", mutate: func(o *Observation) { o.Request.SecFetch.Mode = "cors" }},
 		{name: "origin", field: "first_navigation_origin", mutate: func(o *Observation) { o.FirstNavigationOrigin = "https://other.example" }},
 		{name: "window tolerance", field: "browser.window.outer_width", mutate: func(o *Observation) { o.Browser.Window.OuterWidth += 3 }},
+		{name: "content width tolerance", field: "browser.window.inner_width", mutate: func(o *Observation) { o.Browser.Window.InnerWidth += 3 }},
+		{name: "screen width tolerance", field: "browser.screen.width", mutate: func(o *Observation) { o.Browser.Screen.Width += 3 }},
+		{name: "screen width negative tolerance", field: "browser.screen.width", mutate: func(o *Observation) { o.Browser.Screen.Width -= 3 }},
+		{name: "screen height tolerance", field: "browser.screen.height", mutate: func(o *Observation) { o.Browser.Screen.Height += 3 }},
+		{name: "screen height negative tolerance", field: "browser.screen.height", mutate: func(o *Observation) { o.Browser.Screen.Height -= 3 }},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -118,6 +202,22 @@ func TestCompareBrowserObservationsReturnsNonzeroForStableMismatch(t *testing.T)
 			comparison, ok := findComparison(report.StableComparisons, tt.field)
 			if !ok || comparison.Match {
 				t.Fatalf("comparison %q = %+v, found %v", tt.field, comparison, ok)
+			}
+		})
+	}
+}
+
+func TestConformanceFailureErrorReportsScreenMismatchLabels(t *testing.T) {
+	for _, field := range []string{"browser.screen.width", "browser.screen.height"} {
+		t.Run(field, func(t *testing.T) {
+			report := Report{StableComparisons: []Comparison{{Field: field, Match: false}}}
+
+			message := conformanceFailureError(report).Error()
+			if !strings.Contains(message, field) {
+				t.Fatalf("failure message = %q, want screen mismatch label %q", message, field)
+			}
+			if strings.Contains(message, string(failureClassReportValidation)) {
+				t.Fatalf("failure message = %q, valid screen mismatch degraded to report validation", message)
 			}
 		})
 	}
@@ -138,11 +238,11 @@ func TestConformanceFailureErrorPrioritizesValidationClassesAndReportsTruncation
 	if !strings.Contains(message, "report.validation") {
 		t.Fatalf("failure message = %q, want prioritized generic validation class", message)
 	}
-	if !strings.Contains(message, "additional_labels:13") {
+	if !strings.Contains(message, "additional_labels:14") {
 		t.Fatalf("failure message = %q, want bounded truncation count", message)
 	}
 	labels := strings.Split(strings.TrimPrefix(message, "browser runtime conformance failed: "), ", ")
-	if len(labels) != 12 || labels[len(labels)-1] != "additional_labels:13" {
+	if len(labels) != 12 || labels[len(labels)-1] != "additional_labels:14" {
 		t.Fatalf("failure labels = %v, want exactly 12 with truncation marker", labels)
 	}
 }
@@ -255,6 +355,9 @@ func TestCompareBrowserObservationsRejectsEmptyStableEvidence(t *testing.T) {
 		"client platform":  func(o *Observation) { o.Browser.Navigator.UserAgentData.Platform = "" },
 		"window dimensions": func(o *Observation) {
 			o.Browser.Window = WindowSignals{}
+		},
+		"screen dimensions": func(o *Observation) {
+			o.Browser.Screen = ScreenSignals{}
 		},
 		"request user agent": func(o *Observation) { o.Request.UserAgent = "" },
 		"request brands":     func(o *Observation) { o.Request.ClientHints.Brands = "" },
@@ -627,7 +730,7 @@ func TestCollectorServesBoundedPageAndBuildsRunCorrelatedObservation(t *testing.
 	if response.StatusCode != http.StatusOK || len(page) > MaxPageBytes {
 		t.Fatalf("page status/size = %d/%d", response.StatusCode, len(page))
 	}
-	for _, want := range []string{"navigator.webdriver", "navigator.userAgentData", "__playwright__binding__", "__pwInitScripts", "fetch(location.href"} {
+	for _, want := range []string{"navigator.webdriver", "navigator.userAgentData", "screen.width", "screen.height", "__playwright__binding__", "__pwInitScripts", "fetch(location.href"} {
 		if !bytes.Contains(page, []byte(want)) {
 			t.Errorf("self-reporting page missing %q", want)
 		}
@@ -2000,6 +2103,7 @@ func matchingObservation(kind string) Observation {
 				DeviceMemory:        8,
 			},
 			Window: WindowSignals{OuterWidth: 1920, OuterHeight: 1080, InnerWidth: 1920, InnerHeight: 941},
+			Screen: ScreenSignals{Width: 1920, Height: 1080},
 			Automation: AutomationSignals{
 				PlaywrightBindingPresent:     false,
 				PlaywrightInitScriptsPresent: false,

@@ -124,7 +124,7 @@ loaded amd64 image:
 
 ```sh
 go run ./cmd/browser-runtime-conformance \
-  --image product-capture:v0.1.62 \
+  --image product-capture:v0.1.63 \
   --output /tmp/product-capture-conformance.json
 ```
 

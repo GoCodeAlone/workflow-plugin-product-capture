@@ -76,6 +76,11 @@ type WindowSignals struct {
 	InnerHeight int `json:"inner_height"`
 }
 
+type ScreenSignals struct {
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
 type AutomationSignals struct {
 	PlaywrightBindingPresent     bool `json:"playwright_binding_present"`
 	PlaywrightInitScriptsPresent bool `json:"playwright_init_scripts_present"`
@@ -95,6 +100,7 @@ type WebGLSignals struct {
 type BrowserSignals struct {
 	Navigator  NavigatorSignals  `json:"navigator"`
 	Window     WindowSignals     `json:"window"`
+	Screen     ScreenSignals     `json:"screen"`
 	Automation AutomationSignals `json:"automation"`
 	Document   DocumentSignals   `json:"document"`
 	WebGL      WebGLSignals      `json:"webgl"`
@@ -184,7 +190,8 @@ const (
 	comparisonFieldWindowOuterWidth          = "browser.window.outer_width"
 	comparisonFieldWindowOuterHeight         = "browser.window.outer_height"
 	comparisonFieldWindowInnerWidth          = "browser.window.inner_width"
-	comparisonFieldWindowInnerHeight         = "browser.window.inner_height"
+	comparisonFieldScreenWidth               = "browser.screen.width"
+	comparisonFieldScreenHeight              = "browser.screen.height"
 )
 
 func validFailureClass(value FailureClass) bool {
@@ -225,7 +232,8 @@ func validComparisonField(value string) bool {
 		comparisonFieldWindowOuterWidth,
 		comparisonFieldWindowOuterHeight,
 		comparisonFieldWindowInnerWidth,
-		comparisonFieldWindowInnerHeight:
+		comparisonFieldScreenWidth,
+		comparisonFieldScreenHeight:
 		return true
 	default:
 		return false
@@ -418,8 +426,12 @@ func stableEvidenceErrors(label string, observation Observation) []string {
 		result = append(result, prefix+"navigator platform")
 	}
 	window := observation.Browser.Window
-	if window.OuterWidth <= 0 || window.OuterHeight <= 0 || window.InnerWidth <= 0 || window.InnerHeight <= 0 {
+	if window.OuterWidth <= 0 || window.OuterHeight <= 0 || window.InnerWidth <= 0 {
 		result = append(result, prefix+"window dimensions")
+	}
+	screen := observation.Browser.Screen
+	if screen.Width <= 0 || screen.Height <= 0 {
+		result = append(result, prefix+"screen dimensions")
 	}
 	if strings.TrimSpace(observation.Request.UserAgent) == "" {
 		result = append(result, prefix+"request user_agent")
@@ -558,7 +570,8 @@ func Compare(direct, attached Observation, versions Versions) Report {
 	addWindow(comparisonFieldWindowOuterWidth, direct.Browser.Window.OuterWidth, attached.Browser.Window.OuterWidth)
 	addWindow(comparisonFieldWindowOuterHeight, direct.Browser.Window.OuterHeight, attached.Browser.Window.OuterHeight)
 	addWindow(comparisonFieldWindowInnerWidth, direct.Browser.Window.InnerWidth, attached.Browser.Window.InnerWidth)
-	addWindow(comparisonFieldWindowInnerHeight, direct.Browser.Window.InnerHeight, attached.Browser.Window.InnerHeight)
+	addWindow(comparisonFieldScreenWidth, direct.Browser.Screen.Width, attached.Browser.Screen.Width)
+	addWindow(comparisonFieldScreenHeight, direct.Browser.Screen.Height, attached.Browser.Screen.Height)
 
 	report.Informational["request.header_names"] = InformationalPair{Direct: direct.Request.HeaderNames, Attached: attached.Request.HeaderNames}
 	report.Informational["timing"] = InformationalPair{Direct: direct.Timing, Attached: attached.Timing}
@@ -567,6 +580,7 @@ func Compare(direct, attached Observation, versions Versions) Report {
 	report.Informational["browser.navigator.device_memory"] = InformationalPair{Direct: direct.Browser.Navigator.DeviceMemory, Attached: attached.Browser.Navigator.DeviceMemory}
 	report.Informational["browser.document.cookie_present"] = InformationalPair{Direct: direct.Browser.Document.CookiePresent, Attached: attached.Browser.Document.CookiePresent}
 	report.Informational["browser.document.cookie_length"] = InformationalPair{Direct: direct.Browser.Document.CookieLength, Attached: attached.Browser.Document.CookieLength}
+	report.Informational["browser.window.inner_height"] = InformationalPair{Direct: direct.Browser.Window.InnerHeight, Attached: attached.Browser.Window.InnerHeight}
 
 	for _, comparison := range report.StableComparisons {
 		if !comparison.Match {
@@ -826,7 +840,8 @@ const selfReportingPage = `<!doctype html>
         language: safe(() => navigator.language, ''), languages: safe(() => Array.from(navigator.languages || []).map(String).slice(0, 20), []),
         platform: safe(() => navigator.platform, ''), hardware_concurrency: safe(() => navigator.hardwareConcurrency, 0), device_memory: safe(() => navigator.deviceMemory, 0)
       },
-      window: { outer_width: safe(() => outerWidth, 0), outer_height: safe(() => outerHeight, 0), inner_width: safe(() => innerWidth, 0), inner_height: safe(() => innerHeight, 0) },
+		window: { outer_width: safe(() => outerWidth, 0), outer_height: safe(() => outerHeight, 0), inner_width: safe(() => innerWidth, 0), inner_height: safe(() => innerHeight, 0) },
+		screen: { width: safe(() => screen.width, 0), height: safe(() => screen.height, 0) },
       automation: {
         playwright_binding_present: safe(() => typeof window.__playwright__binding__ !== 'undefined', false),
         playwright_init_scripts_present: safe(() => typeof window.__pwInitScripts !== 'undefined', false)
