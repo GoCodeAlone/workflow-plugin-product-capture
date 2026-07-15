@@ -19,6 +19,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -1787,12 +1788,30 @@ func TestCandidateReleaseMetadataAndDocumentation(t *testing.T) {
 		t.Fatal("runtime image must default to headed Chrome")
 	}
 	manifest := readRepositoryFile(t, "plugin.json")
-	if !strings.Contains(manifest, `"version": "0.1.61"`) || strings.Contains(manifest, "/v0.1.60/") {
-		t.Fatal("plugin manifest must be prepared for v0.1.61")
+	var release struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(manifest), &release); err != nil {
+		t.Fatalf("decode plugin manifest: %v", err)
+	}
+	if release.Version == "" {
+		t.Fatal("plugin manifest version is required")
+	}
+	tag := "v" + release.Version
+	releaseTagPattern := regexp.MustCompile(`v[0-9]+\.[0-9]+\.[0-9]+`)
+	manifestTags := releaseTagPattern.FindAllString(manifest, -1)
+	if len(manifestTags) == 0 {
+		t.Fatal("plugin manifest must contain versioned download URLs")
+	}
+	for _, referencedTag := range manifestTags {
+		if referencedTag != tag {
+			t.Errorf("plugin manifest contains stale release tag %q; want only %q", referencedTag, tag)
+		}
 	}
 	readme := readRepositoryFile(t, "README.md")
 	for _, want := range []string{
 		"go run ./cmd/browser-runtime-conformance",
+		"product-capture:" + tag,
 		"decisions/0002-use-ephemeral-diagnostic-tunnel.md",
 		"provider_image_ref",
 		"provider_component_ref",
@@ -1800,6 +1819,28 @@ func TestCandidateReleaseMetadataAndDocumentation(t *testing.T) {
 	} {
 		if !strings.Contains(readme, want) {
 			t.Errorf("README missing %q", want)
+		}
+	}
+	liveUsage := readRepositoryFile(t, "docs/buymywishlist-live-usage.md")
+	_, currentUsage, found := strings.Cut(liveUsage, "## Current Release Target")
+	if !found {
+		t.Fatal("BuyMyWishlist live-usage documentation missing current release section")
+	}
+	currentUsage, _, found = strings.Cut(currentUsage, "## Verified wfcompute Staging Baseline")
+	if !found {
+		t.Fatal("BuyMyWishlist live-usage documentation missing verified baseline section")
+	}
+	for path, content := range map[string]string{
+		"README.md": readme,
+		"docs/buymywishlist-live-usage.md current target": currentUsage,
+	} {
+		if !strings.Contains(content, tag) {
+			t.Errorf("%s missing manifest tag %q", path, tag)
+		}
+		for _, referencedTag := range releaseTagPattern.FindAllString(content, -1) {
+			if referencedTag != tag {
+				t.Errorf("%s contains stale release tag %q; want only %q", path, referencedTag, tag)
+			}
 		}
 	}
 }

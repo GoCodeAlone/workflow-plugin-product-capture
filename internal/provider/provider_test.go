@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -2525,6 +2526,86 @@ func TestBrowserDiagnosticRequiresOneExactHTTPSOriginAndPublicDNSPin(t *testing.
 			_, err := resolveBrowserDiagnosticTarget(context.Background(), tc.url, tc.allowed, resolver)
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("error = %v, want containing %q", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestBrowserDiagnosticPrefersIPv4PinForDualStackHost(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		addresses []net.IPAddr
+		want      string
+	}{
+		{
+			name: "IPv6 then IPv4",
+			addresses: []net.IPAddr{
+				{IP: net.ParseIP("2001:4860:4860::8888")},
+				{IP: net.ParseIP("93.184.216.34")},
+			},
+			want: "MAP diagnostic.example 93.184.216.34",
+		},
+		{
+			name: "IPv4 then IPv6",
+			addresses: []net.IPAddr{
+				{IP: net.ParseIP("93.184.216.34")},
+				{IP: net.ParseIP("2001:4860:4860::8888")},
+			},
+			want: "MAP diagnostic.example 93.184.216.34",
+		},
+		{
+			name:      "IPv6 only",
+			addresses: []net.IPAddr{{IP: net.ParseIP("2001:4860:4860::8888")}},
+			want:      "MAP diagnostic.example [2001:4860:4860::8888]",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target, err := resolveBrowserDiagnosticTarget(
+				context.Background(),
+				"https://diagnostic.example/probe",
+				"https://diagnostic.example",
+				func(context.Context, string) ([]net.IPAddr, error) {
+					return tc.addresses, nil
+				},
+			)
+			if err != nil {
+				t.Fatalf("resolve diagnostic target: %v", err)
+			}
+			if target.resolverRules != tc.want {
+				t.Fatalf("resolver rules = %q, want %q", target.resolverRules, tc.want)
+			}
+		})
+	}
+}
+
+func TestPublicDiagnosticIPClassifiesIPv6RoutingSpace(t *testing.T) {
+	for _, tc := range []struct {
+		address string
+		want    bool
+	}{
+		{address: "64:ff9b:1::1"},
+		{address: "100:0:0:1::1"},
+		{address: "2001:2::1"},
+		{address: "2001:5::1"},
+		{address: "2002:a00:1::1"},
+		{address: "3fff::1"},
+		{address: "4000::1"},
+		{address: "5f00::1"},
+		{address: "fec0::1"},
+		{address: "64:ff9b::a00:1"},
+		{address: "64:ff9b::5db8:d822", want: true},
+		{address: "2001:1::1", want: true},
+		{address: "2001:1::2", want: true},
+		{address: "2001:1::3", want: true},
+		{address: "2001:3::1", want: true},
+		{address: "2001:4:112::1", want: true},
+		{address: "2001:20::1", want: true},
+		{address: "2001:30::1", want: true},
+		{address: "2606:4700:4700::1111", want: true},
+	} {
+		t.Run(tc.address, func(t *testing.T) {
+			if got := isPublicDiagnosticIP(netip.MustParseAddr(tc.address)); got != tc.want {
+				t.Fatalf("isPublicDiagnosticIP(%s) = %t, want %t", tc.address, got, tc.want)
 			}
 		})
 	}
