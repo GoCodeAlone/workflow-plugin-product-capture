@@ -1788,16 +1788,26 @@ func TestCandidateReleaseMetadataAndDocumentation(t *testing.T) {
 		t.Fatal("runtime image must default to headed Chrome")
 	}
 	manifest := readRepositoryFile(t, "plugin.json")
-	if !strings.Contains(manifest, `"version": "0.1.62"`) || strings.Contains(manifest, "/v0.1.61/") {
-		t.Fatal("plugin manifest must be prepared for v0.1.62")
-	}
 	var release struct {
 		Version string `json:"version"`
 	}
 	if err := json.Unmarshal([]byte(manifest), &release); err != nil {
 		t.Fatalf("decode plugin manifest: %v", err)
 	}
+	if release.Version == "" {
+		t.Fatal("plugin manifest version is required")
+	}
 	tag := "v" + release.Version
+	releaseTagPattern := regexp.MustCompile(`v[0-9]+\.[0-9]+\.[0-9]+`)
+	manifestTags := releaseTagPattern.FindAllString(manifest, -1)
+	if len(manifestTags) == 0 {
+		t.Fatal("plugin manifest must contain versioned download URLs")
+	}
+	for _, referencedTag := range manifestTags {
+		if referencedTag != tag {
+			t.Errorf("plugin manifest contains stale release tag %q; want only %q", referencedTag, tag)
+		}
+	}
 	readme := readRepositoryFile(t, "README.md")
 	for _, want := range []string{
 		"go run ./cmd/browser-runtime-conformance",
@@ -1827,7 +1837,7 @@ func TestCandidateReleaseMetadataAndDocumentation(t *testing.T) {
 		if !strings.Contains(content, tag) {
 			t.Errorf("%s missing manifest tag %q", path, tag)
 		}
-		for _, referencedTag := range regexp.MustCompile(`v[0-9]+\.[0-9]+\.[0-9]+`).FindAllString(content, -1) {
+		for _, referencedTag := range releaseTagPattern.FindAllString(content, -1) {
 			if referencedTag != tag {
 				t.Errorf("%s contains stale release tag %q; want only %q", path, referencedTag, tag)
 			}
