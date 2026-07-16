@@ -1297,7 +1297,7 @@ func classifyRunHealthResponse(resp *http.Response, runID string, managedTunnel 
 	}
 
 	if retryableHealthStatus(resp.StatusCode) ||
-		managedTunnel && resp.StatusCode == cloudflareOriginDNSFailureStatusCode {
+		(managedTunnel && resp.StatusCode == cloudflareOriginDNSFailureStatusCode) {
 		classification := fmt.Errorf("diagnostic health endpoint returned transient status %d", resp.StatusCode)
 		return true, classifiedDiagnosticHealthError(managedTunnel, classification, bodyErr)
 	}

@@ -585,7 +585,7 @@ func TestFetchRunHealthRetriesCloudflareOriginDNSFailureOnlyForManagedTunnel(t *
 			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 				calls++
 				if calls == 1 {
-					response := healthResponse(request, 530)
+					response := healthResponse(request, cloudflareOriginDNSFailureStatusCode)
 					response.Body = failureBody
 					return response, nil
 				}
@@ -622,7 +622,7 @@ func TestFetchRunHealthRetriesCloudflareOriginDNSFailureOnlyForManagedTunnel(t *
 		failureBody := &trackingReadCloser{Reader: strings.NewReader("<!doctype html><title>Origin DNS error</title>")}
 		client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 			calls++
-			response := healthResponse(request, 530)
+			response := healthResponse(request, cloudflareOriginDNSFailureStatusCode)
 			response.Body = failureBody
 			return response, nil
 		})}
