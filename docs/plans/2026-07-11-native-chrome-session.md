@@ -85,9 +85,10 @@ Expected: FAIL because methods/types are absent.
 
 Use existing `/v1/agents`, `/v1/leases`, and `/v1/tasks/{id}/artifacts`
 contracts. Download accepts only the returned canonical
-`artifact://<pool>/tasks/<task>/proofs/<proof>/artifacts/<name>` ref,
+`artifact://<pool>/tasks/<task>/proofs/<proof>/<name>` ref,
 validates/escapes each fixed and name segment (including safe multi-segment
-artifact names), and calls the existing proof-scoped download route. Do not
+artifact names), and calls the existing proof-scoped download route, whose HTTP
+path separately includes `/artifacts/` before the name. Do not
 expose generic arbitrary-path requests. Download rejects nonpositive limits and
 reads at most `maxBytes+1`. Strictly decode the lease's normalized artifact
 specs. Add a server-fixture round trip from `ListTaskArtifacts` to
@@ -524,7 +525,7 @@ wrong declared content type, size `max_bytes+1`, and invalid JSON before upload.
 Server tests repeat the same checks before storage so a modified/old agent cannot
 bypass policy. Generic JSON validity means syntactic JSON only; product output
 schema validation remains in product-capture Task 4. Add failing producer tests
-requiring canonical `artifact://<pool>/tasks/<task>/proofs/<proof>/artifacts/<name>`
+requiring canonical `artifact://<pool>/tasks/<task>/proofs/<proof>/<name>`
 refs for simple and nested names, normalization of existing legacy stored refs,
 and a real workflow-compute handler round trip through the compute-core client.
 
@@ -546,10 +547,11 @@ bound `stat`/read before upload and set the declared content type/retention. In
 `handleTaskArtifactUpload`, resolve the same task/operation/spec, use a bounded
 reader, validate declared name/type/size and JSON syntax, then store. Keep
 `/v1/agent-artifacts/` update packages separate and unchanged. Canonicalize
-public/listed refs from trusted task/proof/name metadata with the explicit
-`/artifacts/` marker; continue reading legacy stored metadata while emitting only
-canonical refs. Preserve nested artifact names by adding the route marker rather
-than treating a leading `artifacts/` name segment as the marker.
+public/listed refs from trusted task/proof/name metadata without the HTTP-only
+`/artifacts/` route marker; continue reading legacy stored metadata while
+emitting only canonical refs. Preserve nested artifact names, including a
+leading `artifacts/` name segment, by adding the marker only when constructing
+the download route.
 
 **Step 4: Verify and deploy staging**
 

@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
 	"github.com/GoCodeAlone/workflow-plugin-product-capture/internal/snapshot"
@@ -32,6 +33,14 @@ const (
 	maxSummaryImageURLBytes                      = 2048
 	maxSummaryPriceBytes                         = 128
 	maxSummaryCurrencyBytes                      = 16
+	stagingRunLogRetentionSeconds                = 600
+	failureEvidenceTimeout                       = 5 * time.Second
+	failureEvidenceMaxAttempts                   = 3
+	maxFailureRunLogBytes                        = 1 << 20
+	maxFailurePreviewBytes                       = 12 << 10
+	runLogPreserveLabel                          = "workflow.compute.run_logs.preserve"
+	runLogRetentionSecondsLabel                  = "workflow.compute.run_logs.retention_seconds"
+	runLogStderrArtifactName                     = "run-logs/stderr.txt"
 	browserDiagnosticSchemaSHA256                = "sha256:c7cfb25ad2fe4842cdd1b5a078c495e16d729cc18f81e7054e7becba0d620d40"
 	browserDiagnosticOperationInputSchemaRef     = "schema://providers/workflow-plugin-product-capture/browser/operations/browser_diagnostic/input/v1"
 	browserDiagnosticOperationInputSchemaSHA256  = "sha256:732d520997602aea2e1f0bc751b5e05bf372608a373f078d9ac4c3eb1ae912f4"
@@ -39,7 +48,10 @@ const (
 	browserDiagnosticOperationOutputSchemaSHA256 = "sha256:94eb33379184a7f00f489c7bc018afff76e0abb4a675609b541ed3cf61ef155e"
 )
 
-var canonicalPricePattern = regexp.MustCompile(`^(0|[1-9][0-9]*)(\.[0-9]{2})?$`)
+var (
+	canonicalPricePattern    = regexp.MustCompile(`^(0|[1-9][0-9]*)(\.[0-9]{2})?$`)
+	bearerFailureLinePattern = regexp.MustCompile(`(?i)(^|[^a-z0-9])bearer[[:space:]]+[^[:space:]]`)
+)
 
 type Config struct {
 	ServerURL            string
@@ -131,6 +143,14 @@ type browserDiagnosticArtifact struct {
 }
 
 func Run(ctx context.Context, cfg Config) (Summary, error) {
+	summary, err := run(ctx, cfg)
+	if err != nil {
+		return Summary{}, boundedWrappedError("", err)
+	}
+	return summary, nil
+}
+
+func run(ctx context.Context, cfg Config) (Summary, error) {
 	cfg = withDefaults(cfg)
 	productOperation, productSchema, err := validateConfig(cfg)
 	if err != nil {
@@ -180,7 +200,7 @@ func Run(ctx context.Context, cfg Config) (Summary, error) {
 		}
 		diagnosticTask, diagnosticProof, err := waitForAcceptedProof(ctx, client, cfg, diagnosticTask, diagnosticExecutor)
 		if err != nil {
-			return Summary{}, fmt.Errorf("browser diagnostic: %w", err)
+			return Summary{}, boundedWrappedError("browser diagnostic: ", err)
 		}
 		diagnosticOperation, _ := providerOperation(cfg.Contract, "browser_diagnostic")
 		diagnosticArtifact, err := downloadDiagnosticArtifact(ctx, client, cfg, diagnosticTask, diagnosticProof, diagnosticOperation, diagnosticSchema)
@@ -524,7 +544,11 @@ func submitProviderTask(ctx context.Context, client *protocol.Client, cfg Config
 			ExecutionSecurityTier: protocol.ExecutionSandboxedContainer,
 			ProofTier:             protocol.ProofArtifactHash,
 		},
-		NetworkPolicy:  protocol.NetworkPolicy{Mode: protocol.NetworkModeDirect},
+		NetworkPolicy: protocol.NetworkPolicy{Mode: protocol.NetworkModeDirect},
+		Labels: map[string]string{
+			runLogPreserveLabel:         "true",
+			runLogRetentionSecondsLabel: fmt.Sprint(stagingRunLogRetentionSeconds),
+		},
 		InputHash:      inputHash,
 		RequestedAt:    now,
 		TimeoutSeconds: cfg.TaskTimeoutSeconds,
@@ -576,16 +600,13 @@ func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Conf
 			return protocol.Task{}, protocol.ProofReceipt{}, fmt.Errorf("read task: %w", err)
 		}
 		task, found, stalls := snapshot.Task, snapshot.Found, snapshot.Stalls
-		if len(stalls) > 0 {
-			return protocol.Task{}, protocol.ProofReceipt{}, fmt.Errorf("task %s stalled: %s", taskID, stalls[0].Reason)
-		}
 		if found {
 			if taskBindingHash(task) != taskBindingHash(expected) {
 				return protocol.Task{}, protocol.ProofReceipt{}, errors.New("terminal task does not match submitted provider task")
 			}
 			switch task.Status {
 			case protocol.TaskFailed, protocol.TaskStalled, protocol.TaskCanceled:
-				return protocol.Task{}, protocol.ProofReceipt{}, fmt.Errorf("task %s ended with status %s", taskID, task.Status)
+				return protocol.Task{}, protocol.ProofReceipt{}, failedProviderTaskError(waitCtx, client, cfg, task, expected, expectedExecutor)
 			case protocol.TaskSucceeded:
 				foundProof, err := retryTransient(waitCtx, cfg.PollInterval, func() (proofSnapshot, error) {
 					proof, ok, err := client.FindProof(waitCtx, taskID)
@@ -599,12 +620,23 @@ func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Conf
 					if proof.Verifier.Status != protocol.VerificationAccepted {
 						return protocol.Task{}, protocol.ProofReceipt{}, fmt.Errorf("proof %s is %s", proof.ID, proof.Verifier.Status)
 					}
-					if err := validateAcceptedProof(proof, task, expected, cfg, expectedExecutor); err != nil {
+					if err := validateProofBinding(proof, task, expected, cfg, expectedExecutor); err != nil {
 						return protocol.Task{}, protocol.ProofReceipt{}, err
+					}
+					if proof.ExitCode != 0 {
+						base := errors.New("accepted proof exit_code is nonzero")
+						return protocol.Task{}, protocol.ProofReceipt{}, failedProviderProofError(waitCtx, client, cfg, base, task, expected, expectedExecutor, proof)
 					}
 					return task, proof, nil
 				}
+				if err := waitForPoll(waitCtx, cfg.PollInterval); err != nil {
+					return protocol.Task{}, protocol.ProofReceipt{}, fmt.Errorf("timed out waiting for task %s proof", taskID)
+				}
+				continue
 			}
+		}
+		if len(stalls) > 0 {
+			return protocol.Task{}, protocol.ProofReceipt{}, fmt.Errorf("task %s stalled", taskID)
 		}
 		if err := waitForPoll(waitCtx, cfg.PollInterval); err != nil {
 			return protocol.Task{}, protocol.ProofReceipt{}, fmt.Errorf("timed out waiting for task %s proof", taskID)
@@ -612,7 +644,168 @@ func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Conf
 	}
 }
 
-func validateAcceptedProof(proof protocol.ProofReceipt, terminal, expected protocol.Task, cfg Config, expectedExecutor protocol.ExecutorRef) error {
+func failedProviderTaskError(ctx context.Context, client *protocol.Client, cfg Config, task, expected protocol.Task, expectedExecutor protocol.ExecutorRef) error {
+	base := fmt.Errorf("task %s ended with status %s", task.ID, task.Status)
+	evidenceCtx, cancel := context.WithTimeout(ctx, failureEvidenceTimeout)
+	defer cancel()
+	remainingReads := failureEvidenceMaxAttempts
+	foundProof, err := retryTransientBudget(evidenceCtx, cfg.PollInterval, &remainingReads, func() (proofSnapshot, error) {
+		proof, found, err := client.FindProof(evidenceCtx, task.ID)
+		return proofSnapshot{Proof: proof, Found: found}, err
+	})
+	proof, found := foundProof.Proof, foundProof.Found
+	if err != nil || !found {
+		return base
+	}
+	return providerFailureEvidenceError(evidenceCtx, client, cfg, &remainingReads, base, task, expected, expectedExecutor, proof)
+}
+
+func failedProviderProofError(ctx context.Context, client *protocol.Client, cfg Config, base error, task, expected protocol.Task, expectedExecutor protocol.ExecutorRef, proof protocol.ProofReceipt) error {
+	evidenceCtx, cancel := context.WithTimeout(ctx, failureEvidenceTimeout)
+	defer cancel()
+	remainingReads := failureEvidenceMaxAttempts
+	return providerFailureEvidenceError(evidenceCtx, client, cfg, &remainingReads, base, task, expected, expectedExecutor, proof)
+}
+
+func providerFailureEvidenceError(ctx context.Context, client *protocol.Client, cfg Config, remainingReads *int, base error, task, expected protocol.Task, expectedExecutor protocol.ExecutorRef, proof protocol.ProofReceipt) error {
+	if proof.ExitCode == 0 || validateProofBinding(proof, task, expected, cfg, expectedExecutor) != nil {
+		return base
+	}
+	artifacts, err := retryTransientBudget(ctx, cfg.PollInterval, remainingReads, func() ([]protocol.TaskArtifact, error) {
+		return client.ListTaskArtifacts(ctx, task.ID)
+	})
+	if err != nil {
+		return base
+	}
+	var stderr *protocol.TaskArtifact
+	for index := range artifacts {
+		artifact := &artifacts[index]
+		if artifact.Name != runLogStderrArtifactName {
+			continue
+		}
+		if stderr != nil {
+			return base
+		}
+		stderr = artifact
+	}
+	expectedRef := fmt.Sprintf("artifact://%s/tasks/%s/proofs/%s/%s", task.PoolID, task.ID, proof.ID, runLogStderrArtifactName)
+	if stderr == nil || stderr.TaskID != task.ID || stderr.ProofID != proof.ID || stderr.PoolID != task.PoolID || stderr.Ref != expectedRef ||
+		stderr.ContentType != "text/plain; charset=utf-8" || stderr.SizeBytes <= 0 || stderr.SizeBytes > maxFailureRunLogBytes ||
+		!validSHA256(stderr.SHA256) {
+		return base
+	}
+	body, err := retryTransientBudget(ctx, cfg.PollInterval, remainingReads, func() ([]byte, error) {
+		return client.DownloadTaskArtifact(ctx, stderr.Ref, maxFailureRunLogBytes)
+	})
+	if err != nil || int64(len(body)) != stderr.SizeBytes || sha256Ref(body) != stderr.SHA256 {
+		return base
+	}
+	preview := boundedFailurePreview(body)
+	if preview == "" {
+		return base
+	}
+	prefix := base.Error() + "; provider stderr:\n"
+	preview = boundedTextTail(preview, maxFailurePreviewBytes-len(prefix))
+	return errors.New(prefix + preview)
+}
+
+func boundedFailurePreview(body []byte) string {
+	if !utf8.Valid(body) {
+		return ""
+	}
+	text := string(body)
+	lines := strings.FieldsFunc(text, func(r rune) bool { return r == '\r' || r == '\n' })
+	clean := make([]string, 0, len(lines))
+	redactContinuation := false
+	for _, line := range lines {
+		line = strings.TrimSpace(strings.ReplaceAll(line, "\x00", ""))
+		if line == "" {
+			continue
+		}
+		if redactContinuation {
+			clean = append(clean, "[redacted sensitive line]")
+			redactContinuation = false
+			continue
+		}
+		if match := sensitiveFailureAssignment(line); match != nil {
+			clean = append(clean, "[redacted sensitive line]")
+			remainder := strings.Trim(strings.TrimSpace(line[match[1]:]), "\"'")
+			redactContinuation = remainder == "" || strings.EqualFold(remainder, "bearer")
+			continue
+		}
+		if bearerFailureLinePattern.MatchString(line) {
+			clean = append(clean, "[redacted sensitive line]")
+			continue
+		}
+		clean = append(clean, line)
+	}
+	return boundedTextTail(strings.Join(clean, "\n"), maxFailurePreviewBytes)
+}
+
+func sensitiveFailureAssignment(line string) []int {
+	for index, char := range line {
+		if char != ':' && char != '=' {
+			continue
+		}
+		key := strings.Map(func(char rune) rune {
+			if char >= 'A' && char <= 'Z' {
+				return char + ('a' - 'A')
+			}
+			if (char >= 'a' && char <= 'z') || (char >= '0' && char <= '9') {
+				return char
+			}
+			return -1
+		}, line[:index])
+		for _, marker := range []string{
+			"authorization", "cookie", "token", "secret", "password", "passwd", "credential", "apikey", "privatekey",
+			"session", "sessid", "csrf", "xsrf",
+		} {
+			if strings.Contains(key, marker) {
+				return []int{0, index + 1}
+			}
+		}
+	}
+	return nil
+}
+
+func boundedWrappedError(prefix string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return boundedError{
+		message: prefix + boundedTextTail(err.Error(), maxFailurePreviewBytes-len(prefix)),
+		cause:   err,
+	}
+}
+
+type boundedError struct {
+	message string
+	cause   error
+}
+
+func (e boundedError) Error() string { return e.message }
+
+func (e boundedError) Is(target error) bool { return errors.Is(e.cause, target) }
+
+func boundedTextTail(text string, maxBytes int) string {
+	text = strings.ToValidUTF8(text, "")
+	if maxBytes <= 0 {
+		return ""
+	}
+	if len(text) <= maxBytes {
+		return text
+	}
+	const marker = "[truncated to bounded stderr tail]\n"
+	if maxBytes <= len(marker) {
+		return marker[:maxBytes]
+	}
+	budget := maxBytes - len(marker)
+	tail := []byte(text)
+	tail = tail[len(tail)-budget:]
+	return marker + strings.ToValidUTF8(string(tail), "")
+}
+
+func validateProofBinding(proof protocol.ProofReceipt, terminal, expected protocol.Task, cfg Config, expectedExecutor protocol.ExecutorRef) error {
 	if err := proof.Validate(); err != nil {
 		return fmt.Errorf("accepted proof receipt: %w", err)
 	}
@@ -630,9 +823,6 @@ func validateAcceptedProof(proof protocol.ProofReceipt, terminal, expected proto
 	}
 	if protocol.CanonicalHash(proof.Executor) != protocol.CanonicalHash(expectedExecutor) {
 		return errors.New("accepted proof executor does not match requested runtime")
-	}
-	if proof.ExitCode != 0 {
-		return errors.New("accepted proof exit_code is nonzero")
 	}
 	return nil
 }
@@ -858,7 +1048,7 @@ func validateArtifactMetadata(task protocol.Task, proof protocol.ProofReceipt, a
 	if artifact.TaskID != task.ID || artifact.ProofID != proof.ID || artifact.PoolID != task.PoolID {
 		return fmt.Errorf("artifact %q scope does not match accepted task and proof", artifact.Name)
 	}
-	expectedRef := fmt.Sprintf("artifact://%s/tasks/%s/proofs/%s/artifacts/%s", task.PoolID, task.ID, proof.ID, artifact.Name)
+	expectedRef := fmt.Sprintf("artifact://%s/tasks/%s/proofs/%s/%s", task.PoolID, task.ID, proof.ID, artifact.Name)
 	if artifact.Ref != expectedRef {
 		return fmt.Errorf("artifact %q ref is not canonical", artifact.Name)
 	}
@@ -946,6 +1136,24 @@ func retryTransient[T any](ctx context.Context, interval time.Duration, operatio
 			return zero, errors.Join(waitErr, err)
 		}
 	}
+}
+
+func retryTransientBudget[T any](ctx context.Context, interval time.Duration, remaining *int, operation func() (T, error)) (T, error) {
+	var zero T
+	for remaining != nil && *remaining > 0 {
+		*remaining--
+		value, err := operation()
+		if err == nil {
+			return value, nil
+		}
+		if !isTransientControlError(err) || *remaining == 0 {
+			return zero, err
+		}
+		if waitErr := waitForPoll(ctx, interval); waitErr != nil {
+			return zero, errors.Join(waitErr, err)
+		}
+	}
+	return zero, errors.New("transient retry read budget exhausted")
 }
 
 func isTransientControlError(err error) bool {
