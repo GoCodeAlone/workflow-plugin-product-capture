@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	coreprotocol "github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
+	"github.com/GoCodeAlone/workflow-plugin-product-capture/internal/conformance"
 	"github.com/GoCodeAlone/workflow-plugin-product-capture/internal/snapshot"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
@@ -621,6 +623,36 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	}
 	if !got.PostedToOrigin {
 		t.Fatalf("diagnostic should post browser signals back to the controlled origin: %+v", got)
+	}
+}
+
+func TestMainForwardsIPv4PolicyToBrowserDiagnostic(t *testing.T) {
+	var gotURL string
+	var gotRequireIPv4 bool
+	var stdout, stderr bytes.Buffer
+	code := mainWithBrowserDiagnosticRunner(
+		[]string{"--browser-diagnostic-url", "https://diagnostic.example/probe", "--browser-diagnostic-require-ipv4"},
+		&stdout,
+		&stderr,
+		func(rawURL string, _ io.Writer, requireIPv4 bool) error {
+			gotURL = rawURL
+			gotRequireIPv4 = requireIPv4
+			return nil
+		},
+	)
+	if code != 0 || stderr.Len() != 0 {
+		t.Fatalf("Main code/stderr = %d/%q, want successful policy forwarding", code, stderr.String())
+	}
+	if gotURL != "https://diagnostic.example/probe" || !gotRequireIPv4 {
+		t.Fatalf("browser diagnostic runner got URL/requireIPv4 = %q/%v", gotURL, gotRequireIPv4)
+	}
+}
+
+func TestMainRejectsIPv4PolicyWithoutBrowserDiagnosticURL(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Main([]string{"--browser-diagnostic-require-ipv4"}, &stdout, &stderr, strings.NewReader("{}"))
+	if code != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "requires --browser-diagnostic-url") {
+		t.Fatalf("Main code/stdout/stderr = %d/%q/%q, want scoped policy rejection", code, stdout.String(), stderr.String())
 	}
 }
 
@@ -2578,6 +2610,109 @@ func TestBrowserDiagnosticPrefersIPv4PinForDualStackHost(t *testing.T) {
 	}
 }
 
+func TestBrowserDiagnosticRequiredIPv4WaitsForPublication(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		started := time.Now()
+		target, err := resolveBrowserDiagnosticTargetWithPolicy(
+			context.Background(),
+			"https://diagnostic.example/probe",
+			"https://diagnostic.example",
+			func(context.Context, string) ([]net.IPAddr, error) {
+				calls++
+				addresses := []net.IPAddr{{IP: net.ParseIP("2606:4700::6810:85e5")}}
+				if calls > 1 {
+					addresses = append(addresses, net.IPAddr{IP: net.ParseIP("104.16.133.229")})
+				}
+				return addresses, nil
+			},
+			true,
+		)
+		if err != nil {
+			t.Fatalf("resolve required IPv4 diagnostic target: %v", err)
+		}
+		if calls != 2 {
+			t.Fatalf("DNS lookup calls = %d, want AAAA-only retry followed by dual-stack publication", calls)
+		}
+		if target.resolverRules != "MAP diagnostic.example 104.16.133.229" {
+			t.Fatalf("resolver rules = %q, want published IPv4 pin", target.resolverRules)
+		}
+		if elapsed := time.Since(started); elapsed != browserDiagnosticDNSRetryInterval {
+			t.Fatalf("required IPv4 publication retry elapsed = %s, want %s", elapsed, browserDiagnosticDNSRetryInterval)
+		}
+	})
+}
+
+func TestBrowserDiagnosticRequiredIPv4RejectsIPv6Literal(t *testing.T) {
+	_, err := resolveBrowserDiagnosticTargetWithPolicy(
+		context.Background(),
+		"https://[2606:4700:4700::1111]/probe",
+		"https://[2606:4700:4700::1111]",
+		nil,
+		true,
+	)
+	if err == nil || !strings.Contains(err.Error(), "requires IPv4") {
+		t.Fatalf("resolve required IPv4 diagnostic target error = %v, want IPv6 literal rejection", err)
+	}
+}
+
+func TestBrowserDiagnosticRequiredIPv4RedactsResolverHostname(t *testing.T) {
+	const hostname = "secret-tunnel.trycloudflare.com"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	_, err := resolveBrowserDiagnosticTargetWithPolicy(
+		ctx,
+		"https://"+hostname+"/probe",
+		"https://"+hostname,
+		func(context.Context, string) ([]net.IPAddr, error) {
+			cancel()
+			return nil, &net.DNSError{Err: "no such host", Name: strings.ToUpper(hostname), IsNotFound: true}
+		},
+		true,
+	)
+	if err == nil {
+		t.Fatal("required IPv4 resolver failure unexpectedly succeeded")
+	}
+	if strings.Contains(strings.ToLower(err.Error()), hostname) || strings.Contains(strings.ToLower(err.Error()), "trycloudflare.com") {
+		t.Fatalf("required IPv4 resolver error leaked managed hostname: %v", err)
+	}
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) {
+		t.Fatalf("required IPv4 resolver error lost DNS cause: %v", err)
+	}
+}
+
+func TestRedactBrowserDiagnosticErrorFailsClosedForInvalidPatternText(t *testing.T) {
+	secret := string([]byte{0xff})
+	cause := errors.New("browser diagnostic failed for " + secret)
+	err := redactBrowserDiagnosticError(cause, secret)
+	if !errors.Is(err, cause) {
+		t.Fatalf("redacted browser diagnostic error = %v, want original cause", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("redacted browser diagnostic error retained invalid secret bytes: %q", err.Error())
+	}
+}
+
+func TestRedactBrowserDiagnosticErrorRedactsPathAndRunIdentifier(t *testing.T) {
+	const target = "https://secret-tunnel.trycloudflare.com/runs/secret-run-42/attached"
+	for _, message := range []string{
+		"browser failed at /RUNS/SECRET-RUN-42/ATTACHED",
+		"browser failed for SECRET-RUN-42",
+	} {
+		cause := errors.New(message)
+		err := redactBrowserDiagnosticError(cause, target)
+		if !errors.Is(err, cause) {
+			t.Fatalf("redacted browser diagnostic error = %v, want original cause", err)
+		}
+		for _, forbidden := range []string{"secret-run-42", "/runs/"} {
+			if strings.Contains(strings.ToLower(err.Error()), forbidden) {
+				t.Fatalf("redacted browser diagnostic error leaked %q: %v", forbidden, err)
+			}
+		}
+	}
+}
+
 func TestPublicDiagnosticIPClassifiesIPv6RoutingSpace(t *testing.T) {
 	for _, tc := range []struct {
 		address string
@@ -2609,6 +2744,66 @@ func TestPublicDiagnosticIPClassifiesIPv6RoutingSpace(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPublicDiagnosticIPv4PolicyMatchesConformance(t *testing.T) {
+	candidates := map[netip.Addr]struct{}{
+		netip.MustParseAddr("8.8.8.8"):         {},
+		netip.MustParseAddr("93.184.216.34"):   {},
+		netip.MustParseAddr("104.16.133.229"):  {},
+		netip.MustParseAddr("255.255.255.255"): {},
+		netip.IPv6Loopback():                   {},
+	}
+	for _, rawPrefix := range []string{
+		"0.0.0.0/8",
+		"10.0.0.0/8",
+		"100.64.0.0/10",
+		"127.0.0.0/8",
+		"169.254.0.0/16",
+		"172.16.0.0/12",
+		"192.0.0.0/24",
+		"192.0.2.0/24",
+		"192.88.99.0/24",
+		"192.168.0.0/16",
+		"198.18.0.0/15",
+		"198.51.100.0/24",
+		"203.0.113.0/24",
+		"224.0.0.0/4",
+		"240.0.0.0/4",
+	} {
+		prefix := netip.MustParsePrefix(rawPrefix).Masked()
+		first := prefix.Addr()
+		last := lastIPv4Address(prefix)
+		for _, candidate := range []netip.Addr{first.Prev(), first, last, last.Next()} {
+			if candidate.IsValid() {
+				candidates[candidate] = struct{}{}
+			}
+		}
+	}
+	for candidate := range candidates {
+		if candidate.Is4() {
+			candidates[netip.MustParseAddr("::ffff:"+candidate.String())] = struct{}{}
+		}
+	}
+
+	for candidate := range candidates {
+		t.Run(candidate.String(), func(t *testing.T) {
+			providerResult := isPublicDiagnosticIP(candidate)
+			conformanceResult := conformance.IsPublicDiagnosticIPv4(candidate)
+			if providerResult != conformanceResult {
+				t.Fatalf("public diagnostic IPv4 policy differs for %s: provider=%t conformance=%t", candidate, providerResult, conformanceResult)
+			}
+		})
+	}
+}
+
+func lastIPv4Address(prefix netip.Prefix) netip.Addr {
+	bytes := prefix.Addr().As4()
+	value := binary.BigEndian.Uint32(bytes[:])
+	hostBits := 32 - prefix.Bits()
+	value |= (uint32(1) << hostBits) - 1
+	binary.BigEndian.PutUint32(bytes[:], value)
+	return netip.AddrFrom4(bytes)
 }
 
 func TestBrowserDiagnosticRetriesDNSPropagationBeforePinning(t *testing.T) {

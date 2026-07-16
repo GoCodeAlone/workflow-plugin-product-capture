@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -25,6 +27,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 const (
@@ -36,6 +40,8 @@ const (
 	CloudflaredVersion             = "2026.7.1"
 	CloudflaredSHA256              = "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1"
 	CloudflaredDownloadURL         = "https://github.com/cloudflare/cloudflared/releases/download/" + CloudflaredVersion + "/cloudflared-linux-amd64"
+	diagnosticDNSResolverIP        = "1.1.1.1"
+	diagnosticDNSResolverAddress   = diagnosticDNSResolverIP + ":53"
 	candidateStopSeconds           = 10
 	candidateReapGrace             = 12 * time.Second
 	candidateStopCommandTimeout    = 15 * time.Second
@@ -45,6 +51,11 @@ const (
 	candidateLifecycleCleanupBound = candidateStopCommandTimeout + candidateReapGrace + candidateForceRemoveTimeout + candidateReapGrace + candidateFinalRemoveTimeout + candidateInspectTimeout
 	launchCleanupWaitTimeout       = candidateLifecycleCleanupBound + 5*time.Second
 	defaultConformanceTimeout      = 12 * time.Minute
+	managedDirectDNSRetryWindow    = 15 * time.Second
+	managedDirectDNSRetryInterval  = 250 * time.Millisecond
+	diagnosticDNSQueryTimeout      = 5 * time.Second
+	maxDiagnosticDNSResponseBytes  = 65535
+	maxDiagnosticDNSCNAMEHops      = 16
 )
 
 type Brand struct {
@@ -869,11 +880,13 @@ type Tunnel interface {
 type Dependencies struct {
 	Tunnel              Tunnel
 	HTTPClient          *http.Client
+	TunnelHTTPClient    *http.Client
 	TunnelHealthTimeout time.Duration
+	HealthRetryWait     diagnosticHealthRetryWait
 	Listen              func(string, string) (net.Listener, error)
-	LaunchDirect        func(context.Context, string, string) error
-	LaunchAttached      func(context.Context, string, string) error
-	ValidateLifecycle   func(context.Context, string, string) error
+	LaunchDirect        func(context.Context, string, string, bool) error
+	LaunchAttached      func(context.Context, string, string, bool) error
+	ValidateLifecycle   func(context.Context, string, string, bool) error
 	InspectVersions     func(context.Context, string) (Versions, error)
 }
 
@@ -888,10 +901,44 @@ type Runner struct {
 	Dependencies Dependencies
 }
 
+type redactedManagedTunnelError struct {
+	cause   error
+	message string
+}
+
+func (e redactedManagedTunnelError) Error() string { return e.message }
+func (e redactedManagedTunnelError) Unwrap() error { return e.cause }
+
+type redactedTunnelCleanupError struct{ cause error }
+
+func (e redactedTunnelCleanupError) Error() string { return errDiagnosticTunnelCleanupFailed.Error() }
+func (e redactedTunnelCleanupError) Unwrap() []error {
+	return []error{errDiagnosticTunnelCleanupFailed, e.cause}
+}
+
+type redactedDiagnosticHealthError struct {
+	classification error
+	cause          error
+}
+
+func (e redactedDiagnosticHealthError) Error() string { return e.classification.Error() }
+func (e redactedDiagnosticHealthError) Unwrap() []error {
+	return []error{e.classification, e.cause}
+}
+
 var (
-	errTunnelActivationTimeout  = errors.New("cloudflared timed out before publishing an origin")
-	errTunnelExitedBeforeOrigin = errors.New("cloudflared exited before publishing an origin")
+	errTunnelActivationTimeout             = errors.New("cloudflared timed out before publishing an origin")
+	errTunnelExitedBeforeOrigin            = errors.New("cloudflared exited before publishing an origin")
+	errDiagnosticDNSResolverUnavailable    = errors.New("diagnostic DNS resolver unavailable")
+	errDiagnosticDNSPublicationNotReady    = errors.New("diagnostic DNS publication not ready")
+	errDiagnosticNonPublicIPv4             = errors.New("diagnostic DNS resolved to non-public IPv4 address")
+	errDiagnosticHealthEndpointRejected    = errors.New("run-correlated diagnostic health endpoint rejected")
+	errDiagnosticHealthEndpointUnreachable = errors.New("fetch run-correlated diagnostic health endpoint failed")
+	errDiagnosticHealthResponseTooLarge    = errors.New("diagnostic health response exceeds 4096 bytes")
+	errDiagnosticTunnelCleanupFailed       = errors.New("diagnostic tunnel cleanup failed")
 )
+
+const maxDiagnosticHealthResponseBytes = 4096
 
 func retryableTunnelStartError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -962,8 +1009,13 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
+	healthRetryWait := r.Dependencies.HealthRetryWait
+	if healthRetryWait == nil {
+		healthRetryWait = waitForDiagnosticHealthRetry
+	}
 	origin := strings.TrimRight(strings.TrimSpace(options.Origin), "/")
-	if origin == "" {
+	managedTunnel := origin == ""
+	if managedTunnel {
 		if r.Dependencies.Tunnel == nil {
 			return errors.New("diagnostic tunnel dependency is unavailable")
 		}
@@ -972,6 +1024,10 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 			return fmt.Errorf("resolve diagnostic listen port: %w", splitErr)
 		}
 		healthTimeout := tunnelHealthTimeout(r.Dependencies.TunnelHealthTimeout)
+		tunnelHealthClient := r.Dependencies.TunnelHTTPClient
+		if tunnelHealthClient == nil {
+			return errors.New("managed diagnostic tunnel health client is unavailable")
+		}
 		localURL := "http://127.0.0.1:" + port
 		for attempt := 0; attempt < 3; attempt++ {
 			candidate, startErr := r.Dependencies.Tunnel.Start(ctx, localURL)
@@ -989,7 +1045,15 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 				return errors.Join(err, stopTunnel(r.Dependencies.Tunnel))
 			}
 			healthCtx, healthCancel := context.WithTimeout(ctx, healthTimeout)
-			healthErr := fetchRunHealth(healthCtx, client, candidate+"/runs/"+runID+"/healthz", runID, 500*time.Millisecond)
+			healthErr := fetchRunHealth(
+				healthCtx,
+				tunnelHealthClient,
+				candidate+"/runs/"+runID+"/healthz",
+				runID,
+				500*time.Millisecond,
+				true,
+				healthRetryWait,
+			)
 			healthCancel()
 			if healthErr == nil {
 				origin = candidate
@@ -998,7 +1062,8 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 			if stopErr := stopTunnel(r.Dependencies.Tunnel); stopErr != nil {
 				return errors.Join(healthErr, stopErr)
 			}
-			if !errors.Is(healthErr, context.DeadlineExceeded) || ctx.Err() != nil || attempt == 2 {
+			if errors.Is(healthErr, errDiagnosticDNSResolverUnavailable) ||
+				!errors.Is(healthErr, context.DeadlineExceeded) || ctx.Err() != nil || attempt == 2 {
 				return healthErr
 			}
 		}
@@ -1009,7 +1074,15 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 		}
 		healthCtx, healthCancel := context.WithTimeout(ctx, 90*time.Second)
 		defer healthCancel()
-		if err := fetchRunHealth(healthCtx, client, origin+"/runs/"+runID+"/healthz", runID, 500*time.Millisecond); err != nil {
+		if err := fetchRunHealth(
+			healthCtx,
+			client,
+			origin+"/runs/"+runID+"/healthz",
+			runID,
+			500*time.Millisecond,
+			false,
+			healthRetryWait,
+		); err != nil {
 			return err
 		}
 	}
@@ -1023,16 +1096,18 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 	if err != nil {
 		return fmt.Errorf("inspect candidate versions: %w", err)
 	}
-	if err := r.Dependencies.ValidateLifecycle(ctx, options.Image, origin); err != nil {
-		return fmt.Errorf("validate candidate lifecycle: %w", err)
+	if err := r.Dependencies.ValidateLifecycle(ctx, options.Image, origin, managedTunnel); err != nil {
+		return fmt.Errorf("validate candidate lifecycle: %w", redactManagedTunnelError(err, managedTunnel, origin))
 	}
-	direct, err := launchAndCollect(ctx, collector, "direct", options.Image, origin+"/runs/"+runID+"/direct", r.Dependencies.LaunchDirect)
+	directTarget := origin + "/runs/" + runID + "/direct"
+	direct, err := launchAndCollect(ctx, collector, "direct", options.Image, directTarget, managedTunnel, r.Dependencies.LaunchDirect)
 	if err != nil {
-		return err
+		return redactManagedTunnelError(err, managedTunnel, directTarget, origin)
 	}
-	attached, err := launchAndCollect(ctx, collector, "attached", options.Image, origin+"/runs/"+runID+"/attached", r.Dependencies.LaunchAttached)
+	attachedTarget := origin + "/runs/" + runID + "/attached"
+	attached, err := launchAndCollect(ctx, collector, "attached", options.Image, attachedTarget, managedTunnel, r.Dependencies.LaunchAttached)
 	if err != nil {
-		return err
+		return redactManagedTunnelError(err, managedTunnel, attachedTarget, origin)
 	}
 	report := Compare(direct, attached, versions)
 	data, err := json.MarshalIndent(report, "", "  ")
@@ -1056,6 +1131,57 @@ func tunnelHealthTimeout(configured time.Duration) time.Duration {
 	return 2 * time.Minute
 }
 
+func redactManagedTunnelError(err error, managedTunnel bool, values ...string) error {
+	if err == nil || !managedTunnel {
+		return err
+	}
+	message := err.Error()
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		secrets := diagnosticRedactionSecrets(value)
+		for _, secret := range secrets {
+			if secret != "" {
+				message = replaceDiagnosticValue(message, secret)
+			}
+		}
+	}
+	return redactedManagedTunnelError{cause: err, message: message}
+}
+
+func diagnosticRedactionSecrets(value string) []string {
+	secrets := []string{value}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return secrets
+	}
+	secrets = append(secrets, parsed.Host, parsed.Hostname())
+	if parsed.Path != "" && parsed.Path != "/" {
+		secrets = append(secrets, parsed.Path)
+	}
+	if escapedPath := parsed.EscapedPath(); escapedPath != "" && escapedPath != "/" && escapedPath != parsed.Path {
+		secrets = append(secrets, escapedPath)
+	}
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	for index := 0; index+1 < len(segments); index++ {
+		if strings.EqualFold(segments[index], "runs") && segments[index+1] != "" {
+			secrets = append(secrets, segments[index+1])
+			break
+		}
+	}
+	return secrets
+}
+
+func replaceDiagnosticValue(message, secret string) string {
+	pattern, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(secret))
+	if err != nil {
+		return "<managed-diagnostic-origin>"
+	}
+	return pattern.ReplaceAllLiteralString(message, "<managed-diagnostic-origin>")
+}
+
 func validateDiagnosticOrigin(origin string) error {
 	parsedOrigin, err := url.Parse(origin)
 	if err != nil || parsedOrigin.Scheme != "https" || parsedOrigin.Host == "" || parsedOrigin.User != nil || parsedOrigin.Path != "" || parsedOrigin.RawQuery != "" || parsedOrigin.Fragment != "" {
@@ -1067,47 +1193,153 @@ func validateDiagnosticOrigin(origin string) error {
 func stopTunnel(tunnel Tunnel) error {
 	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	return tunnel.Stop(stopCtx)
+	if err := tunnel.Stop(stopCtx); err != nil {
+		return redactedTunnelCleanupError{cause: err}
+	}
+	return nil
 }
 
-func fetchRunHealth(ctx context.Context, client *http.Client, healthURL, runID string, retryInterval time.Duration) error {
+type diagnosticHealthRetryWait func(context.Context, time.Duration) error
+
+func fetchRunHealth(
+	ctx context.Context,
+	client *http.Client,
+	healthURL, runID string,
+	retryInterval time.Duration,
+	managedTunnel bool,
+	retryWait diagnosticHealthRetryWait,
+) error {
 	if retryInterval <= 0 {
 		retryInterval = 500 * time.Millisecond
 	}
+	if retryWait == nil {
+		return errors.New("diagnostic health retry wait is unavailable")
+	}
 	var lastErr error
 	for {
+		if err := ctx.Err(); err != nil {
+			return errors.Join(lastErr, err)
+		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, healthURL, http.NoBody)
 		if err != nil {
 			return fmt.Errorf("create diagnostic health request: %w", err)
 		}
 		resp, err := client.Do(req)
+		ctxErr := ctx.Err()
 		if err == nil {
-			var health struct {
-				Schema string `json:"schema"`
-				RunID  string `json:"run_id"`
-			}
-			decodeErr := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&health)
-			closeErr := resp.Body.Close()
-			if resp.StatusCode == http.StatusOK {
-				if decodeErr != nil || closeErr != nil || health.Schema != SchemaV1 || health.RunID != runID {
-					return errors.New("run-correlated diagnostic health endpoint rejected")
+			if ctxErr != nil {
+				var closeErr error
+				if resp != nil && resp.Body != nil {
+					closeErr = resp.Body.Close()
 				}
+				return errors.Join(diagnosticHealthResponseCause(managedTunnel, closeErr), ctxErr)
+			}
+			retryable, responseErr := classifyRunHealthResponse(resp, runID, managedTunnel)
+			if ctxErr = ctx.Err(); ctxErr != nil {
+				return errors.Join(responseErr, ctxErr)
+			}
+			if responseErr == nil {
 				return nil
 			}
-			if !retryableHealthStatus(resp.StatusCode) {
-				return fmt.Errorf("run-correlated diagnostic health endpoint returned status %d", resp.StatusCode)
+			if !retryable {
+				return responseErr
 			}
-			lastErr = fmt.Errorf("diagnostic health endpoint returned transient status %d", resp.StatusCode)
+			lastErr = responseErr
 		} else {
-			lastErr = errors.New("fetch run-correlated diagnostic health endpoint failed")
+			if !managedTunnel {
+				lastErr = errDiagnosticHealthEndpointUnreachable
+			} else {
+				var dnsErr *net.DNSError
+				switch {
+				case errors.Is(err, errDiagnosticNonPublicIPv4):
+					return errors.Join(redactedDiagnosticHealthError{classification: errDiagnosticNonPublicIPv4, cause: err}, ctxErr)
+				case errors.As(err, &dnsErr) && dnsErr.IsNotFound:
+					lastErr = redactedDiagnosticHealthError{classification: errDiagnosticDNSPublicationNotReady, cause: err}
+				case errors.As(err, &dnsErr) && retryableDiagnosticIPv4LookupError(err):
+					lastErr = redactedDiagnosticHealthError{classification: errDiagnosticDNSResolverUnavailable, cause: err}
+				case errors.As(err, &dnsErr):
+					return errors.Join(redactedDiagnosticHealthError{classification: errDiagnosticDNSResolverUnavailable, cause: err}, ctxErr)
+				default:
+					lastErr = redactedDiagnosticHealthError{classification: errDiagnosticHealthEndpointUnreachable, cause: err}
+				}
+			}
+			if ctxErr != nil {
+				return errors.Join(lastErr, ctxErr)
+			}
 		}
-		timer := time.NewTimer(retryInterval)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return errors.Join(lastErr, ctx.Err())
-		case <-timer.C:
+		if err := retryWait(ctx, retryInterval); err != nil {
+			if managedTunnel && errors.Is(lastErr, errDiagnosticDNSPublicationNotReady) {
+				return redactedDiagnosticHealthError{
+					classification: errDiagnosticDNSResolverUnavailable,
+					cause:          errors.Join(lastErr, err),
+				}
+			}
+			return errors.Join(lastErr, err)
 		}
+	}
+}
+
+func classifyRunHealthResponse(resp *http.Response, runID string, managedTunnel bool) (bool, error) {
+	body, bodyErr := readAndCloseDiagnosticHealthResponse(resp.Body)
+	if resp.StatusCode == http.StatusOK {
+		var health struct {
+			Schema string `json:"schema"`
+			RunID  string `json:"run_id"`
+		}
+		decodeErr := json.Unmarshal(body, &health)
+		if bodyErr != nil || decodeErr != nil || health.Schema != SchemaV1 || health.RunID != runID {
+			return false, classifiedDiagnosticHealthError(managedTunnel, errDiagnosticHealthEndpointRejected, bodyErr, decodeErr)
+		}
+		return false, nil
+	}
+
+	if retryableHealthStatus(resp.StatusCode) {
+		classification := fmt.Errorf("diagnostic health endpoint returned transient status %d", resp.StatusCode)
+		return true, classifiedDiagnosticHealthError(managedTunnel, classification, bodyErr)
+	}
+	classification := fmt.Errorf("run-correlated diagnostic health endpoint returned status %d", resp.StatusCode)
+	return false, classifiedDiagnosticHealthError(managedTunnel, classification, bodyErr)
+}
+
+func readAndCloseDiagnosticHealthResponse(body io.ReadCloser) ([]byte, error) {
+	if body == nil {
+		return nil, errors.New("diagnostic health response body is unavailable")
+	}
+	data, readErr := io.ReadAll(io.LimitReader(body, maxDiagnosticHealthResponseBytes+1))
+	closeErr := body.Close()
+	var sizeErr error
+	if len(data) > maxDiagnosticHealthResponseBytes {
+		sizeErr = errDiagnosticHealthResponseTooLarge
+	}
+	return data, errors.Join(readErr, sizeErr, closeErr)
+}
+
+func classifiedDiagnosticHealthError(managedTunnel bool, classification error, causes ...error) error {
+	cause := errors.Join(causes...)
+	if cause == nil {
+		return classification
+	}
+	if managedTunnel {
+		return redactedDiagnosticHealthError{classification: classification, cause: cause}
+	}
+	return errors.Join(classification, cause)
+}
+
+func diagnosticHealthResponseCause(managedTunnel bool, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return classifiedDiagnosticHealthError(managedTunnel, errDiagnosticHealthEndpointRejected, cause)
+}
+
+func waitForDiagnosticHealthRetry(ctx context.Context, interval time.Duration) error {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -1120,12 +1352,13 @@ func launchAndCollect(
 	ctx context.Context,
 	collector *Collector,
 	kind, image, target string,
-	launch func(context.Context, string, string) error,
+	managedTunnel bool,
+	launch func(context.Context, string, string, bool) error,
 ) (Observation, error) {
 	launchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	launchResult := make(chan error, 1)
-	go func() { launchResult <- launch(launchCtx, image, target) }()
+	go func() { launchResult <- launch(launchCtx, image, target, managedTunnel) }()
 	observationResult := make(chan struct {
 		observation Observation
 		err         error
@@ -1274,15 +1507,490 @@ func MainContext(ctx context.Context, args []string, stdout, stderr io.Writer, d
 }
 
 func DefaultDependencies(stderr io.Writer) Dependencies {
+	return defaultDependencies(stderr, newDiagnosticHealthClient)
+}
+
+type diagnosticHealthClientFactory func(string, diagnosticHealthDialer) *http.Client
+
+func defaultDependencies(stderr io.Writer, newHealthClient diagnosticHealthClientFactory) Dependencies {
 	client := &http.Client{Timeout: 45 * time.Second}
 	return Dependencies{
 		Tunnel:            &pinnedCloudflaredTunnel{client: client, stderr: stderr},
 		HTTPClient:        client,
+		TunnelHTTPClient:  newHealthClient(diagnosticDNSResolverAddress, nil),
 		LaunchDirect:      launchDirectChrome,
 		LaunchAttached:    launchAttachedProvider,
 		ValidateLifecycle: validateCandidateLifecycle,
 		InspectVersions:   inspectCandidateVersions,
 	}
+}
+
+type diagnosticHealthDialer func(context.Context, string, string) (net.Conn, error)
+type diagnosticIPv4Lookup func(context.Context, string) ([]netip.Addr, error)
+
+func newDiagnosticHealthClient(resolverAddress string, dial diagnosticHealthDialer) *http.Client {
+	lookup := newDiagnosticIPv4Lookup(resolverAddress)
+	if dial == nil {
+		dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+		dial = dialer.DialContext
+	}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _ string, address string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				return nil, err
+			}
+			selected, err := resolvePublicDiagnosticIPv4(ctx, host, lookup)
+			if err != nil {
+				return nil, err
+			}
+			return dial(ctx, "tcp4", net.JoinHostPort(selected.String(), port))
+		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
+	return &http.Client{
+		Transport: transport,
+		Timeout:   45 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+func newDiagnosticIPv4Lookup(resolverAddress string) diagnosticIPv4Lookup {
+	if strings.TrimSpace(resolverAddress) == "" {
+		resolverAddress = diagnosticDNSResolverAddress
+	}
+	return func(ctx context.Context, host string) ([]netip.Addr, error) {
+		return lookupDiagnosticIPv4(ctx, resolverAddress, host)
+	}
+}
+
+func lookupDiagnosticIPv4(ctx context.Context, resolverAddress, host string) ([]netip.Addr, error) {
+	queryCtx, cancel := context.WithTimeout(ctx, diagnosticDNSQueryTimeout)
+	defer cancel()
+
+	name, err := dnsmessage.NewName(strings.TrimSuffix(host, ".") + ".")
+	if err != nil {
+		return nil, fmt.Errorf("build diagnostic DNS name: %w", err)
+	}
+	var idBytes [2]byte
+	if _, err := rand.Read(idBytes[:]); err != nil {
+		return nil, fmt.Errorf("create diagnostic DNS request ID: %w", err)
+	}
+	id := binary.BigEndian.Uint16(idBytes[:])
+	question := dnsmessage.Question{Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET}
+	query, err := (&dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: id, RecursionDesired: true},
+		Questions: []dnsmessage.Question{question},
+	}).Pack()
+	if err != nil {
+		return nil, fmt.Errorf("pack diagnostic DNS query: %w", err)
+	}
+
+	response, err := exchangeDiagnosticDNS(queryCtx, "udp", resolverAddress, query)
+	if err != nil {
+		return nil, diagnosticDNSExchangeError(host, err)
+	}
+	header, err := parseDiagnosticDNSHeader(response, id)
+	if err != nil {
+		return nil, diagnosticDNSProtocolError(host, err)
+	}
+	if header.Truncated {
+		response, err = exchangeDiagnosticDNS(queryCtx, "tcp", resolverAddress, query)
+		if err != nil {
+			return nil, diagnosticDNSExchangeError(host, err)
+		}
+		header, err = parseDiagnosticDNSHeader(response, id)
+		if err != nil {
+			return nil, diagnosticDNSProtocolError(host, err)
+		}
+		if header.Truncated {
+			return nil, diagnosticDNSProtocolError(host, errors.New("diagnostic DNS TCP response is truncated"))
+		}
+	}
+	if err := validateDiagnosticDNSWireLength(response); err != nil {
+		return nil, diagnosticDNSProtocolError(host, err)
+	}
+	var message dnsmessage.Message
+	if err := message.Unpack(response); err != nil {
+		return nil, diagnosticDNSProtocolError(host, fmt.Errorf("unpack diagnostic DNS response: %w", err))
+	}
+	if len(message.Questions) != 1 || message.Questions[0].Type != question.Type || message.Questions[0].Class != question.Class ||
+		!strings.EqualFold(message.Questions[0].Name.String(), question.Name.String()) {
+		return nil, diagnosticDNSProtocolError(host, errors.New("diagnostic DNS response question does not match request"))
+	}
+	if message.RCode != dnsmessage.RCodeSuccess {
+		return nil, diagnosticDNSRCodeError(host, message.RCode)
+	}
+
+	addresses, err := diagnosticDNSIPv4Answers(message.Answers, question.Name)
+	if err != nil {
+		return nil, diagnosticDNSProtocolError(host, err)
+	}
+	if len(addresses) == 0 {
+		return nil, &net.DNSError{Err: "IPv4 address is not published", Name: host, IsNotFound: true}
+	}
+	return addresses, nil
+}
+
+func validateDiagnosticDNSWireLength(message []byte) error {
+	const headerBytes = 12
+	if len(message) < headerBytes {
+		return errors.New("diagnostic DNS response is shorter than its header")
+	}
+	offset := headerBytes
+	questions := int(binary.BigEndian.Uint16(message[4:6]))
+	for range questions {
+		var err error
+		offset, err = skipDiagnosticDNSWireName(message, offset)
+		if err != nil {
+			return err
+		}
+		if len(message)-offset < 4 {
+			return errors.New("diagnostic DNS question is truncated")
+		}
+		offset += 4
+	}
+	resources := int(binary.BigEndian.Uint16(message[6:8])) +
+		int(binary.BigEndian.Uint16(message[8:10])) +
+		int(binary.BigEndian.Uint16(message[10:12]))
+	for range resources {
+		var err error
+		offset, err = skipDiagnosticDNSWireName(message, offset)
+		if err != nil {
+			return err
+		}
+		if len(message)-offset < 10 {
+			return errors.New("diagnostic DNS resource header is truncated")
+		}
+		resourceType := dnsmessage.Type(binary.BigEndian.Uint16(message[offset : offset+2]))
+		dataLength := int(binary.BigEndian.Uint16(message[offset+8 : offset+10]))
+		offset += 10
+		if len(message)-offset < dataLength {
+			return errors.New("diagnostic DNS resource data is truncated")
+		}
+		dataEnd := offset + dataLength
+		switch resourceType {
+		case dnsmessage.TypeA:
+			if dataLength != net.IPv4len {
+				return fmt.Errorf("diagnostic DNS A resource data length is %d, want %d", dataLength, net.IPv4len)
+			}
+		case dnsmessage.TypeCNAME:
+			nameEnd, err := skipDiagnosticDNSWireName(message, offset)
+			if err != nil {
+				return err
+			}
+			if nameEnd != dataEnd {
+				return errors.New("diagnostic DNS CNAME resource contains trailing data")
+			}
+		}
+		offset += dataLength
+	}
+	if offset != len(message) {
+		return fmt.Errorf("diagnostic DNS response contains %d trailing bytes", len(message)-offset)
+	}
+	return nil
+}
+
+func skipDiagnosticDNSWireName(message []byte, offset int) (int, error) {
+	for {
+		if offset >= len(message) {
+			return 0, errors.New("diagnostic DNS name is truncated")
+		}
+		length := int(message[offset])
+		switch length & 0xc0 {
+		case 0xc0:
+			if len(message)-offset < 2 {
+				return 0, errors.New("diagnostic DNS name pointer is truncated")
+			}
+			return offset + 2, nil
+		case 0:
+			if length == 0 {
+				return offset + 1, nil
+			}
+			if len(message)-offset-1 < length {
+				return 0, errors.New("diagnostic DNS label is truncated")
+			}
+			offset += 1 + length
+		default:
+			return 0, errors.New("diagnostic DNS name uses a reserved label encoding")
+		}
+	}
+}
+
+func diagnosticDNSIPv4Answers(answers []dnsmessage.Resource, queryName dnsmessage.Name) ([]netip.Addr, error) {
+	aRecords := make(map[string][]netip.Addr)
+	cnames := make(map[string]string)
+	for _, answer := range answers {
+		if answer.Header.Class != dnsmessage.ClassINET {
+			continue
+		}
+		owner := strings.ToLower(answer.Header.Name.String())
+		switch resource := answer.Body.(type) {
+		case *dnsmessage.AResource:
+			address := netip.AddrFrom4(resource.A)
+			if !slices.Contains(aRecords[owner], address) {
+				aRecords[owner] = append(aRecords[owner], address)
+			}
+		case *dnsmessage.CNAMEResource:
+			target := strings.ToLower(resource.CNAME.String())
+			if existing, ok := cnames[owner]; ok && existing != target {
+				return nil, errors.New("diagnostic DNS response contains conflicting CNAME answers")
+			}
+			cnames[owner] = target
+		}
+	}
+
+	current := strings.ToLower(queryName.String())
+	reachable := make(map[string]struct{})
+	var selected []netip.Addr
+	for hops := 0; ; hops++ {
+		if _, seen := reachable[current]; seen {
+			return nil, errors.New("diagnostic DNS response contains a CNAME loop")
+		}
+		reachable[current] = struct{}{}
+		addresses := aRecords[current]
+		target, hasCNAME := cnames[current]
+		if len(addresses) > 0 {
+			if hasCNAME {
+				return nil, errors.New("diagnostic DNS response owner has both A and CNAME answers")
+			}
+			selected = addresses
+			break
+		}
+		if !hasCNAME {
+			break
+		}
+		if hops == maxDiagnosticDNSCNAMEHops {
+			return nil, errors.New("diagnostic DNS response exceeds the CNAME hop limit")
+		}
+		current = target
+	}
+	for owner := range aRecords {
+		if _, ok := reachable[owner]; !ok {
+			return nil, errors.New("diagnostic DNS response contains an unrelated A answer")
+		}
+	}
+	for owner := range cnames {
+		if _, ok := reachable[owner]; !ok {
+			return nil, errors.New("diagnostic DNS response contains an unrelated CNAME answer")
+		}
+	}
+	return selected, nil
+}
+
+func exchangeDiagnosticDNS(ctx context.Context, network, resolverAddress string, query []byte) ([]byte, error) {
+	connection, err := (&net.Dialer{}).DialContext(ctx, network, resolverAddress)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = connection.Close() }()
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := connection.SetDeadline(deadline); err != nil {
+			return nil, err
+		}
+	}
+	stopCancellation := context.AfterFunc(ctx, func() {
+		_ = connection.SetDeadline(time.Now())
+	})
+	defer stopCancellation()
+
+	if network == "udp" {
+		count, err := connection.Write(query)
+		if err != nil {
+			return nil, err
+		}
+		if count != len(query) {
+			return nil, io.ErrShortWrite
+		}
+		response := make([]byte, maxDiagnosticDNSResponseBytes)
+		count, err = connection.Read(response)
+		if err != nil {
+			return nil, err
+		}
+		return response[:count], nil
+	}
+	if network != "tcp" {
+		return nil, fmt.Errorf("unsupported diagnostic DNS network %q", network)
+	}
+	if len(query) > maxDiagnosticDNSResponseBytes {
+		return nil, errors.New("diagnostic DNS query exceeds TCP framing limit")
+	}
+	frame := make([]byte, 2+len(query))
+	binary.BigEndian.PutUint16(frame[:2], uint16(len(query)))
+	copy(frame[2:], query)
+	if _, err := io.Copy(connection, bytes.NewReader(frame)); err != nil {
+		return nil, err
+	}
+	var size [2]byte
+	if _, err := io.ReadFull(connection, size[:]); err != nil {
+		return nil, err
+	}
+	response := make([]byte, int(binary.BigEndian.Uint16(size[:])))
+	if len(response) == 0 {
+		return nil, errors.New("diagnostic DNS TCP response is empty")
+	}
+	if _, err := io.ReadFull(connection, response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func parseDiagnosticDNSHeader(response []byte, id uint16) (dnsmessage.Header, error) {
+	var parser dnsmessage.Parser
+	header, err := parser.Start(response)
+	if err != nil {
+		return dnsmessage.Header{}, fmt.Errorf("parse diagnostic DNS response header: %w", err)
+	}
+	if !header.Response || header.ID != id || header.OpCode != 0 {
+		return dnsmessage.Header{}, errors.New("diagnostic DNS response header does not match request")
+	}
+	return header, nil
+}
+
+func diagnosticDNSExchangeError(host string, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	var networkErr net.Error
+	timedOut := errors.Is(cause, context.DeadlineExceeded) || (errors.As(cause, &networkErr) && networkErr.Timeout())
+	dnsErr := &net.DNSError{
+		Err:         "diagnostic DNS exchange failed",
+		Name:        host,
+		IsTimeout:   timedOut,
+		IsTemporary: true,
+	}
+	return errors.Join(dnsErr, cause)
+}
+
+func diagnosticDNSProtocolError(host string, cause error) error {
+	if cause == nil {
+		return nil
+	}
+	return errors.Join(&net.DNSError{
+		Err:         "invalid diagnostic DNS response",
+		Name:        host,
+		IsTemporary: true,
+	}, cause)
+}
+
+func diagnosticDNSRCodeError(host string, rcode dnsmessage.RCode) error {
+	return &net.DNSError{
+		Err:         "diagnostic DNS response code " + rcode.String(),
+		Name:        host,
+		IsNotFound:  rcode == dnsmessage.RCodeNameError,
+		IsTemporary: rcode == dnsmessage.RCodeServerFailure || rcode == dnsmessage.RCodeRefused,
+	}
+}
+
+func resolvePublicDiagnosticIPv4(ctx context.Context, host string, lookup diagnosticIPv4Lookup) (netip.Addr, error) {
+	if err := ctx.Err(); err != nil {
+		return netip.Addr{}, err
+	}
+	if literal, err := netip.ParseAddr(host); err == nil {
+		literal = literal.Unmap()
+		if !IsPublicDiagnosticIPv4(literal) {
+			return netip.Addr{}, errDiagnosticNonPublicIPv4
+		}
+		return literal, nil
+	}
+	addresses, err := lookup(ctx, host)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return netip.Addr{}, errors.Join(err, ctxErr)
+	}
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	if len(addresses) == 0 {
+		return netip.Addr{}, &net.DNSError{Err: "IPv4 address is not published", Name: host, IsNotFound: true}
+	}
+	var selected netip.Addr
+	for _, address := range addresses {
+		address = address.Unmap()
+		if !IsPublicDiagnosticIPv4(address) {
+			return netip.Addr{}, errDiagnosticNonPublicIPv4
+		}
+		if !selected.IsValid() {
+			selected = address
+		}
+	}
+	return selected, nil
+}
+
+// IsPublicDiagnosticIPv4 reports whether address is a routable IPv4 diagnostic target.
+func IsPublicDiagnosticIPv4(address netip.Addr) bool {
+	address = address.Unmap()
+	if !address.Is4() || !address.IsGlobalUnicast() || address.IsPrivate() || address.IsLoopback() || address.IsLinkLocalUnicast() {
+		return false
+	}
+	for _, prefix := range []netip.Prefix{
+		netip.MustParsePrefix("0.0.0.0/8"),
+		netip.MustParsePrefix("100.64.0.0/10"),
+		netip.MustParsePrefix("192.0.0.0/24"),
+		netip.MustParsePrefix("192.0.2.0/24"),
+		netip.MustParsePrefix("192.88.99.0/24"),
+		netip.MustParsePrefix("198.18.0.0/15"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+		netip.MustParsePrefix("203.0.113.0/24"),
+		netip.MustParsePrefix("240.0.0.0/4"),
+	} {
+		if prefix.Contains(address) {
+			return false
+		}
+	}
+	return true
+}
+
+func resolveManagedDirectChromeResolverRule(
+	ctx context.Context,
+	target string,
+	lookup diagnosticIPv4Lookup,
+	retryWindow, retryInterval time.Duration,
+) (string, error) {
+	parsed, err := url.Parse(target)
+	if err != nil || parsed.Hostname() == "" {
+		return "", errors.New("managed direct Chrome target is invalid")
+	}
+	if lookup == nil {
+		return "", errors.New("managed direct Chrome DNS resolver is unavailable")
+	}
+	if retryWindow <= 0 || retryInterval <= 0 {
+		return "", errors.New("managed direct Chrome DNS retry bounds must be positive")
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	retryCtx, cancel := context.WithTimeout(ctx, retryWindow)
+	defer cancel()
+	var lastErr error
+	for {
+		selected, lookupErr := resolvePublicDiagnosticIPv4(retryCtx, host, lookup)
+		if ctxErr := retryCtx.Err(); ctxErr != nil {
+			return "", errors.Join(lookupErr, ctxErr)
+		}
+		if lookupErr == nil {
+			return "MAP " + host + " " + selected.String(), nil
+		}
+		lastErr = lookupErr
+		if errors.Is(lookupErr, errDiagnosticNonPublicIPv4) || !retryableDiagnosticIPv4LookupError(lookupErr) {
+			return "", lookupErr
+		}
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-retryCtx.Done():
+			timer.Stop()
+			return "", errors.Join(lastErr, retryCtx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func retryableDiagnosticIPv4LookupError(err error) bool {
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && (dnsErr.IsNotFound || dnsErr.IsTimeout || dnsErr.IsTemporary)
 }
 
 const headedContainerScript = `set -eu
@@ -1361,36 +2069,79 @@ set -e
 child_pid=
 exit "$status"`
 
-func directChromeContainerArgs(image, target, hostProfile string) []string {
+func directChromeContainerArgs(image, target, hostProfile string, managedTunnel bool, resolverRule string) []string {
 	name := "product-capture-direct-" + mustRandomSuffix()
-	return []string{
+	args := []string{
 		"run", "--rm", "--platform", "linux/amd64", "--name", name,
+	}
+	args = append(args, quickTunnelDNSArgs(target, managedTunnel)...)
+	args = append(args,
 		"-e", "PRODUCT_CAPTURE_XVFB_READY_TIMEOUT=10",
 		"-e", "PRODUCT_CAPTURE_CHILD_STOP_TIMEOUT=10",
-		"-v", hostProfile + ":/tmp/conformance-profile",
+		"-v", hostProfile+":/tmp/conformance-profile",
 		"--entrypoint", "/bin/sh", image,
 		"-c", headedContainerScript, "--", "google-chrome",
 		"--user-data-dir=/tmp/conformance-profile",
 		"--window-size=1920,1080",
 		"--no-first-run", "--no-default-browser-check",
 		"--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage",
-		target,
+	)
+	if resolverRule != "" {
+		args = append(args, "--host-resolver-rules="+resolverRule)
 	}
+	return append(args, target)
 }
 
-func attachedProviderContainerArgs(image, target string) []string {
+func attachedProviderContainerArgs(image, target string, managedTunnel bool) []string {
 	parsed, _ := url.Parse(target)
 	origin := parsed.Scheme + "://" + parsed.Host
-	return []string{
+	args := []string{
 		"run", "--rm", "--platform", "linux/amd64", "--name", "product-capture-attached-" + mustRandomSuffix(),
+	}
+	dnsArgs := quickTunnelDNSArgs(target, managedTunnel)
+	args = append(args, dnsArgs...)
+	args = append(args,
 		"-e", "PRODUCT_CAPTURE_BROWSER_HEADLESS=false",
-		"-e", "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS=" + origin,
+		"-e", "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS="+origin,
 		"--entrypoint", "/usr/local/bin/product-capture-provider", image,
 		"--browser-diagnostic-url", target,
+	)
+	if len(dnsArgs) > 0 {
+		args = append(args, "--browser-diagnostic-require-ipv4")
 	}
+	return args
 }
 
-func launchDirectChrome(ctx context.Context, image, target string) error {
+func quickTunnelDNSArgs(target string, managedTunnel bool) []string {
+	if !managedTunnel {
+		return nil
+	}
+	parsed, err := url.Parse(target)
+	if err != nil {
+		return nil
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if host != "trycloudflare.com" && !strings.HasSuffix(host, ".trycloudflare.com") {
+		return nil
+	}
+	return []string{"--dns", diagnosticDNSResolverIP}
+}
+
+func launchDirectChrome(ctx context.Context, image, target string, managedTunnel bool) error {
+	resolverRule := ""
+	if len(quickTunnelDNSArgs(target, managedTunnel)) > 0 {
+		var err error
+		resolverRule, err = resolveManagedDirectChromeResolverRule(
+			ctx,
+			target,
+			newDiagnosticIPv4Lookup(diagnosticDNSResolverAddress),
+			managedDirectDNSRetryWindow,
+			managedDirectDNSRetryInterval,
+		)
+		if err != nil {
+			return fmt.Errorf("resolve managed direct Chrome target: %w", err)
+		}
+	}
 	profile, err := os.MkdirTemp("", "product-capture-conformance-profile-*")
 	if err != nil {
 		return err
@@ -1399,14 +2150,14 @@ func launchDirectChrome(ctx context.Context, image, target string) error {
 	if err := os.Chmod(profile, 0o777); err != nil {
 		return err
 	}
-	args := directChromeContainerArgs(image, target, profile)
+	args := directChromeContainerArgs(image, target, profile, managedTunnel, resolverRule)
 	name := containerName(args)
 	runErr := runManagedContainer(ctx, name, args, nil)
 	return errors.Join(runErr, cleanupEphemeralProfile(profile))
 }
 
-func launchAttachedProvider(ctx context.Context, image, target string) error {
-	args := attachedProviderContainerArgs(image, target)
+func launchAttachedProvider(ctx context.Context, image, target string, managedTunnel bool) error {
+	args := attachedProviderContainerArgs(image, target, managedTunnel)
 	return runManagedContainer(ctx, containerName(args), args, nil)
 }
 
@@ -1509,7 +2260,7 @@ func cleanupEphemeralProfile(profile string) error {
 	return errors.Join(os.RemoveAll(profile), assertNoProfileLocks(profile))
 }
 
-func validateCandidateLifecycle(ctx context.Context, image, origin string) error {
+func validateCandidateLifecycle(ctx context.Context, image, origin string, managedTunnel bool) error {
 	scenarios := []struct {
 		name   string
 		target string
@@ -1521,15 +2272,15 @@ func validateCandidateLifecycle(ctx context.Context, image, origin string) error
 		{name: "sigterm", target: origin + "/lifecycle-hang", delay: 750 * time.Millisecond, signal: "SIGTERM"},
 	}
 	for _, scenario := range scenarios {
-		if err := runLifecycleScenario(ctx, image, scenario.target, scenario.delay, scenario.signal); err != nil {
+		if err := runLifecycleScenario(ctx, image, scenario.target, scenario.delay, scenario.signal, managedTunnel); err != nil {
 			return fmt.Errorf("%s lifecycle: %w", scenario.name, err)
 		}
 	}
 	return nil
 }
 
-func runLifecycleScenario(ctx context.Context, image, target string, delay time.Duration, signal string) error {
-	args := attachedProviderContainerArgs(image, target)
+func runLifecycleScenario(ctx context.Context, image, target string, delay time.Duration, signal string, managedTunnel bool) error {
+	args := attachedProviderContainerArgs(image, target, managedTunnel)
 	name := containerName(args)
 	cmd := exec.Command("docker", args...)
 	var output boundedWriter

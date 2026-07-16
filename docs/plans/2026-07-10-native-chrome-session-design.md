@@ -687,7 +687,7 @@ The candidate conformance attached leg now runs the provider without `DISPLAY`,
 forcing its managed-Xvfb path; the exact local image passed direct-versus-attached
 comparison and all lifecycle scenarios with no residual container. The accepted
 exit-code-1 staging receipt is diagnostic evidence only: Task 4 remains open
-until the immutable `v0.1.63` digest returns an accepted successful staging proof.
+until the immutable `v0.1.64` digest returns an accepted successful staging proof.
 
 ### Backport 2026-07-14: Dual-stack diagnostic pin selection
 
@@ -728,6 +728,92 @@ width/height, and inner width with the existing 2 px tolerance. Preserve
 promotion when only that value differs. Do not suppress Chrome security UI,
 patch Chromium, or add identity overrides. The corrected unpublished runtime
 advances to `v0.1.63`; `v0.1.62` is not repointed.
+
+Scope: no locked Scope Manifest change; Tasks 3-4 retain the same diagnostic,
+release-conformance, and staging-proof boundaries.
+
+### Backport 2026-07-15: IPv4 candidate tunnel readiness
+
+Cause: release run `29383045309` created and registered a healthy Quick Tunnel,
+then started candidate lifecycle validation while DNS exposed only its AAAA
+record to the IPv4-only Docker runtime. The runner health check succeeded over
+its default address family, but the provider correctly pinned the only public
+answer it could see and Chrome returned `ERR_ADDRESS_UNREACHABLE`. The existing
+DNS retry handled lookup errors, not a successful partial-family publication.
+A local count-only probe then saw two A records through Cloudflare's public
+resolver after five seconds while the host resolver still exposed none after
+thirty seconds; three automatic host-resolver attempts each exhausted their
+two-minute health window.
+
+Change: auto-managed Quick Tunnel runs use a dedicated health client that
+performs bounded DNS-wire A queries against Cloudflare's public `1.1.1.1:53`
+service, bypasses local hosts-file policy, and retries truncated UDP responses
+over DNS TCP. It accepts A records only for the queried name or a bounded,
+loop-free CNAME chain and rejects unrelated answer owners. It connects directly
+to a public, validated A record over `tcp4`
+while retaining the original host for TLS verification. Direct and attached candidate containers use the same
+resolver only when their diagnostic target is an auto-managed
+`trycloudflare.com` origin. Direct Chrome performs its own bounded A lookup and
+receives a validated `--host-resolver-rules` pin; attached and lifecycle
+providers use the explicit IPv4 policy. Explicit operator-owned origins retain
+the normal HTTP transport, resolver, and temporary request-error retry behavior
+without a Docker DNS override. The bounded health retry therefore does not
+declare a managed tunnel ready until an A record is published and reachable
+through the same DNS view used by candidate participants; a resolver outage is
+reported as a fixed redacted error instead of rotating healthy tunnels. Managed
+health and cleanup classifications retain their unwrap causes behind fixed
+redacted messages. Malformed, mismatched, persistently truncated,
+valid-prefix-with-trailing-data, or over-declared A/CNAME RDATA responses retain
+their protocol cause and use the same retryable resolver classification as
+transport failures. Managed
+health retries those failures against the same tunnel; resolver or A-publication
+exhaustion returns the fixed resolver-unavailable classification and does not
+rotate the tunnel. The managed health client builds a fresh transport instead
+of cloning mutable process-global proxy, dial, or TLS policy.
+
+Two subsequent exact local runs disproved the assumption that one successful
+health resolution guarantees all later candidate resolutions: health,
+lifecycle, and direct navigation succeeded, but the final attached provider
+twice received a fresh successful AAAA-only answer and pinned IPv6. Managed
+attached diagnostics now pass an explicit conformance-only
+`--browser-diagnostic-require-ipv4` flag. The provider retries successful
+AAAA-only answers within its existing bounded DNS window and pins only after
+IPv4 appears. Explicit origins and generic provider diagnostics do not pass
+this flag, so their IPv6-only behavior remains unchanged. Direct and provider
+lookups, plus managed health correlation, reject successful results returned
+after cancellation or deadline.
+TLS host verification and public-address validation remain fail-closed.
+Managed provider and candidate failures redact the exact target and hostname
+while retaining wrapped causes for classification. The corrected unpublished
+runtime advances to `v0.1.64`; `v0.1.63` is not repointed.
+
+Harness invariant: a fake DNS server that needs the same numeric UDP and TCP
+port must retry a TCP `EADDRINUSE` collision with a fresh UDP allocation and
+close every abandoned listener; accepted TCP connections must also be closed
+before cleanup waits for serving goroutines.
+
+Managed health invariant: the dedicated client never follows redirects, so a
+run-correlated URL cannot leave through `Referer`. One response classifier
+reads at most 4 KiB plus one overflow-detection byte and closes every status.
+It rejects overflow and any malformed trailing JSON, and retains every observed
+read/close cause behind a fixed managed classification for successful,
+nonretryable, and transient responses. A non-public managed DNS answer is a
+terminal fail-closed rejection: clean up that tunnel once without retrying the
+health request or rotating to another tunnel. Cancellation before or during
+body consumption also retains its context and causes. Managed origin redaction
+matches URL, hostname, path, and standalone run identifier case-insensitively
+and fails closed for invalid pattern text in both conformance and provider
+boundaries. Ownership tests do not use short real-clock deadlines, and the TLS
+pin test trusts a hostname certificate while independently asserting the public
+IPv4 dial address and original-host SNI.
+
+Runtime receipt: two consecutive exact-source conformance launches on 2026-07-16
+used candidate image
+`sha256:4836b1e159da8c8c3e2915440d61e56248f56780c96c09f4b5ef6660d8ec118d`.
+Each fresh Quick Tunnel run returned schema `v1`, verdict `pass`, Chrome
+`150.0.7871.124`, Playwright `1.57.0`, Xvfb `2:21.1.7-3+deb12u12`, 23 stable
+comparisons, zero mismatches, and eight informational fields. Both runs removed
+their candidate containers and tunnel processes.
 
 Scope: no locked Scope Manifest change; Tasks 3-4 retain the same diagnostic,
 release-conformance, and staging-proof boundaries.
