@@ -276,6 +276,79 @@ height as informational evidence. Do not suppress browser security UI or add
 identity overrides. Advance the unpublished correction to `v0.1.63` without
 repointing `v0.1.62`. This does not change the Scope Manifest.
 
+**Execution backport 2026-07-15 (IPv4 readiness):** release run
+`29383045309` reached a healthy Quick Tunnel before its A record was visible to
+the IPv4-only candidate container, so lifecycle navigation pinned the then-only
+AAAA answer and failed with `ERR_ADDRESS_UNREACHABLE`. A count-only local probe
+then found two A records through `1.1.1.1` after five seconds while the system
+resolver still found none after thirty seconds. For auto-managed Quick Tunnel
+runs, use a dedicated conformance health client that resolves through
+bounded DNS-wire A queries to `1.1.1.1:53`, bypasses local hosts-file policy,
+falls back to DNS TCP for truncated UDP responses, rejects non-public answers,
+accepts A records only for the query owner or a bounded loop-free CNAME chain,
+rejects valid declared DNS messages followed by trailing wire bytes,
+rejects A/CNAME records whose declared RDATA contains unconsumed bytes,
+pins a validated A record, and dials the origin directly over `tcp4` while
+retaining the original TLS host; give
+direct and attached candidate containers the same Docker DNS resolver only for
+`trycloudflare.com` targets. Direct Chrome also waits for and pins its own
+validated A answer. Explicit operator-owned origins retain their normal
+transport, resolver, and temporary request-error retry behavior. The bounded
+health retry then waits for candidate-reachable DNS before lifecycle validation
+and reports resolver outages as a fixed redacted error without rotating healthy
+tunnels. Classify malformed, mismatched, and persistently truncated DNS
+responses as retryable resolver failures while preserving their protocol cause.
+Retry those failures against the same managed tunnel, and on exhaustion return
+the fixed resolver-unavailable classification without rotating the tunnel.
+Apply the same terminal classification to exhausted A-record publication.
+Preserve managed health and cleanup causes behind fixed redacted messages,
+reject lookup or health-correlation success after cancellation or deadline,
+and preserve TLS
+verification with a fresh transport independent of process-global proxy, dial,
+or TLS hooks;
+preserve provider public-IP validation/pinning and generic provider IPv6-only
+behavior. Advance the unpublished correction to `v0.1.64` without repointing
+`v0.1.63`. This does not change the Scope Manifest.
+
+**Execution backport 2026-07-15 (per-participant IPv4 readiness):** two exact
+local auto-tunnel runs passed health, lifecycle, and direct navigation, then the
+final attached provider received a fresh successful AAAA-only answer and failed
+with `ERR_ADDRESS_UNREACHABLE`. A single readiness lookup cannot guarantee a
+later independent lookup sees the same record family. For auto-managed
+`trycloudflare.com` targets only, pass
+`--browser-diagnostic-require-ipv4` to attached/lifecycle candidates and make
+the provider retry successful AAAA-only answers within its existing bounded
+DNS window before pinning Chrome. Explicit origins and generic provider
+diagnostics do not pass the flag, preserving normal IPv6-only behavior. This
+policy also redacts exact managed targets and hostnames from provider and
+candidate failure text while preserving wrapped error causes. This does not
+change the Scope Manifest or release target.
+
+**Execution backport 2026-07-15 (managed health response boundary):** the
+dedicated managed health client rejects redirects without issuing a second
+request, preventing run-correlated URL disclosure through `Referer`. A single
+classifier reads at most 4 KiB plus one overflow-detection byte and closes every
+response status. It rejects oversized bodies and malformed trailing JSON while
+preserving every observed read and close cause behind the fixed managed
+classification for valid, rejected, and transient responses; cancellation adds
+its context without exposing those causes. A non-public managed DNS answer is
+terminal after one tunnel cleanup, with no health retry or tunnel rotation.
+Managed origin redaction is case-insensitive and fails closed on invalid pattern
+text in both conformance and provider paths, covering the full URL, host, path,
+and standalone run identifier. Explicit operator clients retain their normal
+redirect policy and error text. The ownership proof no longer uses an unrelated
+short wall-clock deadline, and a trusted-certificate test proves that the public
+IPv4 dial pin retains original-host SNI and TLS verification. This does not
+change the Scope Manifest or release target.
+
+**Execution receipt 2026-07-16:** two consecutive exact-source launches against
+candidate image
+`sha256:4836b1e159da8c8c3e2915440d61e56248f56780c96c09f4b5ef6660d8ec118d`
+each used a fresh Quick Tunnel and returned schema `v1`, verdict `pass`, Chrome
+`150.0.7871.124`, Playwright `1.57.0`, Xvfb `2:21.1.7-3+deb12u12`, 23 stable
+comparisons, zero mismatches, and no residual candidate container or tunnel
+process.
+
 **Step 3: Add exact candidate runtime launch checks**
 
 Set image `PRODUCT_CAPTURE_BROWSER_HEADLESS=false`. Build one amd64 image with

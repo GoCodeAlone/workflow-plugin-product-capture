@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strings"
@@ -59,6 +60,14 @@ type browserDiagnosticTarget struct {
 	allowedOrigin string
 	resolverRules string
 }
+
+type redactedBrowserDiagnosticError struct {
+	cause   error
+	message string
+}
+
+func (e redactedBrowserDiagnosticError) Error() string { return e.message }
+func (e redactedBrowserDiagnosticError) Unwrap() error { return e.cause }
 
 var browserProcesses browserProcessPolicy = newBrowserProcessPolicy()
 var browserCommandCleanupStates sync.Map
@@ -162,14 +171,25 @@ func WriteProbe(w io.Writer) error {
 	return enc.Encode(resp)
 }
 
+type browserDiagnosticRunner func(string, io.Writer, bool) error
+
 func Main(args []string, stdout, stderr io.Writer, stdin ...io.Reader) int {
+	return mainWithBrowserDiagnosticRunner(args, stdout, stderr, runBrowserDiagnosticWithPolicy, stdin...)
+}
+
+func mainWithBrowserDiagnosticRunner(args []string, stdout, stderr io.Writer, runDiagnostic browserDiagnosticRunner, stdin ...io.Reader) int {
 	fs := flag.NewFlagSet("product-capture-provider", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	requestPath := fs.String("request", "", "path to product capture request JSON")
 	outputPath := fs.String("output", "", "path to write product snapshot JSON")
 	probe := fs.Bool("probe", false, "print provider capability probe")
 	browserDiagnosticURL := fs.String("browser-diagnostic-url", "", "operator-only URL for browser fingerprint diagnostics")
+	browserDiagnosticRequireIPv4 := fs.Bool("browser-diagnostic-require-ipv4", false, "require IPv4 publication for this browser diagnostic")
 	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+	if *browserDiagnosticRequireIPv4 && *browserDiagnosticURL == "" {
+		_, _ = fmt.Fprintln(stderr, "--browser-diagnostic-require-ipv4 requires --browser-diagnostic-url")
 		return 2
 	}
 	if *browserDiagnosticURL != "" {
@@ -177,7 +197,7 @@ func Main(args []string, stdout, stderr io.Writer, stdin ...io.Reader) int {
 			fmt.Fprintln(stderr, "--browser-diagnostic-url cannot be combined with --probe, --request, or --output")
 			return 2
 		}
-		if err := runBrowserDiagnostic(*browserDiagnosticURL, stdout); err != nil {
+		if err := runDiagnostic(*browserDiagnosticURL, stdout, *browserDiagnosticRequireIPv4); err != nil {
 			fmt.Fprintf(stderr, "browser diagnostic: %v\n", err)
 			return 1
 		}
@@ -727,16 +747,27 @@ func writeBrowserCaptureScript() (string, error) {
 }
 
 func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
+	return runBrowserDiagnosticWithPolicy(rawURL, stdout, false)
+}
+
+func runBrowserDiagnosticWithPolicy(rawURL string, stdout io.Writer, requireIPv4 bool) (runErr error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	allowedOrigins := os.Getenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS")
+	if requireIPv4 {
+		defer func() {
+			runErr = redactBrowserDiagnosticError(runErr, rawURL, allowedOrigins)
+		}()
+	}
 	if err := browserDisplayPreflight(runtime.GOOS, browserHeadlessEnabled(), strings.TrimSpace(os.Getenv("DISPLAY")), exec.LookPath); err != nil {
 		return err
 	}
-	target, err := resolveBrowserDiagnosticTarget(
+	target, err := resolveBrowserDiagnosticTargetWithPolicy(
 		ctx,
 		rawURL,
-		os.Getenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS"),
+		allowedOrigins,
 		net.DefaultResolver.LookupIPAddr,
+		requireIPv4,
 	)
 	if err != nil {
 		return err
@@ -836,6 +867,20 @@ func runBoundedBrowserCleanupCommand(timeout time.Duration, name string, args ..
 }
 
 func resolveBrowserDiagnosticTarget(ctx context.Context, rawURL, allowedOrigins string, lookup browserDiagnosticLookup) (browserDiagnosticTarget, error) {
+	return resolveBrowserDiagnosticTargetWithPolicy(ctx, rawURL, allowedOrigins, lookup, false)
+}
+
+func resolveBrowserDiagnosticTargetWithPolicy(
+	ctx context.Context,
+	rawURL, allowedOrigins string,
+	lookup browserDiagnosticLookup,
+	requireIPv4 bool,
+) (target browserDiagnosticTarget, resolveErr error) {
+	if requireIPv4 {
+		defer func() {
+			resolveErr = redactBrowserDiagnosticError(resolveErr, rawURL, allowedOrigins)
+		}()
+	}
 	if utf8.RuneCountInString(rawURL) > 2048 {
 		return browserDiagnosticTarget{}, errors.New("browser diagnostic URL exceeds 2048 characters")
 	}
@@ -874,10 +919,16 @@ func resolveBrowserDiagnosticTarget(ctx context.Context, rawURL, allowedOrigins 
 	host := canonicalHost(allowed.Hostname())
 	addresses := []net.IPAddr(nil)
 	if literal := net.ParseIP(host); literal != nil {
+		if requireIPv4 && literal.To4() == nil {
+			return browserDiagnosticTarget{}, errors.New("browser diagnostic policy requires IPv4; IPv6 literal targets are unsupported")
+		}
 		addresses = []net.IPAddr{{IP: literal}}
 	} else {
 		if lookup == nil {
 			return browserDiagnosticTarget{}, errors.New("browser diagnostic DNS resolver is unavailable")
+		}
+		if requireIPv4 {
+			lookup = requireIPv4BrowserDiagnosticLookup(lookup)
 		}
 		addresses, err = lookupBrowserDiagnosticAddresses(
 			ctx,
@@ -912,6 +963,72 @@ func resolveBrowserDiagnosticTarget(ctx context.Context, rawURL, allowedOrigins 
 		allowedOrigin: browserURLOrigin(allowed),
 		resolverRules: "MAP " + host + " " + resolverAddress,
 	}, nil
+}
+
+func redactBrowserDiagnosticError(err error, values ...string) error {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		secrets := browserDiagnosticRedactionSecrets(value)
+		for _, secret := range secrets {
+			if secret != "" {
+				message = replaceBrowserDiagnosticValue(message, secret)
+			}
+		}
+	}
+	return redactedBrowserDiagnosticError{cause: err, message: message}
+}
+
+func browserDiagnosticRedactionSecrets(value string) []string {
+	secrets := []string{value}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return secrets
+	}
+	secrets = append(secrets, parsed.Host, parsed.Hostname())
+	if parsed.Path != "" && parsed.Path != "/" {
+		secrets = append(secrets, parsed.Path)
+	}
+	if escapedPath := parsed.EscapedPath(); escapedPath != "" && escapedPath != "/" && escapedPath != parsed.Path {
+		secrets = append(secrets, escapedPath)
+	}
+	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
+	for index := 0; index+1 < len(segments); index++ {
+		if strings.EqualFold(segments[index], "runs") && segments[index+1] != "" {
+			secrets = append(secrets, segments[index+1])
+			break
+		}
+	}
+	return secrets
+}
+
+func replaceBrowserDiagnosticValue(message, secret string) string {
+	pattern, err := regexp.Compile(`(?i)` + regexp.QuoteMeta(secret))
+	if err != nil {
+		return "<managed-diagnostic-origin>"
+	}
+	return pattern.ReplaceAllLiteralString(message, "<managed-diagnostic-origin>")
+}
+
+func requireIPv4BrowserDiagnosticLookup(lookup browserDiagnosticLookup) browserDiagnosticLookup {
+	return func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		addresses, err := lookup(ctx, host)
+		if err != nil {
+			return nil, err
+		}
+		for _, address := range addresses {
+			if address.IP.To4() != nil {
+				return addresses, nil
+			}
+		}
+		return nil, &net.DNSError{Err: "IPv4 address is not published", Name: host, IsNotFound: true}
+	}
 }
 
 func lookupBrowserDiagnosticAddresses(

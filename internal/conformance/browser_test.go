@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +17,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/http/httputil"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -25,8 +29,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 func TestCompareBrowserObservationsClassifiesSchemaV1Fields(t *testing.T) {
@@ -405,12 +414,13 @@ func TestRunnerRejectsUncorrelatedTunnelEndpointAndCleansUp(t *testing.T) {
 
 	tunnel := &fakeTunnel{origin: wrongEndpoint.URL}
 	runner := Runner{Dependencies: Dependencies{
-		Tunnel:     tunnel,
-		HTTPClient: wrongEndpoint.Client(),
-		LaunchDirect: func(context.Context, string, string) error {
+		Tunnel:           tunnel,
+		HTTPClient:       wrongEndpoint.Client(),
+		TunnelHTTPClient: wrongEndpoint.Client(),
+		LaunchDirect: func(context.Context, string, string, bool) error {
 			return errors.New("direct launch must not run before health correlation")
 		},
-		LaunchAttached: func(context.Context, string, string) error {
+		LaunchAttached: func(context.Context, string, string, bool) error {
 			return errors.New("attached launch must not run before health correlation")
 		},
 	}}
@@ -432,7 +442,8 @@ func TestRunnerPropagatesUnexpectedDiagnosticServerFailure(t *testing.T) {
 		Listen: func(string, string) (net.Listener, error) {
 			return &failingListener{err: serveErr}, nil
 		},
-		Tunnel: contextCancellationTunnel{},
+		Tunnel:           contextCancellationTunnel{},
+		TunnelHTTPClient: &http.Client{Timeout: time.Second},
 	}}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -446,26 +457,1041 @@ func TestRunnerPropagatesUnexpectedDiagnosticServerFailure(t *testing.T) {
 }
 
 func TestFetchRunHealthRetriesTransientDNSBeforeAcceptingCorrelation(t *testing.T) {
-	calls := 0
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if calls < 3 {
+				return nil, &net.DNSError{Err: "no such host", Name: request.URL.Hostname(), IsNotFound: true}
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"run-123"}`)),
+				Request:    request,
+			}, nil
+		})}
+		started := time.Now()
+		if err := fetchRunHealth(context.Background(), client, "https://diagnostic.example/runs/run-123/healthz", "run-123", time.Millisecond, true, waitForDiagnosticHealthRetry); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 3 {
+			t.Fatalf("health calls = %d, want 3", calls)
+		}
+		if elapsed := time.Since(started); elapsed != 2*time.Millisecond {
+			t.Fatalf("managed publication retry elapsed = %s, want %s", elapsed, 2*time.Millisecond)
+		}
+	})
+}
+
+func TestFetchRunHealthRetriesTemporaryDNSForOperatorOrigin(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return nil, &net.DNSError{Err: "temporary failure", Name: request.URL.Hostname(), IsTemporary: true}
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"run-123"}`)),
+				Request:    request,
+			}, nil
+		})}
+		started := time.Now()
+		if err := fetchRunHealth(context.Background(), client, "https://operator.example/runs/run-123/healthz", "run-123", time.Millisecond, false, waitForDiagnosticHealthRetry); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 2 {
+			t.Fatalf("operator health calls = %d, want temporary DNS retry followed by success", calls)
+		}
+		if elapsed := time.Since(started); elapsed != time.Millisecond {
+			t.Fatalf("operator health retry elapsed = %s, want %s", elapsed, time.Millisecond)
+		}
+	})
+}
+
+func TestFetchRunHealthPreservesOperatorTransportCauseOnExhaustion(t *testing.T) {
+	cause := errors.New("operator transport cause")
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		calls++
-		if calls < 3 {
-			return nil, &net.DNSError{Err: "no such host", Name: request.URL.Hostname(), IsNotFound: true}
+		return nil, errors.Join(
+			&net.DNSError{Err: "temporary failure", Name: request.URL.Hostname(), IsTemporary: true},
+			cause,
+		)
+	})}
+	stopErr := errors.New("stop after operator health retry")
+	err := fetchRunHealth(
+		context.Background(),
+		client,
+		"https://operator.example/runs/run-123/healthz",
+		"run-123",
+		time.Millisecond,
+		false,
+		func(context.Context, time.Duration) error { return stopErr },
+	)
+	if !errors.Is(err, errDiagnosticHealthEndpointUnreachable) || !errors.Is(err, cause) || !errors.Is(err, stopErr) {
+		t.Fatalf("operator health error = %v, want endpoint classification, transport cause, and retry-stop cause", err)
+	}
+}
+
+func TestFetchRunHealthRetriesTemporaryDNSForManagedOrigin(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		cause := errors.New("temporary resolver cause")
+		client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			if calls == 1 {
+				return nil, errors.Join(&net.DNSError{Err: "temporary failure", Name: request.URL.Hostname(), IsTemporary: true}, cause)
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"run-123"}`)),
+				Request:    request,
+			}, nil
+		})}
+		started := time.Now()
+		if err := fetchRunHealth(context.Background(), client, "https://managed.example/runs/run-123/healthz", "run-123", time.Millisecond, true, waitForDiagnosticHealthRetry); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 2 {
+			t.Fatalf("managed health calls = %d, want temporary DNS retry followed by success", calls)
+		}
+		if elapsed := time.Since(started); elapsed != time.Millisecond {
+			t.Fatalf("managed resolver retry elapsed = %s, want %s", elapsed, time.Millisecond)
+		}
+	})
+}
+
+func TestFetchRunHealthClassifiesExhaustedTemporaryDNS(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		cause := errors.New("temporary resolver cause")
+		client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			return nil, errors.Join(&net.DNSError{Err: "temporary failure", Name: request.URL.Hostname(), IsTemporary: true}, cause)
+		})}
+		const timeout = 2500 * time.Microsecond
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		started := time.Now()
+		err := fetchRunHealth(ctx, client, "https://managed.example/runs/run-123/healthz", "run-123", time.Millisecond, true, waitForDiagnosticHealthRetry)
+		if !errors.Is(err, errDiagnosticDNSResolverUnavailable) || !errors.Is(err, cause) || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("managed health error = %v, want resolver classification, cause, and deadline", err)
+		}
+		if calls != 3 {
+			t.Fatalf("managed health calls = %d, want three attempts before deadline", calls)
+		}
+		if elapsed := time.Since(started); elapsed != timeout {
+			t.Fatalf("managed resolver exhaustion elapsed = %s, want %s", elapsed, timeout)
+		}
+	})
+}
+
+func TestDiagnosticHealthClientDialsOriginOverIPv4(t *testing.T) {
+	var dialNetwork, dialAddress string
+	dialErr := errors.New("stop after observing diagnostic health dial")
+	client := newDiagnosticHealthClient(diagnosticDNSResolverAddress, func(_ context.Context, network, address string) (net.Conn, error) {
+		dialNetwork = network
+		dialAddress = address
+		return nil, dialErr
+	})
+
+	request, err := http.NewRequest(http.MethodGet, "https://93.184.216.34/healthz", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Do(request)
+	if !errors.Is(err, dialErr) {
+		t.Fatalf("diagnostic health request error = %v, want dial sentinel", err)
+	}
+	if dialNetwork != "tcp4" || dialAddress != "93.184.216.34:443" {
+		t.Fatalf("diagnostic health dial = %q %q, want tcp4 origin", dialNetwork, dialAddress)
+	}
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport.Proxy != nil {
+		t.Fatalf("diagnostic health transport = %#v, want direct transport without proxy", client.Transport)
+	}
+}
+
+func TestDiagnosticHealthClientRejectsPrivateResolutionBeforeDial(t *testing.T) {
+	dnsServer := startTestDNSServer(t, testDNSBehavior{expectedName: "diagnostic.example.", publishAOn: 1})
+	dialCalls := 0
+	client := newDiagnosticHealthClient(dnsServer.address, func(context.Context, string, string) (net.Conn, error) {
+		dialCalls++
+		return nil, errors.New("private address reached final dialer")
+	})
+	request, err := http.NewRequest(http.MethodGet, "http://diagnostic.example.:8080/healthz", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.Do(request)
+	if err == nil || !strings.Contains(err.Error(), "non-public") {
+		t.Fatalf("diagnostic health error = %v, want non-public address rejection", err)
+	}
+	if dialCalls != 0 {
+		t.Fatalf("final origin dial calls = %d, want private address rejected before dialing", dialCalls)
+	}
+}
+
+func TestDiagnosticIPv4LookupBypassesHostsFile(t *testing.T) {
+	dnsServer := startTestDNSServer(t, testDNSBehavior{
+		expectedName: "localhost.",
+		publishAOn:   1,
+		aRecord:      [4]byte{93, 184, 216, 34},
+	})
+
+	addresses, err := newDiagnosticIPv4Lookup(dnsServer.address)(context.Background(), "localhost")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []netip.Addr{netip.MustParseAddr("93.184.216.34")}
+	if !slices.Equal(addresses, want) {
+		t.Fatalf("diagnostic IPv4 addresses = %v, want configured-DNS answer %v", addresses, want)
+	}
+	if events := dnsServer.Events(); !slices.Contains(events, "A-published") {
+		t.Fatalf("DNS events = %v, want configured resolver query", events)
+	}
+}
+
+func TestDiagnosticIPv4LookupFallsBackToTCPAfterTruncatedUDPResponse(t *testing.T) {
+	dnsServer := startTruncatedTestDNSServer(t, "diagnostic.example.", [4]byte{93, 184, 216, 34})
+
+	addresses, err := newDiagnosticIPv4Lookup(dnsServer.address)(context.Background(), "diagnostic.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []netip.Addr{netip.MustParseAddr("93.184.216.34")}
+	if !slices.Equal(addresses, want) {
+		t.Fatalf("diagnostic IPv4 addresses = %v, want TCP answer %v", addresses, want)
+	}
+	if got := dnsServer.udpQueries.Load(); got != 1 {
+		t.Fatalf("UDP DNS queries = %d, want 1", got)
+	}
+	if got := dnsServer.tcpQueries.Load(); got != 1 {
+		t.Fatalf("TCP DNS queries = %d, want 1 after truncated UDP response", got)
+	}
+}
+
+func TestDiagnosticIPv4LookupRejectsTrailingWireData(t *testing.T) {
+	t.Run("UDP", func(t *testing.T) {
+		dnsServer := startTestDNSServer(t, testDNSBehavior{
+			expectedName:     "diagnostic.example.",
+			publishAOn:       1,
+			aRecord:          [4]byte{93, 184, 216, 34},
+			trailingResponse: []byte{0xde, 0xad},
+		})
+		_, err := newDiagnosticIPv4Lookup(dnsServer.address)(context.Background(), "diagnostic.example")
+		if err == nil || !retryableDiagnosticIPv4LookupError(err) {
+			t.Fatalf("diagnostic UDP lookup error = %v, want retryable trailing-data rejection", err)
+		}
+	})
+
+	t.Run("TCP", func(t *testing.T) {
+		dnsServer := startTruncatedTestDNSServer(
+			t,
+			"diagnostic.example.",
+			[4]byte{93, 184, 216, 34},
+			truncatedTestDNSOptions{trailingTCP: []byte{0xde, 0xad}},
+		)
+		_, err := newDiagnosticIPv4Lookup(dnsServer.address)(context.Background(), "diagnostic.example")
+		if err == nil || !retryableDiagnosticIPv4LookupError(err) {
+			t.Fatalf("diagnostic TCP lookup error = %v, want retryable trailing-data rejection", err)
+		}
+	})
+}
+
+func TestValidateDiagnosticDNSWireLengthRejectsExtraConsumedRecordData(t *testing.T) {
+	name, err := dnsmessage.NewName("diagnostic.example.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetName, err := dnsmessage.NewName("target.example.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name      string
+		typ       dnsmessage.Type
+		body      dnsmessage.ResourceBody
+		typeBytes []byte
+	}{
+		{
+			name:      "A",
+			typ:       dnsmessage.TypeA,
+			body:      &dnsmessage.AResource{A: [4]byte{93, 184, 216, 34}},
+			typeBytes: []byte{0, byte(dnsmessage.TypeA)},
+		},
+		{
+			name:      "CNAME",
+			typ:       dnsmessage.TypeCNAME,
+			body:      &dnsmessage.CNAMEResource{CNAME: targetName},
+			typeBytes: []byte{0, byte(dnsmessage.TypeCNAME)},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			message, err := (&dnsmessage.Message{
+				Header: dnsmessage.Header{ID: 7, Response: true},
+				Questions: []dnsmessage.Question{{
+					Name: name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET,
+				}},
+				Answers: []dnsmessage.Resource{{
+					Header: dnsmessage.ResourceHeader{Name: name, Type: tc.typ, Class: dnsmessage.ClassINET, TTL: 1},
+					Body:   tc.body,
+				}},
+			}).Pack()
+			if err != nil {
+				t.Fatal(err)
+			}
+			headerPrefix := append(slices.Clone(tc.typeBytes), 0, 1, 0, 0, 0, 1)
+			headerOffset := bytes.LastIndex(message, headerPrefix)
+			if headerOffset < 0 {
+				t.Fatalf("packed %s resource header not found", tc.name)
+			}
+			lengthOffset := headerOffset + len(headerPrefix)
+			dataLength := binary.BigEndian.Uint16(message[lengthOffset : lengthOffset+2])
+			binary.BigEndian.PutUint16(message[lengthOffset:lengthOffset+2], dataLength+1)
+			message = append(message, 0xde)
+
+			if err := validateDiagnosticDNSWireLength(message); err == nil {
+				t.Fatalf("strict DNS validation accepted %s RDATA with an extra consumed byte", tc.name)
+			}
+		})
+	}
+}
+
+func TestTruncatedTestDNSServerClosesStalledTCPConnection(t *testing.T) {
+	var connection net.Conn
+	t.Cleanup(func() {
+		if connection != nil {
+			_ = connection.Close()
+		}
+	})
+	dnsServer := startTruncatedTestDNSServer(t, "diagnostic.example.", [4]byte{93, 184, 216, 34})
+	var err error
+	connection, err = net.Dial("tcp4", dnsServer.address)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-dnsServer.tcpAccepted:
+	case <-time.After(time.Second):
+		t.Fatal("truncated test DNS server did not accept stalled TCP connection")
+	}
+}
+
+func TestListenTruncatedTestDNSRetriesTCPPortCollision(t *testing.T) {
+	var packets []*trackingPacketConn
+	tcpCalls := 0
+	udpConnection, tcpListener, err := listenTruncatedTestDNS(
+		func(network, address string) (net.PacketConn, error) {
+			connection, err := net.ListenPacket(network, address)
+			if err != nil {
+				return nil, err
+			}
+			tracked := &trackingPacketConn{PacketConn: connection}
+			packets = append(packets, tracked)
+			return tracked, nil
+		},
+		func(network, address string) (net.Listener, error) {
+			tcpCalls++
+			if tcpCalls == 1 {
+				return nil, &net.OpError{Op: "listen", Net: network, Err: syscall.EADDRINUSE}
+			}
+			return net.Listen(network, address)
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = udpConnection.Close()
+		_ = tcpListener.Close()
+	})
+	if tcpCalls < 2 {
+		t.Fatalf("TCP listen calls = %d, want retry after port collision", tcpCalls)
+	}
+	if len(packets) < 2 || !packets[0].closed.Load() {
+		t.Fatalf("UDP attempts = %d/first closed=%t, want collided UDP listener closed before retry", len(packets), len(packets) > 0 && packets[0].closed.Load())
+	}
+}
+
+func TestListenTruncatedTestDNSBoundsTCPPortCollisions(t *testing.T) {
+	var packets []*trackingPacketConn
+	tcpCalls := 0
+	udpConnection, tcpListener, err := listenTruncatedTestDNS(
+		func(network, address string) (net.PacketConn, error) {
+			connection, err := net.ListenPacket(network, address)
+			if err != nil {
+				return nil, err
+			}
+			tracked := &trackingPacketConn{PacketConn: connection}
+			packets = append(packets, tracked)
+			return tracked, nil
+		},
+		func(network, _ string) (net.Listener, error) {
+			tcpCalls++
+			return nil, &net.OpError{Op: "listen", Net: network, Err: syscall.EADDRINUSE}
+		},
+	)
+	if udpConnection != nil || tcpListener != nil || !errors.Is(err, syscall.EADDRINUSE) {
+		t.Fatalf("bounded listener result = %v/%v/%v, want nil listeners and address-in-use cause", udpConnection, tcpListener, err)
+	}
+	if tcpCalls != 32 || len(packets) != 32 {
+		t.Fatalf("bounded listener calls = TCP %d/UDP %d, want 32 each", tcpCalls, len(packets))
+	}
+	for attempt, packet := range packets {
+		if !packet.closed.Load() {
+			t.Fatalf("UDP listener attempt %d remained open after collision exhaustion", attempt+1)
+		}
+	}
+}
+
+func TestListenTruncatedTestDNSDoesNotRetryOtherTCPError(t *testing.T) {
+	var packets []*trackingPacketConn
+	tcpCalls := 0
+	wantErr := errors.New("TCP listener denied")
+	udpConnection, tcpListener, err := listenTruncatedTestDNS(
+		func(network, address string) (net.PacketConn, error) {
+			connection, err := net.ListenPacket(network, address)
+			if err != nil {
+				return nil, err
+			}
+			tracked := &trackingPacketConn{PacketConn: connection}
+			packets = append(packets, tracked)
+			return tracked, nil
+		},
+		func(string, string) (net.Listener, error) {
+			tcpCalls++
+			return nil, wantErr
+		},
+	)
+	if udpConnection != nil || tcpListener != nil || !errors.Is(err, wantErr) {
+		t.Fatalf("non-retryable listener result = %v/%v/%v, want nil listeners and original cause", udpConnection, tcpListener, err)
+	}
+	if tcpCalls != 1 || len(packets) != 1 || !packets[0].closed.Load() {
+		t.Fatalf("non-retryable listener calls = TCP %d/UDP %d/closed %t, want 1/1/true", tcpCalls, len(packets), len(packets) == 1 && packets[0].closed.Load())
+	}
+}
+
+func TestDiagnosticIPv4LookupClassifiesProtocolFailures(t *testing.T) {
+	tests := []struct {
+		name       string
+		start      func(*testing.T) string
+		wantDetail string
+	}{
+		{
+			name: "malformed packet",
+			start: func(t *testing.T) string {
+				return startTestDNSServer(t, testDNSBehavior{
+					expectedName:      "diagnostic.example.",
+					malformedResponse: true,
+				}).address
+			},
+			wantDetail: "parse diagnostic DNS response header",
+		},
+		{
+			name: "wrong transaction ID",
+			start: func(t *testing.T) string {
+				return startTestDNSServer(t, testDNSBehavior{
+					expectedName:    "diagnostic.example.",
+					responseIDDelta: 1,
+				}).address
+			},
+			wantDetail: "response header does not match request",
+		},
+		{
+			name: "mismatched question",
+			start: func(t *testing.T) string {
+				return startTestDNSServer(t, testDNSBehavior{
+					expectedName: "diagnostic.example.",
+					responseName: "other.example.",
+				}).address
+			},
+			wantDetail: "response question does not match request",
+		},
+		{
+			name: "truncated TCP response",
+			start: func(t *testing.T) string {
+				return startTruncatedTestDNSServer(t, "diagnostic.example.", [4]byte{93, 184, 216, 34}, truncatedTestDNSOptions{truncateTCP: true}).address
+			},
+			wantDetail: "TCP response is truncated",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := newDiagnosticIPv4Lookup(tc.start(t))(context.Background(), "diagnostic.example")
+			if err == nil {
+				t.Fatal("diagnostic IPv4 lookup accepted invalid DNS response")
+			}
+			var dnsErr *net.DNSError
+			if !errors.As(err, &dnsErr) || !dnsErr.IsTemporary {
+				t.Fatalf("diagnostic IPv4 error = %v, want temporary DNS classification", err)
+			}
+			if !retryableDiagnosticIPv4LookupError(err) {
+				t.Fatalf("diagnostic IPv4 error = %v, want direct resolver retry classification", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantDetail) {
+				t.Fatalf("diagnostic IPv4 error = %v, want preserved detail %q", err, tc.wantDetail)
+			}
+		})
+	}
+}
+
+func TestDiagnosticDNSProtocolErrorPreservesCause(t *testing.T) {
+	cause := errors.New("protocol cause")
+	err := diagnosticDNSProtocolError("diagnostic.example", cause)
+	if !errors.Is(err, cause) {
+		t.Fatalf("diagnostic DNS protocol error = %v, want original cause", err)
+	}
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) || !dnsErr.IsTemporary {
+		t.Fatalf("diagnostic DNS protocol error = %v, want temporary DNS classification", err)
+	}
+}
+
+func TestDiagnosticIPv4LookupValidatesAnswerOwnership(t *testing.T) {
+	t.Run("rejects unrelated A owner", func(t *testing.T) {
+		dnsServer := startTestDNSServer(t, testDNSBehavior{
+			expectedName: "diagnostic.example.",
+			publishAOn:   1,
+			aRecord:      [4]byte{93, 184, 216, 34},
+			aRecordName:  "unrelated.example.",
+		})
+		_, err := newDiagnosticIPv4Lookup(dnsServer.address)(context.Background(), "diagnostic.example")
+		if err == nil {
+			t.Fatal("diagnostic IPv4 lookup accepted an unrelated A answer")
+		}
+		var dnsErr *net.DNSError
+		if !errors.As(err, &dnsErr) || !dnsErr.IsTemporary || !strings.Contains(err.Error(), "unrelated A answer") {
+			t.Fatalf("diagnostic IPv4 error = %v, want temporary unrelated-answer rejection", err)
+		}
+	})
+
+	t.Run("accepts CNAME-owned A answer", func(t *testing.T) {
+		dnsServer := startTestDNSServer(t, testDNSBehavior{
+			expectedName: "diagnostic.example.",
+			publishAOn:   1,
+			aRecord:      [4]byte{93, 184, 216, 34},
+			cnameTarget:  "alias.example.",
+		})
+		addresses, err := newDiagnosticIPv4Lookup(dnsServer.address)(context.Background(), "diagnostic.example")
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []netip.Addr{netip.MustParseAddr("93.184.216.34")}
+		if !slices.Equal(addresses, want) {
+			t.Fatalf("diagnostic IPv4 addresses = %v, want CNAME-owned answer %v", addresses, want)
+		}
+	})
+
+	t.Run("rejects CNAME loop", func(t *testing.T) {
+		dnsServer := startTestDNSServer(t, testDNSBehavior{
+			expectedName: "diagnostic.example.",
+			publishAOn:   1,
+			cnameTarget:  "diagnostic.example.",
+			omitA:        true,
+		})
+		_, err := newDiagnosticIPv4Lookup(dnsServer.address)(context.Background(), "diagnostic.example")
+		if err == nil {
+			t.Fatal("diagnostic IPv4 lookup accepted a CNAME loop")
+		}
+		var dnsErr *net.DNSError
+		if !errors.As(err, &dnsErr) || !dnsErr.IsTemporary || !strings.Contains(err.Error(), "CNAME loop") {
+			t.Fatalf("diagnostic IPv4 error = %v, want temporary CNAME-loop rejection", err)
+		}
+	})
+}
+
+func TestDiagnosticDNSIPv4AnswersValidatesCNAMEBranches(t *testing.T) {
+	name := func(value string) dnsmessage.Name {
+		result, err := dnsmessage.NewName(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	aResource := func(owner string) dnsmessage.Resource {
+		return dnsmessage.Resource{
+			Header: dnsmessage.ResourceHeader{Name: name(owner), Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 1},
+			Body:   &dnsmessage.AResource{A: [4]byte{93, 184, 216, 34}},
+		}
+	}
+	cnameResource := func(owner, target string) dnsmessage.Resource {
+		return dnsmessage.Resource{
+			Header: dnsmessage.ResourceHeader{Name: name(owner), Type: dnsmessage.TypeCNAME, Class: dnsmessage.ClassINET, TTL: 1},
+			Body:   &dnsmessage.CNAMEResource{CNAME: name(target)},
+		}
+	}
+	chain := func(hops int) []dnsmessage.Resource {
+		answers := make([]dnsmessage.Resource, 0, hops+1)
+		for hop := range hops {
+			answers = append(answers, cnameResource(
+				fmt.Sprintf("hop-%d.example.", hop),
+				fmt.Sprintf("hop-%d.example.", hop+1),
+			))
+		}
+		return append(answers, aResource(fmt.Sprintf("hop-%d.example.", hops)))
+	}
+
+	t.Run("accepts hop limit", func(t *testing.T) {
+		addresses, err := diagnosticDNSIPv4Answers(chain(maxDiagnosticDNSCNAMEHops), name("hop-0.example."))
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []netip.Addr{netip.MustParseAddr("93.184.216.34")}
+		if !slices.Equal(addresses, want) {
+			t.Fatalf("diagnostic IPv4 answers = %v, want %v", addresses, want)
+		}
+	})
+
+	for _, tc := range []struct {
+		name       string
+		answers    []dnsmessage.Resource
+		query      string
+		wantDetail string
+	}{
+		{
+			name:       "rejects excessive hops",
+			answers:    chain(maxDiagnosticDNSCNAMEHops + 1),
+			query:      "hop-0.example.",
+			wantDetail: "hop limit",
+		},
+		{
+			name: "rejects conflicting CNAMEs",
+			answers: []dnsmessage.Resource{
+				cnameResource("diagnostic.example.", "alias-a.example."),
+				cnameResource("diagnostic.example.", "alias-b.example."),
+			},
+			query:      "diagnostic.example.",
+			wantDetail: "conflicting CNAME",
+		},
+		{
+			name: "rejects A and CNAME owner",
+			answers: []dnsmessage.Resource{
+				aResource("diagnostic.example."),
+				cnameResource("diagnostic.example.", "alias.example."),
+			},
+			query:      "diagnostic.example.",
+			wantDetail: "both A and CNAME",
+		},
+		{
+			name: "rejects unrelated CNAME",
+			answers: []dnsmessage.Resource{
+				aResource("diagnostic.example."),
+				cnameResource("unrelated.example.", "alias.example."),
+			},
+			query:      "diagnostic.example.",
+			wantDetail: "unrelated CNAME",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := diagnosticDNSIPv4Answers(tc.answers, name(tc.query))
+			if err == nil || !strings.Contains(err.Error(), tc.wantDetail) {
+				t.Fatalf("diagnostic CNAME error = %v, want containing %q", err, tc.wantDetail)
+			}
+		})
+	}
+}
+
+func TestDiagnosticHealthClientDoesNotDependOnGlobalTransportType(t *testing.T) {
+	original := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("global transport must not be used")
+	})
+	t.Cleanup(func() { http.DefaultTransport = original })
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("newDiagnosticHealthClient panicked with custom global transport: %v", recovered)
+		}
+	}()
+
+	client := newDiagnosticHealthClient(diagnosticDNSResolverAddress, func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("stop after transport construction")
+	})
+	if _, ok := client.Transport.(*http.Transport); !ok {
+		t.Fatalf("diagnostic health transport = %T, want dedicated *http.Transport", client.Transport)
+	}
+}
+
+func TestDiagnosticHealthClientDoesNotInheritGlobalTLSPolicy(t *testing.T) {
+	original := http.DefaultTransport
+	http.DefaultTransport = &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // Deliberately unsafe global fixture.
+		DialTLSContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("unsafe global TLS dialer")
+		},
+	}
+	t.Cleanup(func() { http.DefaultTransport = original })
+
+	client := newDiagnosticHealthClient(diagnosticDNSResolverAddress, func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("stop after transport construction")
+	})
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("diagnostic health transport = %T, want dedicated *http.Transport", client.Transport)
+	}
+	if transport.TLSClientConfig != nil || transport.DialTLSContext != nil {
+		t.Fatalf("diagnostic health transport inherited global TLS policy: %#v", transport)
+	}
+}
+
+func TestDiagnosticHealthClientRejectsRedirectWithoutReferer(t *testing.T) {
+	const secretURL = "https://secret-tunnel.trycloudflare.com/runs/secret-run/healthz"
+	client := newDiagnosticHealthClient(diagnosticDNSResolverAddress, nil)
+	var requests []*http.Request
+	client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		requests = append(requests, request.Clone(request.Context()))
+		if len(requests) == 1 {
+			return &http.Response{
+				StatusCode: http.StatusFound,
+				Header:     http.Header{"Location": []string{"https://collector.example/redirected"}},
+				Body:       io.NopCloser(strings.NewReader("redirect")),
+				Request:    request,
+			}, nil
 		}
 		return &http.Response{
 			StatusCode: http.StatusOK,
 			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"run-123"}`)),
+			Body:       io.NopCloser(strings.NewReader("followed")),
+			Request:    request,
+		}, nil
+	})
+
+	response, err := client.Get(secretURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = response.Body.Close() })
+	if response.StatusCode != http.StatusFound || len(requests) != 1 {
+		t.Fatalf("managed redirect status/requests = %d/%d, want original 302 and one request", response.StatusCode, len(requests))
+	}
+	if referer := requests[0].Referer(); referer != "" {
+		t.Fatalf("managed health request Referer = %q, want empty", referer)
+	}
+}
+
+func TestDiagnosticHealthClientWaitsForPublishedARecord(t *testing.T) {
+	dnsServer := startTestDNSServer(t, testDNSBehavior{expectedName: "diagnostic.example.", publishAOn: 2, aRecord: [4]byte{93, 184, 216, 34}})
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"schema":"v1","run_id":"run-123"}`))
+	}))
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Listener = listener
+	server.Start()
+	defer server.Close()
+
+	_, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	ipv6, err := lookupTestDNSAAAA(ctx, dnsServer.address, "diagnostic.example.")
+	if err != nil || len(ipv6) != 1 || ipv6[0] != netip.IPv6Loopback() {
+		t.Fatalf("initial AAAA lookup = %v, %v; want published ::1", ipv6, err)
+	}
+	client := newDiagnosticHealthClient(dnsServer.address, func(ctx context.Context, network, address string) (net.Conn, error) {
+		_, dialPort, splitErr := net.SplitHostPort(address)
+		if splitErr != nil {
+			return nil, splitErr
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort("127.0.0.1", dialPort))
+	})
+	retryWaits := 0
+	if err := fetchRunHealth(
+		ctx,
+		client,
+		"http://diagnostic.example.:"+port+"/runs/run-123/healthz",
+		"run-123",
+		time.Millisecond,
+		true,
+		func(ctx context.Context, _ time.Duration) error {
+			retryWaits++
+			return ctx.Err()
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if retryWaits != 1 {
+		t.Fatalf("health retry waits = %d, want one injected publication wait", retryWaits)
+	}
+	events := dnsServer.Events()
+	aaaaIndex := slices.Index(events, "AAAA-published")
+	unpublishedAIndex := slices.Index(events, "A-unpublished")
+	publishedAIndex := slices.Index(events, "A-published")
+	if aaaaIndex < 0 || unpublishedAIndex < 0 || publishedAIndex < 0 || aaaaIndex > publishedAIndex || unpublishedAIndex > publishedAIndex {
+		t.Fatalf("DNS events = %v, want AAAA and unpublished A before published A", events)
+	}
+}
+
+func TestDiagnosticHealthClientPreservesOriginalTLSHostWhenPinningIPv4(t *testing.T) {
+	sni := make(chan string, 1)
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		sni <- request.TLS.ServerName
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer server.Close()
+	certificate := server.Certificate()
+	if len(certificate.DNSNames) == 0 {
+		t.Fatal("httptest certificate has no DNS name")
+	}
+	host := certificate.DNSNames[0]
+	dnsServer := startTestDNSServer(t, testDNSBehavior{expectedName: host + ".", publishAOn: 1, aRecord: [4]byte{93, 184, 216, 34}})
+
+	_, port, err := net.SplitHostPort(server.Listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialed := make(chan string, 1)
+	client := newDiagnosticHealthClient(dnsServer.address, func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialed <- address
+		_, dialPort, splitErr := net.SplitHostPort(address)
+		if splitErr != nil {
+			return nil, splitErr
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort("127.0.0.1", dialPort))
+	})
+	transport := client.Transport.(*http.Transport)
+	rootCAs := x509.NewCertPool()
+	rootCAs.AddCert(certificate)
+	transport.TLSClientConfig = &tls.Config{RootCAs: rootCAs, MinVersion: tls.VersionTLS12}
+	request, err := http.NewRequest(http.MethodGet, "https://"+net.JoinHostPort(host, port)+"/healthz", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if response.StatusCode != http.StatusNoContent {
+		t.Fatalf("diagnostic TLS response status = %d, want %d", response.StatusCode, http.StatusNoContent)
+	}
+	if got := <-dialed; got != net.JoinHostPort("93.184.216.34", port) {
+		t.Fatalf("diagnostic TLS dial address = %q, want pinned public IPv4", got)
+	}
+	if got := <-sni; got != host {
+		t.Fatalf("diagnostic TLS SNI = %q, want original host %q", got, host)
+	}
+}
+
+func TestRunnerSelectsHealthClientByOriginOwnership(t *testing.T) {
+	healthResponse := func(request *http.Request) (*http.Response, error) {
+		runID := strings.Split(strings.Trim(request.URL.Path, "/"), "/")[1]
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"` + runID + `"}`)),
+			Request:    request,
+		}, nil
+	}
+	launchMustNotRun := func(context.Context, string, string, bool) error {
+		return errors.New("browser launch must not run before lifecycle validation")
+	}
+	versions := func(context.Context, string) (Versions, error) {
+		return Versions{}, nil
+	}
+
+	t.Run("managed tunnel", func(t *testing.T) {
+		var operatorCalls, tunnelCalls int
+		var managedTunnel bool
+		lifecycleErr := errors.New("stop after managed lifecycle ownership at https://managed.trycloudflare.com")
+		runner := Runner{Dependencies: Dependencies{
+			Tunnel: &fakeTunnel{origin: "https://managed.trycloudflare.com"},
+			HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				operatorCalls++
+				return nil, errors.New("operator health client must not serve a managed tunnel")
+			})},
+			TunnelHTTPClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				tunnelCalls++
+				return healthResponse(request)
+			})},
+			LaunchDirect:   launchMustNotRun,
+			LaunchAttached: launchMustNotRun,
+			ValidateLifecycle: func(_ context.Context, _, _ string, got bool) error {
+				managedTunnel = got
+				return lifecycleErr
+			},
+			InspectVersions: versions,
+		}}
+		err := runner.Run(context.Background(), Options{Image: "candidate:test", Output: filepath.Join(t.TempDir(), "conformance.json")})
+		if !errors.Is(err, lifecycleErr) {
+			t.Fatalf("Run error = %v, want lifecycle ownership sentinel", err)
+		}
+		if operatorCalls != 0 || tunnelCalls != 1 {
+			t.Fatalf("health calls = operator:%d tunnel:%d, want 0/1", operatorCalls, tunnelCalls)
+		}
+		if !managedTunnel {
+			t.Fatal("managed tunnel ownership was not propagated to candidate lifecycle")
+		}
+		if strings.Contains(err.Error(), "managed.trycloudflare.com") {
+			t.Fatalf("managed lifecycle error leaked tunnel origin: %v", err)
+		}
+	})
+
+	t.Run("operator origin", func(t *testing.T) {
+		var operatorCalls, tunnelCalls int
+		managedTunnel := true
+		lifecycleErr := errors.New("stop after operator lifecycle ownership")
+		runner := Runner{Dependencies: Dependencies{
+			HTTPClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				operatorCalls++
+				return healthResponse(request)
+			})},
+			TunnelHTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+				tunnelCalls++
+				return nil, errors.New("tunnel health client must not serve an operator origin")
+			})},
+			LaunchDirect:   launchMustNotRun,
+			LaunchAttached: launchMustNotRun,
+			ValidateLifecycle: func(_ context.Context, _, _ string, got bool) error {
+				managedTunnel = got
+				return lifecycleErr
+			},
+			InspectVersions: versions,
+		}}
+		err := runner.Run(context.Background(), Options{
+			Image:  "candidate:test",
+			Output: filepath.Join(t.TempDir(), "conformance.json"),
+			Origin: "https://operator.trycloudflare.com",
+		})
+		if !errors.Is(err, lifecycleErr) {
+			t.Fatalf("Run error = %v, want lifecycle ownership sentinel", err)
+		}
+		if operatorCalls != 1 || tunnelCalls != 0 {
+			t.Fatalf("health calls = operator:%d tunnel:%d, want 1/0", operatorCalls, tunnelCalls)
+		}
+		if managedTunnel {
+			t.Fatal("explicit Quick Tunnel origin was marked as managed")
+		}
+	})
+}
+
+func TestRunnerRedactsManagedDirectLaunchFailure(t *testing.T) {
+	const origin = "https://managed.trycloudflare.com"
+	var launchErr error
+	healthClient := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		runID := strings.Split(strings.Trim(request.URL.Path, "/"), "/")[1]
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"` + runID + `"}`)),
 			Request:    request,
 		}, nil
 	})}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := fetchRunHealth(ctx, client, "https://diagnostic.example/runs/run-123/healthz", "run-123", time.Millisecond); err != nil {
-		t.Fatal(err)
+	runner := Runner{Dependencies: Dependencies{
+		Tunnel:           &fakeTunnel{origin: origin},
+		HTTPClient:       healthClient,
+		TunnelHTTPClient: healthClient,
+		LaunchDirect: func(_ context.Context, _, target string, _ bool) error {
+			launchErr = errors.New("chrome failed to navigate to " + target)
+			return launchErr
+		},
+		LaunchAttached: func(context.Context, string, string, bool) error {
+			t.Fatal("attached launch ran after direct failure")
+			return nil
+		},
+		ValidateLifecycle: func(context.Context, string, string, bool) error { return nil },
+		InspectVersions:   func(context.Context, string) (Versions, error) { return Versions{}, nil },
+	}}
+	err := runner.Run(context.Background(), Options{Image: "candidate:test", Output: filepath.Join(t.TempDir(), "conformance.json")})
+	if !errors.Is(err, launchErr) {
+		t.Fatalf("Run error = %v, want direct launch cause", err)
 	}
-	if calls != 3 {
-		t.Fatalf("health calls = %d, want 3", calls)
+	if strings.Contains(err.Error(), "managed.trycloudflare.com") || strings.Contains(err.Error(), "/runs/") {
+		t.Fatalf("managed direct error leaked tunnel target: %v", err)
+	}
+}
+
+func TestRedactManagedTunnelErrorMatchesHostnameCaseInsensitively(t *testing.T) {
+	cause := errors.New("launch HTTPS://SECRET-TUNNEL.TRYCLOUDFLARE.COM/runs/secret-run/direct failed")
+	err := redactManagedTunnelError(cause, true, "https://secret-tunnel.trycloudflare.com")
+	if !errors.Is(err, cause) {
+		t.Fatalf("redacted managed error = %v, want original cause", err)
+	}
+	for _, forbidden := range []string{"secret-tunnel", "trycloudflare.com"} {
+		if strings.Contains(strings.ToLower(err.Error()), forbidden) {
+			t.Fatalf("redacted managed error leaked case-variant %q: %v", forbidden, err)
+		}
+	}
+}
+
+func TestRedactManagedTunnelErrorRedactsPathAndRunIdentifier(t *testing.T) {
+	const target = "https://secret-tunnel.trycloudflare.com/runs/secret-run-42/direct"
+	for _, message := range []string{
+		"launch failed at /RUNS/SECRET-RUN-42/DIRECT",
+		"launch failed for SECRET-RUN-42",
+	} {
+		cause := errors.New(message)
+		err := redactManagedTunnelError(cause, true, target)
+		if !errors.Is(err, cause) {
+			t.Fatalf("redacted managed error = %v, want original cause", err)
+		}
+		for _, forbidden := range []string{"secret-run-42", "/runs/"} {
+			if strings.Contains(strings.ToLower(err.Error()), forbidden) {
+				t.Fatalf("redacted managed error leaked %q: %v", forbidden, err)
+			}
+		}
+	}
+}
+
+func TestRedactManagedTunnelErrorFailsClosedForInvalidPatternText(t *testing.T) {
+	secret := string([]byte{0xff})
+	cause := errors.New("launch failed for " + secret)
+	err := redactManagedTunnelError(cause, true, secret)
+	if !errors.Is(err, cause) {
+		t.Fatalf("redacted managed error = %v, want original cause", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatalf("redacted managed error retained invalid secret bytes: %q", err.Error())
+	}
+}
+
+func TestRunnerRejectsManagedTunnelWithoutDedicatedHealthClient(t *testing.T) {
+	tunnel := &sequenceTunnel{origins: []string{"https://managed.trycloudflare.com"}}
+	runner := Runner{Dependencies: Dependencies{
+		Tunnel: tunnel,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			runID := strings.Split(strings.Trim(request.URL.Path, "/"), "/")[1]
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"` + runID + `"}`)),
+				Request:    request,
+			}, nil
+		})},
+	}}
+	err := runner.Run(context.Background(), Options{Image: "candidate:test", Output: filepath.Join(t.TempDir(), "conformance.json")})
+	if err == nil || !strings.Contains(err.Error(), "managed diagnostic tunnel health client is unavailable") {
+		t.Fatalf("Run error = %v, want missing managed health client rejection", err)
+	}
+	if tunnel.startCalls != 0 {
+		t.Fatalf("tunnel start calls = %d, want rejection before activation", tunnel.startCalls)
+	}
+}
+
+func TestDefaultDependenciesConfigureDedicatedManagedHealthClient(t *testing.T) {
+	managedClient := &http.Client{}
+	var resolverAddress string
+	dependencies := defaultDependencies(io.Discard, func(address string, dial diagnosticHealthDialer) *http.Client {
+		resolverAddress = address
+		if dial != nil {
+			t.Fatal("default dependencies injected a final origin dialer")
+		}
+		return managedClient
+	})
+	if dependencies.HTTPClient == nil || dependencies.TunnelHTTPClient == nil || dependencies.HTTPClient == dependencies.TunnelHTTPClient {
+		t.Fatalf("default health clients = operator:%p managed:%p, want distinct configured clients", dependencies.HTTPClient, dependencies.TunnelHTTPClient)
+	}
+	if dependencies.TunnelHTTPClient != managedClient || resolverAddress != "1.1.1.1:53" {
+		t.Fatalf("managed health client/address = %p/%q, want injected client and 1.1.1.1:53", dependencies.TunnelHTTPClient, resolverAddress)
 	}
 }
 
@@ -487,11 +1513,16 @@ func TestDefaultConformanceTimeoutCoversTunnelRetriesAndRuntime(t *testing.T) {
 	}
 }
 
-func TestRunnerRetriesQuickTunnelActivationAndCleansEachAttempt(t *testing.T) {
+func TestRunnerRetriesTransientQuickTunnelHealthAndCleansEachAttempt(t *testing.T) {
 	tunnel := &sequenceTunnel{origins: []string{"https://first.invalid", "https://second.test"}}
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if request.URL.Host == "first.invalid" {
-			return nil, &net.DNSError{Err: "no such host", Name: request.URL.Hostname(), IsNotFound: true}
+			return &http.Response{
+				StatusCode: http.StatusServiceUnavailable,
+				Header:     make(http.Header),
+				Body:       http.NoBody,
+				Request:    request,
+			}, nil
 		}
 		runID := strings.Split(strings.Trim(request.URL.Path, "/"), "/")[1]
 		return &http.Response{
@@ -504,7 +1535,11 @@ func TestRunnerRetriesQuickTunnelActivationAndCleansEachAttempt(t *testing.T) {
 	runner := Runner{Dependencies: Dependencies{
 		Tunnel:              tunnel,
 		HTTPClient:          client,
-		TunnelHealthTimeout: 5 * time.Millisecond,
+		TunnelHTTPClient:    client,
+		TunnelHealthTimeout: time.Second,
+		HealthRetryWait: func(context.Context, time.Duration) error {
+			return context.DeadlineExceeded
+		},
 	}}
 	err := runner.Run(context.Background(), Options{
 		Image:  "candidate:test",
@@ -518,11 +1553,44 @@ func TestRunnerRetriesQuickTunnelActivationAndCleansEachAttempt(t *testing.T) {
 	}
 }
 
+func TestRunnerRejectsNonPublicManagedDNSWithoutRetryingOrRotating(t *testing.T) {
+	tunnel := &sequenceTunnel{origins: []string{"https://private-answer.test"}}
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errDiagnosticNonPublicIPv4
+	})}
+	retryWaits := 0
+	runner := Runner{Dependencies: Dependencies{
+		Tunnel:           tunnel,
+		HTTPClient:       client,
+		TunnelHTTPClient: client,
+		HealthRetryWait: func(context.Context, time.Duration) error {
+			retryWaits++
+			return errors.New("unexpected health retry")
+		},
+	}}
+	err := runner.Run(context.Background(), Options{
+		Image:  "candidate:test",
+		Output: filepath.Join(t.TempDir(), "conformance.json"),
+	})
+	if !errors.Is(err, errDiagnosticNonPublicIPv4) {
+		t.Fatalf("Run error = %v, want non-public IPv4 rejection", err)
+	}
+	if errors.Is(err, errDiagnosticHealthEndpointUnreachable) {
+		t.Fatalf("Run error = %v, do not want generic endpoint-unreachable classification", err)
+	}
+	if retryWaits != 0 {
+		t.Fatalf("managed health retry waits = %d, want 0", retryWaits)
+	}
+	if tunnel.startCalls != 1 || tunnel.stopCalls != 1 {
+		t.Fatalf("tunnel calls = start:%d stop:%d, want fail-closed cleanup at 1/1", tunnel.startCalls, tunnel.stopCalls)
+	}
+}
+
 func TestRunnerRetriesTransientQuickTunnelStartFailure(t *testing.T) {
 	tunnel := &sequenceTunnel{
 		origins: []string{"", "https://second.test"},
 		startErrors: []error{
-			&net.DNSError{Err: "temporary failure", Name: "api.trycloudflare.com", IsTemporary: true},
+			&net.DNSError{Err: "temporary failure", IsTemporary: true},
 			nil,
 		},
 	}
@@ -538,6 +1606,7 @@ func TestRunnerRetriesTransientQuickTunnelStartFailure(t *testing.T) {
 	runner := Runner{Dependencies: Dependencies{
 		Tunnel:              tunnel,
 		HTTPClient:          client,
+		TunnelHTTPClient:    client,
 		TunnelHealthTimeout: 5 * time.Millisecond,
 	}}
 	err := runner.Run(context.Background(), Options{
@@ -552,12 +1621,12 @@ func TestRunnerRetriesTransientQuickTunnelStartFailure(t *testing.T) {
 	}
 }
 
-func TestRunnerAbortsRetryWhenFailedTunnelStartCleanupFails(t *testing.T) {
-	cleanupErr := errors.New("cleanup failed")
+func TestRunnerRedactsFailedTunnelStartCleanup(t *testing.T) {
+	cleanupErr := errors.New("cleanup failed for https://secret-tunnel.trycloudflare.com")
 	tunnel := &sequenceTunnel{
 		origins: []string{"", "https://second.test"},
 		startErrors: []error{
-			&net.DNSError{Err: "temporary failure", Name: "api.trycloudflare.com", IsTemporary: true},
+			&net.DNSError{Err: "temporary failure", IsTemporary: true},
 			nil,
 		},
 		stopErrors: []error{cleanupErr},
@@ -571,37 +1640,285 @@ func TestRunnerAbortsRetryWhenFailedTunnelStartCleanupFails(t *testing.T) {
 			Request:    request,
 		}, nil
 	})}
-	runner := Runner{Dependencies: Dependencies{Tunnel: tunnel, HTTPClient: client}}
+	runner := Runner{Dependencies: Dependencies{Tunnel: tunnel, HTTPClient: client, TunnelHTTPClient: client}}
 	err := runner.Run(context.Background(), Options{
 		Image:  "candidate:test",
 		Output: filepath.Join(t.TempDir(), "conformance.json"),
 	})
-	if !errors.Is(err, cleanupErr) {
-		t.Fatalf("Run error = %v, want failed-start cleanup error", err)
+	if !errors.Is(err, errDiagnosticTunnelCleanupFailed) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("Run error = %v, want fixed redacted cleanup classification and preserved cause", err)
 	}
 	if tunnel.startCalls != 1 || tunnel.stopCalls != 1 {
 		t.Fatalf("tunnel calls = start:%d stop:%d, want retry aborted at 1/1", tunnel.startCalls, tunnel.stopCalls)
+	}
+	if strings.Contains(err.Error(), "secret-tunnel") || strings.Contains(err.Error(), "trycloudflare.com") {
+		t.Fatalf("Run cleanup error leaked tunnel origin: %v", err)
 	}
 }
 
 func TestFetchRunHealthRedactsEndpointOnFailure(t *testing.T) {
 	const secretURL = "https://secret-tunnel.trycloudflare.com/runs/secret-run/healthz"
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		cancel()
 		return nil, &url.Error{
 			Op:  request.Method,
 			URL: secretURL,
 			Err: &net.DNSError{Err: "no such host", Name: request.URL.Hostname(), IsNotFound: true},
 		}
 	})}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
-	defer cancel()
-	err := fetchRunHealth(ctx, client, secretURL, "secret-run", time.Millisecond)
+	err := fetchRunHealth(ctx, client, secretURL, "secret-run", time.Millisecond, true, waitForDiagnosticHealthRetry)
 	if err == nil {
 		t.Fatal("health check unexpectedly succeeded")
 	}
 	for _, forbidden := range []string{"secret-tunnel", "secret-run", "trycloudflare.com"} {
 		if strings.Contains(err.Error(), forbidden) {
 			t.Fatalf("health error leaked %q: %v", forbidden, err)
+		}
+	}
+	var dnsErr *net.DNSError
+	if !errors.As(err, &dnsErr) {
+		t.Fatalf("managed health error lost DNS cause: %v", err)
+	}
+}
+
+func TestFetchRunHealthPreservesManagedTransportCause(t *testing.T) {
+	const secretURL = "https://secret-tunnel.trycloudflare.com/runs/secret-run/healthz"
+	cause := errors.New("TLS failure for " + secretURL)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		cancel()
+		return nil, cause
+	})}
+	err := fetchRunHealth(ctx, client, secretURL, "secret-run", time.Millisecond, true, waitForDiagnosticHealthRetry)
+	if !errors.Is(err, cause) || !errors.Is(err, errDiagnosticHealthEndpointUnreachable) {
+		t.Fatalf("managed health error = %v, want redacted classification and original cause", err)
+	}
+	for _, forbidden := range []string{"secret-tunnel", "secret-run", "trycloudflare.com"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("managed transport error leaked %q: %v", forbidden, err)
+		}
+	}
+}
+
+func TestFetchRunHealthPreservesRedactedManagedResponseCauses(t *testing.T) {
+	const secretURL = "https://secret-tunnel.trycloudflare.com/runs/secret-run/healthz"
+	readErr := errors.New("read failed for " + strings.ToUpper(secretURL))
+	closeErr := errors.New("close failed for " + strings.ToUpper(secretURL))
+	body := &trackingReadCloser{
+		Reader:   readFunc(func([]byte) (int, error) { return 0, readErr }),
+		closeErr: closeErr,
+	}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    request,
+		}, nil
+	})}
+	err := fetchRunHealth(context.Background(), client, secretURL, "secret-run", time.Millisecond, true, waitForDiagnosticHealthRetry)
+	if !errors.Is(err, errDiagnosticHealthEndpointRejected) || !errors.Is(err, readErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("managed response error = %v, want fixed classification plus read and close causes", err)
+	}
+	for _, forbidden := range []string{"secret-tunnel", "secret-run", "trycloudflare.com"} {
+		if strings.Contains(strings.ToLower(err.Error()), forbidden) {
+			t.Fatalf("managed response error leaked %q: %v", forbidden, err)
+		}
+	}
+}
+
+func TestFetchRunHealthRejectsTrailingContent(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"run-123"}garbage`)),
+			Request:    request,
+		}, nil
+	})}
+	err := fetchRunHealth(context.Background(), client, "https://diagnostic.example/runs/run-123/healthz", "run-123", time.Millisecond, true, waitForDiagnosticHealthRetry)
+	if !errors.Is(err, errDiagnosticHealthEndpointRejected) {
+		t.Fatalf("managed health error = %v, want trailing-content rejection", err)
+	}
+}
+
+func TestFetchRunHealthRejectsOversizedSuccessBody(t *testing.T) {
+	body := &trackingReadCloser{Reader: strings.NewReader(
+		`{"schema":"v1","run_id":"run-123"}` + strings.Repeat(" ", 4096),
+	)}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    request,
+		}, nil
+	})}
+	err := fetchRunHealth(context.Background(), client, "https://diagnostic.example/runs/run-123/healthz", "run-123", time.Millisecond, true, waitForDiagnosticHealthRetry)
+	if !errors.Is(err, errDiagnosticHealthEndpointRejected) {
+		t.Fatalf("managed health error = %v, want oversized-body rejection", err)
+	}
+	if !body.closed {
+		t.Fatal("oversized managed health response body remained open")
+	}
+}
+
+func TestFetchRunHealthPreservesReadErrorAfterBoundedBody(t *testing.T) {
+	readErr := errors.New("late bounded health response read failure")
+	body := &trackingReadCloser{Reader: io.MultiReader(
+		strings.NewReader(strings.Repeat("x", 4096)),
+		readFunc(func([]byte) (int, error) { return 0, readErr }),
+	)}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusServiceUnavailable,
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    request,
+		}, nil
+	})}
+	stopErr := errors.New("stop after response classification")
+	err := fetchRunHealth(
+		context.Background(),
+		client,
+		"https://diagnostic.example/runs/run-123/healthz",
+		"run-123",
+		time.Millisecond,
+		true,
+		func(context.Context, time.Duration) error { return stopErr },
+	)
+	if !errors.Is(err, readErr) || !errors.Is(err, stopErr) {
+		t.Fatalf("managed health error = %v, want late read and retry-stop causes", err)
+	}
+	if !body.closed {
+		t.Fatal("managed health response body remained open after late read failure")
+	}
+}
+
+func TestFetchRunHealthPreservesRedactedManagedNonOKResponseCauses(t *testing.T) {
+	const secretURL = "https://secret-tunnel.trycloudflare.com/runs/secret-run/healthz"
+	for _, tc := range []struct {
+		name           string
+		status         int
+		wantRetryWaits int
+	}{
+		{name: "nonretryable redirect", status: http.StatusFound},
+		{name: "transient unavailable", status: http.StatusServiceUnavailable, wantRetryWaits: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			readErr := errors.New("read failed for " + strings.ToUpper(secretURL))
+			closeErr := errors.New("close failed for " + strings.ToUpper(secretURL))
+			body := &trackingReadCloser{
+				Reader:   readFunc(func([]byte) (int, error) { return 0, readErr }),
+				closeErr: closeErr,
+			}
+			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode: tc.status,
+					Header:     make(http.Header),
+					Body:       body,
+					Request:    request,
+				}, nil
+			})}
+			retryWaits := 0
+			stopErr := errors.New("stop after response classification")
+			err := fetchRunHealth(
+				context.Background(),
+				client,
+				secretURL,
+				"secret-run",
+				time.Millisecond,
+				true,
+				func(context.Context, time.Duration) error {
+					retryWaits++
+					return stopErr
+				},
+			)
+			if !errors.Is(err, readErr) || !errors.Is(err, closeErr) {
+				t.Fatalf("managed status %d error = %v, want read and close causes", tc.status, err)
+			}
+			if retryWaits != tc.wantRetryWaits {
+				t.Fatalf("managed status %d retry waits = %d, want %d", tc.status, retryWaits, tc.wantRetryWaits)
+			}
+			if tc.wantRetryWaits > 0 && !errors.Is(err, stopErr) {
+				t.Fatalf("managed status %d error = %v, want retry stop cause", tc.status, err)
+			}
+			for _, forbidden := range []string{"secret-tunnel", "secret-run", "trycloudflare.com"} {
+				if strings.Contains(strings.ToLower(err.Error()), forbidden) {
+					t.Fatalf("managed status %d error leaked %q: %v", tc.status, forbidden, err)
+				}
+			}
+		})
+	}
+}
+
+func TestRunnerAbortsManagedTunnelOnResolverFailureWithoutRotating(t *testing.T) {
+	dnsServer := startTestDNSServer(t, testDNSBehavior{expectedName: "secret-tunnel.trycloudflare.com.", rcode: dnsmessage.RCodeServerFailure})
+	tunnel := &sequenceTunnel{origins: []string{
+		"https://secret-tunnel.trycloudflare.com.",
+		"https://must-not-start.trycloudflare.com.",
+	}}
+	runner := Runner{Dependencies: Dependencies{
+		Tunnel:              tunnel,
+		HTTPClient:          &http.Client{Timeout: time.Second},
+		TunnelHTTPClient:    newDiagnosticHealthClient(dnsServer.address, nil),
+		TunnelHealthTimeout: time.Second,
+		HealthRetryWait: func(context.Context, time.Duration) error {
+			return context.DeadlineExceeded
+		},
+	}}
+	err := runner.Run(context.Background(), Options{Image: "candidate:test", Output: filepath.Join(t.TempDir(), "conformance.json")})
+	if !errors.Is(err, errDiagnosticDNSResolverUnavailable) {
+		t.Fatalf("Run error = %v, want resolver-unavailable classification", err)
+	}
+	if tunnel.startCalls != 1 || tunnel.stopCalls != 1 {
+		t.Fatalf("tunnel calls = start:%d stop:%d, want resolver failure to abort after 1/1", tunnel.startCalls, tunnel.stopCalls)
+	}
+	if !slices.Contains(dnsServer.Events(), "SERVFAIL") {
+		t.Fatalf("DNS events = %v, want production resolver SERVFAIL", dnsServer.Events())
+	}
+	for _, forbidden := range []string{"secret-tunnel", "must-not-start", "trycloudflare.com"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("Run error leaked %q: %v", forbidden, err)
+		}
+	}
+}
+
+func TestRunnerAbortsManagedTunnelOnPublicationExhaustionWithoutRotating(t *testing.T) {
+	dnsServer := startTestDNSServer(t, testDNSBehavior{
+		expectedName: "secret-tunnel.trycloudflare.com.",
+		publishAOn:   100,
+	})
+	tunnel := &sequenceTunnel{origins: []string{
+		"https://secret-tunnel.trycloudflare.com.",
+		"https://secret-tunnel.trycloudflare.com.",
+		"https://secret-tunnel.trycloudflare.com.",
+	}}
+	runner := Runner{Dependencies: Dependencies{
+		Tunnel:              tunnel,
+		HTTPClient:          &http.Client{Timeout: time.Second},
+		TunnelHTTPClient:    newDiagnosticHealthClient(dnsServer.address, nil),
+		TunnelHealthTimeout: time.Second,
+		HealthRetryWait: func(context.Context, time.Duration) error {
+			return context.DeadlineExceeded
+		},
+	}}
+	err := runner.Run(context.Background(), Options{Image: "candidate:test", Output: filepath.Join(t.TempDir(), "conformance.json")})
+	if !errors.Is(err, errDiagnosticDNSResolverUnavailable) || !errors.Is(err, errDiagnosticDNSPublicationNotReady) {
+		t.Fatalf("Run error = %v, want resolver-unavailable exhaustion with publication cause", err)
+	}
+	if tunnel.startCalls != 1 || tunnel.stopCalls != 1 {
+		t.Fatalf("tunnel calls = start:%d stop:%d, want publication exhaustion to abort after 1/1", tunnel.startCalls, tunnel.stopCalls)
+	}
+	if !slices.Contains(dnsServer.Events(), "A-unpublished") {
+		t.Fatalf("DNS events = %v, want unpublished A result", dnsServer.Events())
+	}
+	for _, forbidden := range []string{"secret-tunnel", "trycloudflare.com"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Fatalf("Run error leaked %q: %v", forbidden, err)
 		}
 	}
 }
@@ -781,8 +2098,8 @@ func TestMainWritesRedactedReportAndReturnsBoundedConformanceFailure(t *testing.
 	tunnel := &proxyTunnel{client: client}
 	var targetMu sync.Mutex
 	var observedTargets []string
-	launch := func(kind string, mismatch bool) func(context.Context, string, string) error {
-		return func(ctx context.Context, image, target string) error {
+	launch := func(kind string, mismatch bool) func(context.Context, string, string, bool) error {
+		return func(ctx context.Context, image, target string, _ bool) error {
 			targetMu.Lock()
 			observedTargets = append(observedTargets, target)
 			targetMu.Unlock()
@@ -835,11 +2152,12 @@ func TestMainWritesRedactedReportAndReturnsBoundedConformanceFailure(t *testing.
 	output := filepath.Join(t.TempDir(), "conformance.json")
 	lifecycleCalls := 0
 	dependencies := Dependencies{
-		Tunnel:         tunnel,
-		HTTPClient:     client,
-		LaunchDirect:   launch("direct", false),
-		LaunchAttached: launch("attached", true),
-		ValidateLifecycle: func(context.Context, string, string) error {
+		Tunnel:           tunnel,
+		HTTPClient:       client,
+		TunnelHTTPClient: client,
+		LaunchDirect:     launch("direct", false),
+		LaunchAttached:   launch("attached", true),
+		ValidateLifecycle: func(context.Context, string, string, bool) error {
 			lifecycleCalls++
 			return nil
 		},
@@ -914,7 +2232,7 @@ func TestMainWritesRedactedReportAndReturnsBoundedConformanceFailure(t *testing.
 func TestLaunchAndCollectWaitsForLauncherCleanupAfterCancellation(t *testing.T) {
 	collector := NewCollector("run-cancel")
 	cleanupComplete := make(chan struct{})
-	launch := func(ctx context.Context, _, _ string) error {
+	launch := func(ctx context.Context, _, _ string, _ bool) error {
 		<-ctx.Done()
 		time.Sleep(25 * time.Millisecond)
 		close(cleanupComplete)
@@ -922,7 +2240,7 @@ func TestLaunchAndCollectWaitsForLauncherCleanupAfterCancellation(t *testing.T) 
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	_, err := launchAndCollect(ctx, collector, "direct", "candidate:test", "https://diagnostic.example/direct", launch)
+	_, err := launchAndCollect(ctx, collector, "direct", "candidate:test", "https://diagnostic.example/direct", false, launch)
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("launchAndCollect error = %v, want deadline", err)
 	}
@@ -971,7 +2289,7 @@ func TestMainRequiresCandidateImageAndOutput(t *testing.T) {
 }
 
 func TestDirectChromeContainerArgsUseHeadedChromeWithoutCDPOrPlaywright(t *testing.T) {
-	got := directChromeContainerArgs("candidate:test", "https://diagnostic.example/runs/run/direct", "/tmp/profile")
+	got := directChromeContainerArgs("candidate:test", "https://diagnostic.example/runs/run/direct", "/tmp/profile", false, "")
 	for _, want := range []string{
 		"--platform", "linux/amd64",
 		"--entrypoint", "/bin/sh",
@@ -985,7 +2303,7 @@ func TestDirectChromeContainerArgsUseHeadedChromeWithoutCDPOrPlaywright(t *testi
 		}
 	}
 	joined := strings.Join(got, " ")
-	for _, forbidden := range []string{"--headless", "remote-debugging", "playwright", "product-capture-provider", "AutomationControlled"} {
+	for _, forbidden := range []string{"--dns", "--headless", "remote-debugging", "playwright", "product-capture-provider", "AutomationControlled"} {
 		if strings.Contains(strings.ToLower(joined), strings.ToLower(forbidden)) {
 			t.Errorf("direct args contain forbidden %q: %s", forbidden, joined)
 		}
@@ -993,7 +2311,7 @@ func TestDirectChromeContainerArgsUseHeadedChromeWithoutCDPOrPlaywright(t *testi
 }
 
 func TestDirectChromeContainerArgsUseBoundedXvfbSocketReadiness(t *testing.T) {
-	joined := strings.Join(directChromeContainerArgs("candidate:test", "https://diagnostic.example/direct", "/tmp/profile"), " ")
+	joined := strings.Join(directChromeContainerArgs("candidate:test", "https://diagnostic.example/direct", "/tmp/profile", false, ""), " ")
 	for _, required := range []string{
 		"--entrypoint /bin/sh",
 		"Xvfb :99",
@@ -1044,7 +2362,7 @@ func TestHeadedContainerWrapperAvoidsDelayedNumericPIDWatchdog(t *testing.T) {
 }
 
 func TestAttachedContainerArgsRunRealProviderDiagnostic(t *testing.T) {
-	got := attachedProviderContainerArgs("candidate:test", "https://diagnostic.example/runs/run/attached")
+	got := attachedProviderContainerArgs("candidate:test", "https://diagnostic.example/runs/run/attached", false)
 	want := []string{
 		"run", "--rm", "--platform", "linux/amd64",
 		"-e", "PRODUCT_CAPTURE_BROWSER_HEADLESS=false",
@@ -1061,6 +2379,640 @@ func TestAttachedContainerArgsRunRealProviderDiagnostic(t *testing.T) {
 			t.Fatalf("attached provider must own its headed display; args contain %q", forbidden)
 		}
 	}
+}
+
+func TestQuickTunnelContainerArgsUseAdjacentCloudflareDNS(t *testing.T) {
+	target := "https://managed.trycloudflare.com/runs/run/observation"
+	directResolverRule := "MAP managed.trycloudflare.com 104.16.133.229"
+	tests := map[string][]string{
+		"direct":   stripContainerName(directChromeContainerArgs("candidate:test", target, "/tmp/profile", true, directResolverRule)),
+		"attached": stripContainerName(attachedProviderContainerArgs("candidate:test", target, true)),
+	}
+	for name, args := range tests {
+		t.Run(name, func(t *testing.T) {
+			index := slices.Index(args, "--dns")
+			if index < 0 || index+1 >= len(args) || args[index+1] != diagnosticDNSResolverIP {
+				t.Fatalf("container args = %#v, want adjacent --dns %s", args, diagnosticDNSResolverIP)
+			}
+		})
+	}
+	attached := tests["attached"]
+	if !slices.Contains(attached, "--browser-diagnostic-require-ipv4") {
+		t.Fatalf("attached args = %#v, want managed IPv4 policy flag", attached)
+	}
+	if !slices.Contains(tests["direct"], "--host-resolver-rules="+directResolverRule) {
+		t.Fatalf("direct args = %#v, want managed public IPv4 resolver pin", tests["direct"])
+	}
+
+	for _, target := range []string{
+		"https://trycloudflare.com.evil.example/runs/run/direct",
+		"https://operator.example/runs/run/direct",
+	} {
+		if args := quickTunnelDNSArgs(target, true); len(args) != 0 {
+			t.Fatalf("quickTunnelDNSArgs(%q) = %#v, want no resolver override", target, args)
+		}
+	}
+	if args := quickTunnelDNSArgs(target, false); len(args) != 0 {
+		t.Fatalf("explicit quickTunnelDNSArgs(%q) = %#v, want operator resolver", target, args)
+	}
+}
+
+func TestManagedDirectChromeResolverRuleWaitsForPublishedPublicIPv4(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		started := time.Now()
+		rule, err := resolveManagedDirectChromeResolverRule(
+			context.Background(),
+			"https://managed.trycloudflare.com/runs/run/direct",
+			func(context.Context, string) ([]netip.Addr, error) {
+				calls++
+				if calls == 1 {
+					return nil, &net.DNSError{Err: "no such host", Name: "managed.trycloudflare.com", IsNotFound: true}
+				}
+				return []netip.Addr{netip.MustParseAddr("104.16.133.229")}, nil
+			},
+			50*time.Millisecond,
+			time.Millisecond,
+		)
+		if err != nil {
+			t.Fatalf("resolve managed direct Chrome rule: %v", err)
+		}
+		if calls != 2 {
+			t.Fatalf("managed direct DNS calls = %d, want retry after unpublished A record", calls)
+		}
+		if rule != "MAP managed.trycloudflare.com 104.16.133.229" {
+			t.Fatalf("managed direct resolver rule = %q", rule)
+		}
+		if elapsed := time.Since(started); elapsed != time.Millisecond {
+			t.Fatalf("managed direct DNS retry elapsed = %s, want %s", elapsed, time.Millisecond)
+		}
+	})
+}
+
+func TestManagedDirectChromeResolverRuleRejectsSuccessAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := resolveManagedDirectChromeResolverRule(
+		ctx,
+		"https://managed.trycloudflare.com/runs/run/direct",
+		func(context.Context, string) ([]netip.Addr, error) {
+			cancel()
+			return []netip.Addr{netip.MustParseAddr("104.16.133.229")}, nil
+		},
+		50*time.Millisecond,
+		time.Millisecond,
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("managed direct resolver error = %v, want cancellation after lookup", err)
+	}
+}
+
+func TestResolvePublicDiagnosticIPv4RejectsLookupSuccessAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	_, err := resolvePublicDiagnosticIPv4(ctx, "diagnostic.example", func(context.Context, string) ([]netip.Addr, error) {
+		cancel()
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("diagnostic IPv4 resolver error = %v, want canceled lookup rejection", err)
+	}
+}
+
+func TestFetchRunHealthRejectsCorrelatedSuccessWhenCanceledDuringBodyRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	body := &trackingReadCloser{
+		Reader: strings.NewReader(`{"schema":"v1","run_id":"run-123"}`),
+		onRead: cancel,
+	}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    request,
+		}, nil
+	})}
+	err := fetchRunHealth(ctx, client, "https://diagnostic.example/runs/run-123/healthz", "run-123", time.Millisecond, true, waitForDiagnosticHealthRetry)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("diagnostic health error = %v, want canceled success rejection", err)
+	}
+	if !body.closed {
+		t.Fatal("diagnostic health response body remained open after cancellation")
+	}
+}
+
+func TestFetchRunHealthRedactsCloseErrorWhenCanceledBeforeBodyRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	closeErr := errors.New("close failed for HTTPS://SECRET-TUNNEL.TRYCLOUDFLARE.COM/runs/secret-run/healthz")
+	body := &trackingReadCloser{
+		Reader:   strings.NewReader(`{"schema":"v1","run_id":"run-123"}`),
+		closeErr: closeErr,
+	}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		cancel()
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    request,
+		}, nil
+	})}
+	err := fetchRunHealth(ctx, client, "https://diagnostic.example/runs/run-123/healthz", "run-123", time.Millisecond, true, waitForDiagnosticHealthRetry)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, errDiagnosticHealthEndpointRejected) || !errors.Is(err, closeErr) {
+		t.Fatalf("diagnostic health error = %v, want cancellation, fixed classification, and close cause", err)
+	}
+	for _, forbidden := range []string{"secret-tunnel", "secret-run", "trycloudflare.com"} {
+		if strings.Contains(strings.ToLower(err.Error()), forbidden) {
+			t.Fatalf("pre-read cancellation error leaked %q: %v", forbidden, err)
+		}
+	}
+	if !body.closed {
+		t.Fatal("diagnostic health response body remained open after pre-read cancellation")
+	}
+}
+
+func TestFetchRunHealthPreservesBodyErrorWhenCanceledDuringRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	readErr := errors.New("health body read failed for HTTPS://SECRET-TUNNEL.TRYCLOUDFLARE.COM/runs/secret-run/healthz")
+	body := &trackingReadCloser{Reader: readFunc(func([]byte) (int, error) {
+		cancel()
+		return 0, readErr
+	})}
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    request,
+		}, nil
+	})}
+	err := fetchRunHealth(ctx, client, "https://diagnostic.example/runs/run-123/healthz", "run-123", time.Millisecond, true, waitForDiagnosticHealthRetry)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, errDiagnosticHealthEndpointRejected) || !errors.Is(err, readErr) {
+		t.Fatalf("diagnostic health error = %v, want cancellation, fixed classification, and body read cause", err)
+	}
+	for _, forbidden := range []string{"secret-tunnel", "secret-run", "trycloudflare.com"} {
+		if strings.Contains(strings.ToLower(err.Error()), forbidden) {
+			t.Fatalf("canceled managed health error leaked %q: %v", forbidden, err)
+		}
+	}
+	if !body.closed {
+		t.Fatal("diagnostic health response body remained open after read failure")
+	}
+}
+
+type testDNSBehavior struct {
+	expectedName      string
+	publishAOn        int32
+	rcode             dnsmessage.RCode
+	aRecord           [4]byte
+	responseIDDelta   uint16
+	responseName      string
+	malformedResponse bool
+	aRecordName       string
+	cnameTarget       string
+	omitA             bool
+	trailingResponse  []byte
+}
+
+type testDNSServer struct {
+	address string
+
+	aQueries atomic.Int32
+	mu       sync.Mutex
+	events   []string
+}
+
+func (s *testDNSServer) record(event string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.events = append(s.events, event)
+}
+
+func (s *testDNSServer) Events() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.events)
+}
+
+func lookupTestDNSAAAA(ctx context.Context, resolverAddress, host string) ([]netip.Addr, error) {
+	name, err := dnsmessage.NewName(strings.TrimSuffix(host, ".") + ".")
+	if err != nil {
+		return nil, err
+	}
+	query, err := (&dnsmessage.Message{
+		Header: dnsmessage.Header{ID: 0xa11a, RecursionDesired: true},
+		Questions: []dnsmessage.Question{{
+			Name:  name,
+			Type:  dnsmessage.TypeAAAA,
+			Class: dnsmessage.ClassINET,
+		}},
+	}).Pack()
+	if err != nil {
+		return nil, err
+	}
+	response, err := exchangeDiagnosticDNS(ctx, "udp", resolverAddress, query)
+	if err != nil {
+		return nil, err
+	}
+	var message dnsmessage.Message
+	if err := message.Unpack(response); err != nil {
+		return nil, err
+	}
+	addresses := make([]netip.Addr, 0, len(message.Answers))
+	for _, answer := range message.Answers {
+		if resource, ok := answer.Body.(*dnsmessage.AAAAResource); ok {
+			addresses = append(addresses, netip.AddrFrom16(resource.AAAA))
+		}
+	}
+	return addresses, nil
+}
+
+func startTestDNSServer(t *testing.T, behavior testDNSBehavior) *testDNSServer {
+	t.Helper()
+	connection, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &testDNSServer{address: connection.LocalAddr().String()}
+	serveErr := make(chan error, 1)
+	serveDone := make(chan struct{})
+	go func() {
+		defer close(serveDone)
+		buffer := make([]byte, 1232)
+		for {
+			count, remote, err := connection.ReadFrom(buffer)
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if err != nil {
+				serveErr <- err
+				return
+			}
+			var parser dnsmessage.Parser
+			header, err := parser.Start(buffer[:count])
+			if err != nil {
+				serveErr <- err
+				return
+			}
+			question, err := parser.Question()
+			if err != nil {
+				serveErr <- err
+				return
+			}
+			if got := question.Name.String(); got != behavior.expectedName {
+				serveErr <- fmt.Errorf("DNS question name = %q, want %q", got, behavior.expectedName)
+				return
+			}
+			if behavior.malformedResponse {
+				if _, err := connection.WriteTo([]byte{0, 1, 2}, remote); err != nil && !errors.Is(err, net.ErrClosed) {
+					serveErr <- err
+					return
+				}
+				continue
+			}
+			responseQuestion := question
+			if behavior.responseName != "" {
+				responseName, err := dnsmessage.NewName(behavior.responseName)
+				if err != nil {
+					serveErr <- err
+					return
+				}
+				responseQuestion.Name = responseName
+			}
+			builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+				ID:                 header.ID + behavior.responseIDDelta,
+				Response:           true,
+				Authoritative:      true,
+				RecursionDesired:   header.RecursionDesired,
+				RecursionAvailable: true,
+				RCode:              behavior.rcode,
+			})
+			builder.EnableCompression()
+			if err := builder.StartQuestions(); err != nil {
+				serveErr <- err
+				return
+			}
+			if err := builder.Question(responseQuestion); err != nil {
+				serveErr <- err
+				return
+			}
+			if err := builder.StartAnswers(); err != nil {
+				serveErr <- err
+				return
+			}
+			if behavior.rcode == dnsmessage.RCodeSuccess {
+				resourceName := responseQuestion.Name
+				if behavior.cnameTarget != "" {
+					cnameTarget, err := dnsmessage.NewName(behavior.cnameTarget)
+					if err != nil {
+						serveErr <- err
+						return
+					}
+					resourceHeader := dnsmessage.ResourceHeader{Name: responseQuestion.Name, Class: dnsmessage.ClassINET, TTL: 1}
+					if err := builder.CNAMEResource(resourceHeader, dnsmessage.CNAMEResource{CNAME: cnameTarget}); err != nil {
+						serveErr <- err
+						return
+					}
+					resourceName = cnameTarget
+				}
+				if behavior.aRecordName != "" {
+					aRecordName, err := dnsmessage.NewName(behavior.aRecordName)
+					if err != nil {
+						serveErr <- err
+						return
+					}
+					resourceName = aRecordName
+				}
+				resourceHeader := dnsmessage.ResourceHeader{Name: resourceName, Class: dnsmessage.ClassINET, TTL: 1}
+				switch question.Type {
+				case dnsmessage.TypeA:
+					if server.aQueries.Add(1) >= behavior.publishAOn {
+						server.record("A-published")
+						if behavior.omitA {
+							break
+						}
+						aRecord := behavior.aRecord
+						if aRecord == ([4]byte{}) {
+							aRecord = [4]byte{127, 0, 0, 1}
+						}
+						if err := builder.AResource(resourceHeader, dnsmessage.AResource{A: aRecord}); err != nil {
+							serveErr <- err
+							return
+						}
+					} else {
+						server.record("A-unpublished")
+					}
+				case dnsmessage.TypeAAAA:
+					server.record("AAAA-published")
+					if err := builder.AAAAResource(resourceHeader, dnsmessage.AAAAResource{AAAA: [16]byte{15: 1}}); err != nil {
+						serveErr <- err
+						return
+					}
+				}
+			} else {
+				server.record("SERVFAIL")
+			}
+			response, err := builder.Finish()
+			if err != nil {
+				serveErr <- err
+				return
+			}
+			response = append(response, behavior.trailingResponse...)
+			if _, err := connection.WriteTo(response, remote); err != nil && !errors.Is(err, net.ErrClosed) {
+				serveErr <- err
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		_ = connection.Close()
+		select {
+		case <-serveDone:
+		case <-time.After(time.Second):
+			t.Error("test DNS server did not stop")
+			return
+		}
+		select {
+		case err := <-serveErr:
+			t.Errorf("serve test DNS: %v", err)
+		default:
+		}
+	})
+	return server
+}
+
+type truncatedTestDNSServer struct {
+	address string
+
+	udpQueries  atomic.Int32
+	tcpQueries  atomic.Int32
+	tcpAccepted chan struct{}
+	tcpMu       sync.Mutex
+	tcpClosing  bool
+	tcpActive   map[net.Conn]struct{}
+}
+
+type truncatedTestDNSOptions struct {
+	truncateTCP bool
+	trailingTCP []byte
+}
+
+type trackingPacketConn struct {
+	net.PacketConn
+	closed atomic.Bool
+}
+
+func (c *trackingPacketConn) Close() error {
+	c.closed.Store(true)
+	return c.PacketConn.Close()
+}
+
+func listenTruncatedTestDNS(
+	listenPacket func(string, string) (net.PacketConn, error),
+	listenTCP func(string, string) (net.Listener, error),
+) (net.PacketConn, net.Listener, error) {
+	const maxAttempts = 32
+	var collisionErr error
+	for range maxAttempts {
+		udpConnection, err := listenPacket("udp4", "127.0.0.1:0")
+		if err != nil {
+			return nil, nil, err
+		}
+		tcpListener, err := listenTCP("tcp4", udpConnection.LocalAddr().String())
+		if err == nil {
+			return udpConnection, tcpListener, nil
+		}
+		if closeErr := udpConnection.Close(); closeErr != nil {
+			return nil, nil, errors.Join(err, closeErr)
+		}
+		if !errors.Is(err, syscall.EADDRINUSE) {
+			return nil, nil, err
+		}
+		collisionErr = err
+	}
+	return nil, nil, fmt.Errorf("reserve shared UDP/TCP test DNS port after %d attempts: %w", maxAttempts, collisionErr)
+}
+
+func startTruncatedTestDNSServer(t *testing.T, expectedName string, aRecord [4]byte, options ...truncatedTestDNSOptions) *truncatedTestDNSServer {
+	t.Helper()
+	var option truncatedTestDNSOptions
+	if len(options) > 0 {
+		option = options[0]
+	}
+	udpConnection, tcpListener, err := listenTruncatedTestDNS(net.ListenPacket, net.Listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &truncatedTestDNSServer{
+		address:     udpConnection.LocalAddr().String(),
+		tcpAccepted: make(chan struct{}, 1),
+		tcpActive:   make(map[net.Conn]struct{}),
+	}
+	serveErr := make(chan error, 2)
+	var serveWG sync.WaitGroup
+	reportErr := func(err error) {
+		select {
+		case serveErr <- err:
+		default:
+		}
+	}
+	buildResponse := func(query []byte, truncated bool) ([]byte, error) {
+		var parser dnsmessage.Parser
+		header, err := parser.Start(query)
+		if err != nil {
+			return nil, err
+		}
+		question, err := parser.Question()
+		if err != nil {
+			return nil, err
+		}
+		if got := question.Name.String(); got != expectedName {
+			return nil, fmt.Errorf("DNS question name = %q, want %q", got, expectedName)
+		}
+		builder := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+			ID:                 header.ID,
+			Response:           true,
+			Authoritative:      true,
+			Truncated:          truncated,
+			RecursionDesired:   header.RecursionDesired,
+			RecursionAvailable: true,
+		})
+		builder.EnableCompression()
+		if err := builder.StartQuestions(); err != nil {
+			return nil, err
+		}
+		if err := builder.Question(question); err != nil {
+			return nil, err
+		}
+		if truncated {
+			return builder.Finish()
+		}
+		if err := builder.StartAnswers(); err != nil {
+			return nil, err
+		}
+		resourceHeader := dnsmessage.ResourceHeader{Name: question.Name, Class: dnsmessage.ClassINET, TTL: 1}
+		if err := builder.AResource(resourceHeader, dnsmessage.AResource{A: aRecord}); err != nil {
+			return nil, err
+		}
+		return builder.Finish()
+	}
+
+	serveWG.Add(2)
+	go func() {
+		defer serveWG.Done()
+		buffer := make([]byte, 1232)
+		for {
+			count, remote, err := udpConnection.ReadFrom(buffer)
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if err != nil {
+				reportErr(err)
+				return
+			}
+			server.udpQueries.Add(1)
+			response, err := buildResponse(buffer[:count], true)
+			if err != nil {
+				reportErr(err)
+				return
+			}
+			if _, err := udpConnection.WriteTo(response, remote); err != nil && !errors.Is(err, net.ErrClosed) {
+				reportErr(err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer serveWG.Done()
+		for {
+			connection, err := tcpListener.Accept()
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if err != nil {
+				reportErr(err)
+				return
+			}
+			server.tcpMu.Lock()
+			if server.tcpClosing {
+				server.tcpMu.Unlock()
+				_ = connection.Close()
+				return
+			}
+			server.tcpActive[connection] = struct{}{}
+			server.tcpMu.Unlock()
+
+			err = func() error {
+				defer func() {
+					server.tcpMu.Lock()
+					delete(server.tcpActive, connection)
+					server.tcpMu.Unlock()
+					_ = connection.Close()
+				}()
+				select {
+				case server.tcpAccepted <- struct{}{}:
+				default:
+				}
+				var size [2]byte
+				if _, err := io.ReadFull(connection, size[:]); err != nil {
+					return err
+				}
+				query := make([]byte, binary.BigEndian.Uint16(size[:]))
+				if _, err := io.ReadFull(connection, query); err != nil {
+					return err
+				}
+				server.tcpQueries.Add(1)
+				response, err := buildResponse(query, option.truncateTCP)
+				if err != nil {
+					return err
+				}
+				response = append(response, option.trailingTCP...)
+				frame := make([]byte, 2+len(response))
+				binary.BigEndian.PutUint16(frame[:2], uint16(len(response)))
+				copy(frame[2:], response)
+				_, err = connection.Write(frame)
+				return err
+			}()
+			if err != nil {
+				server.tcpMu.Lock()
+				closing := server.tcpClosing
+				server.tcpMu.Unlock()
+				if !closing {
+					reportErr(err)
+				}
+				return
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		server.tcpMu.Lock()
+		server.tcpClosing = true
+		active := make([]net.Conn, 0, len(server.tcpActive))
+		for connection := range server.tcpActive {
+			active = append(active, connection)
+		}
+		server.tcpMu.Unlock()
+		for _, connection := range active {
+			_ = connection.Close()
+		}
+		_ = udpConnection.Close()
+		_ = tcpListener.Close()
+		done := make(chan struct{})
+		go func() {
+			serveWG.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("truncated test DNS server did not stop")
+		}
+		select {
+		case err := <-serveErr:
+			t.Errorf("serve truncated test DNS: %v", err)
+		default:
+		}
+	})
+	return server
 }
 
 func TestPinnedCloudflaredReleaseMetadata(t *testing.T) {
@@ -1438,7 +3390,7 @@ esac
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- runLifecycleScenario(ctx, "candidate:test", "https://example.test/lifecycle-hang", time.Minute, "stop")
+		result <- runLifecycleScenario(ctx, "candidate:test", "https://example.test/lifecycle-hang", time.Minute, "stop", false)
 	}()
 	container := filepath.Join(stateDir, "container")
 	deadline := time.Now().Add(2 * time.Second)
@@ -1526,7 +3478,7 @@ esac
 	ctx, cancel := context.WithCancel(context.Background())
 	result := make(chan error, 1)
 	go func() {
-		result <- runLifecycleScenario(ctx, "candidate:test", "https://example.test/lifecycle-hang", time.Minute, "stop")
+		result <- runLifecycleScenario(ctx, "candidate:test", "https://example.test/lifecycle-hang", time.Minute, "stop", false)
 	}()
 	waitForPath(t, filepath.Join(stateDir, "container"))
 	cancel()
@@ -1590,7 +3542,7 @@ esac
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("PRODUCT_CAPTURE_TEST_DOCKER_STATE", stateDir)
 
-	err := runLifecycleScenario(context.Background(), "candidate:test", "https://example.test/lifecycle-hang", time.Minute, "stop")
+	err := runLifecycleScenario(context.Background(), "candidate:test", "https://example.test/lifecycle-hang", time.Minute, "stop", false)
 	if err == nil || !strings.Contains(err.Error(), "container exited before stop termination") {
 		t.Fatalf("runLifecycleScenario error = %v, want early exit", err)
 	}
@@ -2001,6 +3953,33 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+type trackingReadCloser struct {
+	io.Reader
+	closed   bool
+	closeErr error
+	onRead   func()
+	once     sync.Once
+}
+
+func (r *trackingReadCloser) Read(buffer []byte) (int, error) {
+	count, err := r.Reader.Read(buffer)
+	if r.onRead != nil {
+		r.once.Do(r.onRead)
+	}
+	return count, err
+}
+
+func (r *trackingReadCloser) Close() error {
+	r.closed = true
+	return r.closeErr
+}
+
+type readFunc func([]byte) (int, error)
+
+func (f readFunc) Read(buffer []byte) (int, error) {
+	return f(buffer)
 }
 
 type proxyTunnel struct {
