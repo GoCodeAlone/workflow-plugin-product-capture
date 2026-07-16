@@ -341,6 +341,17 @@ short wall-clock deadline, and a trusted-certificate test proves that the public
 IPv4 dial pin retains original-host SNI and TLS verification. This does not
 change the Scope Manifest or release target.
 
+**Execution backport 2026-07-16 (managed Cloudflare origin readiness):**
+release run `29484605136` received HTTP 530 from the generated Quick Tunnel
+about four seconds before `cloudflared` registered the tunnel connection.
+Cloudflare [documents 530 as an origin DNS resolution failure](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-530/).
+Treat that status as transient only for an auto-managed Quick Tunnel health check, within the
+existing two-minute health deadline and three-attempt tunnel limit. Explicit
+operator-owned origins retain terminal status handling, and persistent managed
+530 responses still fail closed when the bounded deadline expires. Advance the
+unpublished correction to `v0.1.65` without repointing `v0.1.64`. This does not
+change the Scope Manifest.
+
 **Execution receipt 2026-07-16:** two consecutive exact-source launches against
 candidate image
 `sha256:4836b1e159da8c8c3e2915440d61e56248f56780c96c09f4b5ef6660d8ec118d`

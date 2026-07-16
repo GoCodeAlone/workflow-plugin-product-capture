@@ -564,6 +564,92 @@ func TestFetchRunHealthRetriesTemporaryDNSForManagedOrigin(t *testing.T) {
 	})
 }
 
+func TestFetchRunHealthRetriesCloudflareOriginDNSFailureOnlyForManagedTunnel(t *testing.T) {
+	healthResponse := func(request *http.Request, status int) *http.Response {
+		var body io.ReadCloser = http.NoBody
+		if status == http.StatusOK {
+			body = io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"run-123"}`))
+		}
+		return &http.Response{
+			StatusCode: status,
+			Header:     make(http.Header),
+			Body:       body,
+			Request:    request,
+		}
+	}
+
+	t.Run("managed", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			calls := 0
+			failureBody := &trackingReadCloser{Reader: strings.NewReader("<!doctype html><title>Origin DNS error</title>")}
+			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				calls++
+				if calls == 1 {
+					response := healthResponse(request, 530)
+					response.Body = failureBody
+					return response, nil
+				}
+				return healthResponse(request, http.StatusOK), nil
+			})}
+			started := time.Now()
+			err := fetchRunHealth(
+				context.Background(),
+				client,
+				"https://managed.example/runs/run-123/healthz",
+				"run-123",
+				time.Millisecond,
+				true,
+				waitForDiagnosticHealthRetry,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if calls != 2 {
+				t.Fatalf("managed health calls = %d, want status 530 retry followed by success", calls)
+			}
+			if !failureBody.closed {
+				t.Fatal("managed status 530 HTML body was not closed")
+			}
+			if elapsed := time.Since(started); elapsed != time.Millisecond {
+				t.Fatalf("managed status 530 retry elapsed = %s, want %s", elapsed, time.Millisecond)
+			}
+		})
+	})
+
+	t.Run("explicit", func(t *testing.T) {
+		calls := 0
+		retryWaits := 0
+		failureBody := &trackingReadCloser{Reader: strings.NewReader("<!doctype html><title>Origin DNS error</title>")}
+		client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls++
+			response := healthResponse(request, 530)
+			response.Body = failureBody
+			return response, nil
+		})}
+		err := fetchRunHealth(
+			context.Background(),
+			client,
+			"https://operator.example/runs/run-123/healthz",
+			"run-123",
+			time.Millisecond,
+			false,
+			func(context.Context, time.Duration) error {
+				retryWaits++
+				return nil
+			},
+		)
+		if err == nil || !strings.Contains(err.Error(), "status 530") {
+			t.Fatalf("explicit health error = %v, want terminal status 530", err)
+		}
+		if calls != 1 || retryWaits != 0 {
+			t.Fatalf("explicit health calls/retry waits = %d/%d, want 1/0", calls, retryWaits)
+		}
+		if !failureBody.closed {
+			t.Fatal("explicit status 530 HTML body was not closed")
+		}
+	})
+}
+
 func TestFetchRunHealthClassifiesExhaustedTemporaryDNS(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		calls := 0
@@ -1514,42 +1600,49 @@ func TestDefaultConformanceTimeoutCoversTunnelRetriesAndRuntime(t *testing.T) {
 }
 
 func TestRunnerRetriesTransientQuickTunnelHealthAndCleansEachAttempt(t *testing.T) {
-	tunnel := &sequenceTunnel{origins: []string{"https://first.invalid", "https://second.test"}}
-	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
-		if request.URL.Host == "first.invalid" {
-			return &http.Response{
-				StatusCode: http.StatusServiceUnavailable,
-				Header:     make(http.Header),
-				Body:       http.NoBody,
-				Request:    request,
-			}, nil
-		}
-		runID := strings.Split(strings.Trim(request.URL.Path, "/"), "/")[1]
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     make(http.Header),
-			Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"` + runID + `"}`)),
-			Request:    request,
-		}, nil
-	})}
-	runner := Runner{Dependencies: Dependencies{
-		Tunnel:              tunnel,
-		HTTPClient:          client,
-		TunnelHTTPClient:    client,
-		TunnelHealthTimeout: time.Second,
-		HealthRetryWait: func(context.Context, time.Duration) error {
-			return context.DeadlineExceeded
-		},
-	}}
-	err := runner.Run(context.Background(), Options{
-		Image:  "candidate:test",
-		Output: filepath.Join(t.TempDir(), "conformance.json"),
-	})
-	if err == nil || !strings.Contains(err.Error(), "browser launch dependencies") {
-		t.Fatalf("Run error = %v, want post-health dependency failure", err)
-	}
-	if tunnel.startCalls != 2 || tunnel.stopCalls != 2 {
-		t.Fatalf("tunnel calls = start:%d stop:%d, want 2/2", tunnel.startCalls, tunnel.stopCalls)
+	for name, firstStatus := range map[string]int{
+		"service unavailable": http.StatusServiceUnavailable,
+		"origin DNS failure":  cloudflareOriginDNSFailureStatusCode,
+	} {
+		t.Run(name, func(t *testing.T) {
+			tunnel := &sequenceTunnel{origins: []string{"https://first.invalid", "https://second.test"}}
+			client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+				if request.URL.Host == "first.invalid" {
+					return &http.Response{
+						StatusCode: firstStatus,
+						Header:     make(http.Header),
+						Body:       http.NoBody,
+						Request:    request,
+					}, nil
+				}
+				runID := strings.Split(strings.Trim(request.URL.Path, "/"), "/")[1]
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"schema":"v1","run_id":"` + runID + `"}`)),
+					Request:    request,
+				}, nil
+			})}
+			runner := Runner{Dependencies: Dependencies{
+				Tunnel:              tunnel,
+				HTTPClient:          client,
+				TunnelHTTPClient:    client,
+				TunnelHealthTimeout: time.Second,
+				HealthRetryWait: func(context.Context, time.Duration) error {
+					return context.DeadlineExceeded
+				},
+			}}
+			err := runner.Run(context.Background(), Options{
+				Image:  "candidate:test",
+				Output: filepath.Join(t.TempDir(), "conformance.json"),
+			})
+			if err == nil || !strings.Contains(err.Error(), "browser launch dependencies") {
+				t.Fatalf("Run error = %v, want post-health dependency failure", err)
+			}
+			if tunnel.startCalls != 2 || tunnel.stopCalls != 2 {
+				t.Fatalf("tunnel calls = start:%d stop:%d, want 2/2", tunnel.startCalls, tunnel.stopCalls)
+			}
+		})
 	}
 }
 

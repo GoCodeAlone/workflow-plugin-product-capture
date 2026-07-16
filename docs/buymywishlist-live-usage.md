@@ -61,20 +61,20 @@ plane and embedded in the invite/setup flow.
 
 ## Current Release Target
 
-Use `workflow-plugin-product-capture` `v0.1.64` for the next BuyMyWishlist
+Use `workflow-plugin-product-capture` `v0.1.65` for the next BuyMyWishlist
 live-incorporation pass. Downstream workflow-compute scenarios, staging proof
 defaults, and BuyMyWishlist plugin pins should all reference this tag once its
 release workflow has published the matching browser runtime image digest.
 
 Do not copy a digest from this source tree. The digest that matters is the
-GHCR `product-capture-browser@sha256:<digest>` emitted by the `v0.1.64`
+GHCR `product-capture-browser@sha256:<digest>` emitted by the `v0.1.65`
 release workflow. For component-backed deployments, use the wfcompute package
 campaign's promoted component digest for
 `provider://workflow-plugin-product-capture/browser/runtime`.
 
 ## Product-Owned Staging Proof
 
-After the `v0.1.64` release publishes its browser image, dispatch
+After the `v0.1.65` release publishes its browser image, dispatch
 `.github/workflows/staging-proof.yml` from `main`. Supply the exact released
 image reference, the registered retained staging worker ID, and a real Amazon
 product URL. Store a credential scoped to `agent:read`, `task:read`, and

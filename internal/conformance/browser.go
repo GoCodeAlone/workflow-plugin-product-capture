@@ -938,7 +938,10 @@ var (
 	errDiagnosticTunnelCleanupFailed       = errors.New("diagnostic tunnel cleanup failed")
 )
 
-const maxDiagnosticHealthResponseBytes = 4096
+const (
+	maxDiagnosticHealthResponseBytes     = 4096
+	cloudflareOriginDNSFailureStatusCode = 530
+)
 
 func retryableTunnelStartError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -1293,7 +1296,8 @@ func classifyRunHealthResponse(resp *http.Response, runID string, managedTunnel 
 		return false, nil
 	}
 
-	if retryableHealthStatus(resp.StatusCode) {
+	if retryableHealthStatus(resp.StatusCode) ||
+		managedTunnel && resp.StatusCode == cloudflareOriginDNSFailureStatusCode {
 		classification := fmt.Errorf("diagnostic health endpoint returned transient status %d", resp.StatusCode)
 		return true, classifiedDiagnosticHealthError(managedTunnel, classification, bodyErr)
 	}
