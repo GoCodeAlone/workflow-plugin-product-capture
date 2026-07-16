@@ -286,12 +286,13 @@ Scope: pre-lock manifest expands from three to five PRs; no production deploy.
 
 ### Backport 2026-07-11: Executable staging prerequisites
 
-Cause: plan review found the bounded client omitted the canonical `/artifacts/`
-ref segment, webhook `ensure` could rotate a secret after deployment, and BMW's
-real readiness cron delays funded items for seven days.
+Cause: plan review required the bounded client to preserve the proof-scoped
+HTTP route's `/artifacts/` segment, webhook `ensure` could rotate a secret after
+deployment, and BMW's real readiness cron delays funded items for seven days.
 
 Change: bounded downloads round-trip canonical
-`artifact://<pool>/tasks/<task>/proofs/<proof>/artifacts/<name>` refs. Stripe
+`artifact://<pool>/tasks/<task>/proofs/<proof>/<name>` refs and translate them to
+the proof-scoped HTTP `/artifacts/` route. Stripe
 Payments and Issuing `ensure` runs must succeed before the BMW deployment that
 consumes their environment secrets. Fulfillment readiness uses an
 environment-backed delay: seven days by default/production and zero only in
@@ -834,3 +835,43 @@ Each fresh Quick Tunnel run returned schema `v1`, verdict `pass`, Chrome
 `150.0.7871.124`, Playwright `1.57.0`, Xvfb `2:21.1.7-3+deb12u12`, 23 stable
 comparisons, zero mismatches, and eight informational fields. Both runs removed
 their candidate containers and tunnel processes.
+
+### Backport 2026-07-16: Bounded failed-provider evidence
+
+Cause: staging proofs `bmw-capture-7af61cacee301be8` and
+`task-product-capture-capture-product-a0109cd8f63aaf91cbfd` failed on the
+retained worker in under eight seconds, while the exact `v0.1.65` image reached
+Amazon locally and returned a bounded manual-review classification after the
+capture window. The proof receipt intentionally exposed only
+`agent.operation_failed`; the product-owned proof had no retained stderr with
+which to distinguish host/runtime failure from an Amazon response.
+
+Change: product-capture staging-proof tasks request workflow-compute's existing
+generic run-log preservation for 600 seconds. On a nonzero proof, the proof
+client retrieves only the canonical task/proof-scoped `run-logs/stderr.txt`
+artifact for a verifier-accepted receipt bound to the submitted task and
+executor, checks its metadata, UTF-8 encoding, size, and digest, and redacts
+complete sensitive lines before applying a 12 KiB bound to the rendered error.
+Optional control-plane reads stop after three attempts or five seconds.
+Production BMW tasks and proof previews remain unchanged. Do not add
+product-specific diagnostics or raw executor errors to workflow-compute.
+
+Scope: no locked Scope Manifest change; Task 4 already owns product-capture
+staging proof behavior and bounded evidence.
+
+Post-change runtime evidence is intentionally gated on merging this proof
+client change: dispatch the real staging proof from `main`, record its bounded
+failure evidence here, and use that evidence before changing provider behavior.
+
+Contract correction: the first failed-evidence implementation copied an
+invented extra `/artifacts/` segment into its artifact-ref fixture and therefore
+matched compute-core `v0.8.6` rather than workflow-compute. The server's emitted
+canonical ref is
+`artifact://<pool>/tasks/<task>/proofs/<proof>/<name>`; `/artifacts/` exists only
+in the proof-scoped HTTP download route. Compute-core `v0.8.7` corrects its
+public parser against a literal server fixture, after which this proof client
+must consume that released API rather than duplicate ref parsing. A canonical
+name beginning `artifacts/` remains valid and maps to an HTTP path containing
+`/artifacts/artifacts/`; no unversioned reserved name segment is introduced.
+This corrects failed Task 1/Task 5 contract assumptions without changing the
+locked task or PR manifest.

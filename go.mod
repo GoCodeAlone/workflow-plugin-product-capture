@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/GoCodeAlone/workflow v0.74.5
-	github.com/GoCodeAlone/workflow-plugin-compute-core v0.8.6
+	github.com/GoCodeAlone/workflow-plugin-compute-core v0.8.7
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2
 	golang.org/x/mod v0.36.0
 	golang.org/x/net v0.54.0

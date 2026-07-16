@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
 )
@@ -82,6 +83,10 @@ func TestRunCompletesGenericProductCaptureRoundTrip(t *testing.T) {
 		submitted.Requirements.ExecutionSecurityTier != protocol.ExecutionSandboxedContainer ||
 		submitted.Requirements.ProofTier != protocol.ProofArtifactHash {
 		t.Fatalf("requirements = %+v", submitted.Requirements)
+	}
+	if submitted.Labels["workflow.compute.run_logs.preserve"] != "true" ||
+		submitted.Labels["workflow.compute.run_logs.retention_seconds"] != "600" {
+		t.Fatalf("staging proof run-log labels = %#v", submitted.Labels)
 	}
 	var input map[string]any
 	if err := json.Unmarshal(provider.Input, &input); err != nil {
@@ -431,6 +436,437 @@ func TestRunRejectsUnsuccessfulTaskOrProof(t *testing.T) {
 			t.Fatalf("Run error = %v, want rejected proof", err)
 		}
 	})
+}
+
+func TestRunReportsBoundedSanitizedProviderFailureEvidence(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.runLogBody = []byte("chrome warning\nAuthorization: Bearer do-not-print-this\nError: Chrome profile is already active: SingletonLock\n")
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil {
+		t.Fatal("Run succeeded, want failed provider evidence")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "Chrome profile is already active: SingletonLock") {
+		t.Fatalf("Run error = %v, want provider failure evidence", err)
+	}
+	for _, forbidden := range []string{"do-not-print-this", "Authorization: Bearer"} {
+		if strings.Contains(message, forbidden) {
+			t.Fatalf("Run error leaked %q: %v", forbidden, err)
+		}
+	}
+	if len(message) > maxFailurePreviewBytes {
+		t.Fatalf("Run error bytes = %d, want at most %d", len(message), maxFailurePreviewBytes)
+	}
+}
+
+func TestRunReportsProviderFailureEvidenceForSucceededTaskWithNonzeroProof(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.runLogBody = []byte("Error: inconsistent succeeded task retained provider failure\n")
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil || !strings.Contains(err.Error(), "inconsistent succeeded task retained provider failure") {
+		t.Fatalf("Run error = %v, want provider failure evidence for nonzero proof", err)
+	}
+}
+
+func TestRunRetriesTransientProviderFailureEvidenceReads(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.runLogBody = []byte("Error: retained worker runtime failed before navigation\n")
+	fixture.transientArtifactListFailures = 1
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil || !strings.Contains(err.Error(), "retained worker runtime failed before navigation") {
+		t.Fatalf("Run error = %v, want retried provider failure evidence", err)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if got := countArtifactReads(fixture.requests); got != failureEvidenceMaxAttempts {
+		t.Fatalf("failure evidence reads = %d, want %d", got, failureEvidenceMaxAttempts)
+	}
+}
+
+func TestRunDoesNotReportUnverifiedProviderFailureEvidence(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.runLogBody = []byte("Error: unverified provider detail must not be reported\n")
+	fixture.artifactSHA256 = "sha256:" + strings.Repeat("f", 64)
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil {
+		t.Fatal("Run succeeded, want failed provider task")
+	}
+	if strings.Contains(err.Error(), "unverified provider detail") {
+		t.Fatalf("Run error reported digest-mismatched evidence: %v", err)
+	}
+	if !strings.Contains(err.Error(), "ended with status failed") {
+		t.Fatalf("Run error = %v, want generic failed-task error", err)
+	}
+}
+
+func TestRunDoesNotReportFailureEvidenceFromMismatchedArtifactRef(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.runLogBody = []byte("Error: cross-task provider detail must not be reported\n")
+	fixture.artifactRef = "artifact://pool-1/tasks/other-task/proofs/other-proof/run-logs/stderr.txt"
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil {
+		t.Fatal("Run succeeded, want failed provider task")
+	}
+	if strings.Contains(err.Error(), "cross-task provider detail") {
+		t.Fatalf("Run error reported cross-task evidence: %v", err)
+	}
+}
+
+func TestRunDoesNotReportFailureEvidenceFromRejectedProof(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.proofStatus = protocol.VerificationRejected
+	fixture.runLogBody = []byte("Error: rejected-proof provider detail must not be reported\n")
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil {
+		t.Fatal("Run succeeded, want failed provider task")
+	}
+	if strings.Contains(err.Error(), "rejected-proof provider detail") {
+		t.Fatalf("Run error reported evidence from rejected proof: %v", err)
+	}
+}
+
+func TestRunDoesNotReportFailureEvidenceFromMismatchedProofBindings(t *testing.T) {
+	tests := map[string]func(*protocol.ProofReceipt){
+		"worker":    func(proof *protocol.ProofReceipt) { proof.WorkerID = "other-worker" },
+		"policy":    func(proof *protocol.ProofReceipt) { proof.PolicyID = "other-policy" },
+		"input":     func(proof *protocol.ProofReceipt) { proof.InputHash = sha256RefForTest([]byte("other-input")) },
+		"task hash": func(proof *protocol.ProofReceipt) { proof.TaskHash = sha256RefForTest([]byte("other-task")) },
+		"dependency": func(proof *protocol.ProofReceipt) {
+			proof.DependencyClosureHash = sha256RefForTest([]byte("other-workload"))
+		},
+		"executor": func(proof *protocol.ProofReceipt) {
+			proof.Executor.ImageDigest = sha256RefForTest([]byte("other-image"))
+		},
+		"shape": func(proof *protocol.ProofReceipt) { proof.FinishedAt = time.Time{} },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			fixture := newComputeFixture(t)
+			fixture.taskStatus = protocol.TaskFailed
+			fixture.runLogBody = []byte("Error: mismatched-proof detail must not be reported\n")
+			fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+				proof.ExitCode = 1
+				mutate(proof)
+				proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+			}
+			server := httptest.NewServer(fixture)
+			t.Cleanup(server.Close)
+
+			_, err := Run(t.Context(), testConfig(t, server.URL))
+			if err == nil {
+				t.Fatal("Run succeeded, want failed provider task")
+			}
+			if strings.Contains(err.Error(), "mismatched-proof detail") {
+				t.Fatalf("Run error reported evidence from mismatched proof: %v", err)
+			}
+		})
+	}
+}
+
+func TestBoundedFailurePreviewRemainsBoundedAfterRedaction(t *testing.T) {
+	body := []byte(strings.Repeat("token=x\n", maxFailurePreviewBytes))
+	preview := boundedFailurePreview(body)
+	if len(preview) > maxFailurePreviewBytes {
+		t.Fatalf("boundedFailurePreview bytes = %d, want at most %d", len(preview), maxFailurePreviewBytes)
+	}
+	if strings.Contains(preview, "token=x") {
+		t.Fatalf("boundedFailurePreview leaked sensitive input: %q", preview)
+	}
+}
+
+func TestBoundedFailurePreviewRedactsCompleteLongSensitiveLineBeforeTruncation(t *testing.T) {
+	body := []byte("Authorization: Bearer " + strings.Repeat("x", maxFailurePreviewBytes*2))
+	preview := boundedFailurePreview(body)
+	if strings.Contains(preview, strings.Repeat("x", 64)) {
+		t.Fatalf("boundedFailurePreview leaked truncated sensitive line: %q", preview)
+	}
+	if !strings.Contains(preview, "[redacted sensitive line]") {
+		t.Fatalf("boundedFailurePreview = %q, want redaction marker", preview)
+	}
+}
+
+func TestBoundedFailurePreviewRedactsStructuredSecretFormats(t *testing.T) {
+	for _, line := range []string{
+		"Cookie: session_id=do-not-print",
+		"Authorization=Bearer do-not-print",
+		"env[CLIENT_SECRET]=do-not-print",
+		`headers["Authorization"]="do-not-print"`,
+		"SESSION_ID=do-not-print",
+		"PHPSESSID=do-not-print",
+		"CSRF=do-not-print",
+		"XSRF=do-not-print",
+		`{"client_secret":"do-not-print"}`,
+		"AWS_SECRET_ACCESS_KEY=do-not-print",
+		"SECRET_KEY=do-not-print",
+		`{"stripe_secret_key":"do-not-print"}`,
+	} {
+		t.Run(line, func(t *testing.T) {
+			preview := boundedFailurePreview([]byte("safe before\n" + line + "\nsafe after"))
+			if strings.Contains(preview, "do-not-print") {
+				t.Fatalf("boundedFailurePreview(%q) leaked secret: %q", line, preview)
+			}
+			if !strings.Contains(preview, "safe before") || !strings.Contains(preview, "safe after") ||
+				strings.Count(preview, "[redacted sensitive line]") != 1 {
+				t.Fatalf("boundedFailurePreview(%q) = %q, want safe neighbors and one redaction", line, preview)
+			}
+		})
+	}
+}
+
+func TestBoundedFailurePreviewRedactsSensitiveContinuationLine(t *testing.T) {
+	preview := boundedFailurePreview([]byte("safe before\n\"client_secret\":\n\"do-not-print\"\nsafe after"))
+	if strings.Contains(preview, "do-not-print") {
+		t.Fatalf("boundedFailurePreview leaked sensitive continuation: %q", preview)
+	}
+	if !strings.Contains(preview, "safe before") || !strings.Contains(preview, "safe after") ||
+		strings.Count(preview, "[redacted sensitive line]") != 2 {
+		t.Fatalf("boundedFailurePreview = %q, want safe neighbors and two redactions", preview)
+	}
+}
+
+func TestBoundedFailurePreviewRedactsSplitBearerCredential(t *testing.T) {
+	preview := boundedFailurePreview([]byte("safe before\nAuthorization: Bearer\ndo-not-print\nsafe after"))
+	if strings.Contains(preview, "do-not-print") {
+		t.Fatalf("boundedFailurePreview leaked split Bearer credential: %q", preview)
+	}
+	if !strings.Contains(preview, "safe before") || !strings.Contains(preview, "safe after") ||
+		strings.Count(preview, "[redacted sensitive line]") != 2 {
+		t.Fatalf("boundedFailurePreview = %q, want safe neighbors and two redactions", preview)
+	}
+}
+
+func TestBoundedWrappedErrorAlwaysReturnsValidUTF8(t *testing.T) {
+	err := boundedWrappedError("browser diagnostic: ", errors.New(string([]byte{'x', 0xff, 'y'})))
+	if !utf8.ValidString(err.Error()) {
+		t.Fatalf("boundedWrappedError returned invalid UTF-8: %q", err)
+	}
+	if len(err.Error()) > maxFailurePreviewBytes {
+		t.Fatalf("boundedWrappedError bytes = %d, want at most %d", len(err.Error()), maxFailurePreviewBytes)
+	}
+}
+
+func TestBoundedWrappedErrorPreservesClassificationWithoutExposingCause(t *testing.T) {
+	cause := fmt.Errorf("provider detail: %w", context.DeadlineExceeded)
+	err := boundedWrappedError("", cause)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("boundedWrappedError lost deadline classification: %v", err)
+	}
+	if unwrapped := errors.Unwrap(err); unwrapped != nil {
+		t.Fatalf("boundedWrappedError exposed raw cause: %v", unwrapped)
+	}
+}
+
+func TestRunDoesNotReportMalformedUTF8ProviderFailureEvidence(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.runLogBody = append([]byte("Error: invalid utf8 detail "), 0xff, '\n')
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil {
+		t.Fatal("Run succeeded, want failed provider task")
+	}
+	if strings.Contains(err.Error(), "invalid utf8 detail") {
+		t.Fatalf("Run error reported malformed UTF-8 evidence: %v", err)
+	}
+}
+
+func TestRunBoundsCompleteProviderFailureDisplay(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.runLogBody = []byte(strings.Repeat("Error: retained provider failure detail\n", 1_000))
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil {
+		t.Fatal("Run succeeded, want failed provider task")
+	}
+	if len(err.Error()) > maxFailurePreviewBytes {
+		t.Fatalf("Run error bytes = %d, want at most %d", len(err.Error()), maxFailurePreviewBytes)
+	}
+}
+
+func TestRunBoundsRejectedProofIdentity(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.proofStatus = protocol.VerificationRejected
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ID = strings.Repeat("x", maxFailurePreviewBytes*2)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil {
+		t.Fatal("Run succeeded, want rejected proof")
+	}
+	if len(err.Error()) > maxFailurePreviewBytes {
+		t.Fatalf("Run error bytes = %d, want at most %d", len(err.Error()), maxFailurePreviewBytes)
+	}
+	if !utf8.ValidString(err.Error()) {
+		t.Fatalf("Run error is not valid UTF-8: %q", err)
+	}
+}
+
+func TestRunBoundsTransientProviderFailureEvidenceReads(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.runLogBody = []byte("Error: unavailable provider evidence\n")
+	fixture.transientFailures = map[string]int{"GET /v1/proofs": 1_000_000}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.ResultTimeout = time.Second
+
+	_, err := Run(t.Context(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "ended with status failed") {
+		t.Fatalf("Run error = %v, want generic failed-task error", err)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if got := countFailureEvidenceReads(fixture.requests); got != failureEvidenceMaxAttempts {
+		t.Fatalf("failure evidence reads = %d, want %d", got, failureEvidenceMaxAttempts)
+	}
+}
+
+func TestRunDoesNotReportUntrustedStallReason(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.omitSubmittedTasks = true
+	fixture.stallReason = "Authorization: Bearer untrusted-stall-secret"
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil || !strings.Contains(err.Error(), "stalled") {
+		t.Fatalf("Run error = %v, want generic stalled-task error", err)
+	}
+	if strings.Contains(err.Error(), "untrusted-stall-secret") {
+		t.Fatalf("Run error leaked untrusted stall reason: %v", err)
+	}
+}
+
+func TestRunPrioritizesBoundTerminalFailureOverStallReason(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.stallReason = "Authorization: Bearer untrusted-stall-secret"
+	fixture.runLogBody = []byte("Error: verified provider failure detail\n")
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil || !strings.Contains(err.Error(), "verified provider failure detail") {
+		t.Fatalf("Run error = %v, want proof-scoped provider evidence", err)
+	}
+	if strings.Contains(err.Error(), "untrusted-stall-secret") {
+		t.Fatalf("Run error leaked untrusted stall reason: %v", err)
+	}
+}
+
+func TestRunContinuesPendingProofDespiteStaleStall(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.stallReason = "stale capacity stall"
+	proofReads := 0
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proofReads++
+		if proofReads == 1 {
+			proof.Verifier.Status = protocol.VerificationPending
+		} else {
+			proof.Verifier.Status = protocol.VerificationRejected
+		}
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil || !strings.Contains(err.Error(), "rejected") {
+		t.Fatalf("Run error = %v, want rejection after pending proof", err)
+	}
+	if strings.Contains(err.Error(), "stalled") {
+		t.Fatalf("Run error used stale stall while proof was pending: %v", err)
+	}
+}
+
+func TestRunBoundsBrowserDiagnosticFailureDisplay(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.diagnosticRunLogBody = []byte(strings.Repeat("Error: diagnostic provider failure detail\n", 1_000))
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		if strings.Contains(proof.TaskID, "browser-diagnostic") {
+			proof.ExitCode = 1
+			proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+		}
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.BrowserDiagnosticURL = "https://diagnostic.example.test/product-capture-browser"
+
+	_, err := Run(t.Context(), cfg)
+	if err == nil {
+		t.Fatal("Run succeeded, want failed browser diagnostic")
+	}
+	if len(err.Error()) > maxFailurePreviewBytes {
+		t.Fatalf("Run error bytes = %d, want at most %d", len(err.Error()), maxFailurePreviewBytes)
+	}
 }
 
 func TestRunRejectsMismatchedTerminalRequirements(t *testing.T) {
@@ -832,6 +1268,9 @@ type computeFixture struct {
 	artifactContentType               string
 	artifactSize                      int64
 	artifactSHA256                    string
+	artifactRef                       string
+	runLogBody                        []byte
+	diagnosticRunLogBody              []byte
 	taskStatus                        protocol.TaskStatus
 	proofStatus                       protocol.VerificationStatus
 	afterCapacity                     func()
@@ -839,6 +1278,8 @@ type computeFixture struct {
 	permanentFailures                 map[string]int
 	transientArtifactListFailures     int
 	transientArtifactDownloadFailures int
+	omitSubmittedTasks                bool
+	stallReason                       string
 	mutateProof                       func(*protocol.ProofReceipt)
 	mutateTerminalTask                func(*protocol.Task)
 	mutateSubmittedResponse           func(*protocol.Task)
@@ -954,14 +1395,20 @@ func (f *computeFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.writeJSON(w, map[string]any{"leases": f.leases})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/tasks":
 		tasks := append([]protocol.Task(nil), f.queued...)
-		for _, submitted := range f.submitted {
-			submitted.Status = f.taskStatus
-			if f.mutateTerminalTask != nil {
-				f.mutateTerminalTask(&submitted)
+		if !f.omitSubmittedTasks {
+			for _, submitted := range f.submitted {
+				submitted.Status = f.taskStatus
+				if f.mutateTerminalTask != nil {
+					f.mutateTerminalTask(&submitted)
+				}
+				tasks = append(tasks, submitted)
 			}
-			tasks = append(tasks, submitted)
 		}
-		f.writeJSON(w, protocol.TaskList{Tasks: tasks})
+		var stalls []protocol.TaskStall
+		if f.stallReason != "" && len(f.submitted) > 0 {
+			stalls = []protocol.TaskStall{{TaskID: f.submitted[0].ID, Reason: f.stallReason}}
+		}
+		f.writeJSON(w, protocol.TaskList{Tasks: tasks, Stalls: stalls})
 		if f.afterCapacity != nil && len(f.submitted) == 0 {
 			if flusher, ok := w.(http.Flusher); ok {
 				flusher.Flush()
@@ -1028,7 +1475,16 @@ func (f *computeFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		name := f.artifactName
 		contentType := f.artifactContentType
 		isDiagnostic := task.Workload.Provider != nil && task.Workload.Provider.Operation == "browser_diagnostic"
-		if isDiagnostic {
+		if isDiagnostic && len(f.diagnosticRunLogBody) > 0 {
+			body = f.diagnosticRunLogBody
+			name = "run-logs/stderr.txt"
+			contentType = "text/plain; charset=utf-8"
+		} else if len(f.runLogBody) > 0 {
+			body = f.runLogBody
+			name = "run-logs/stderr.txt"
+			contentType = "text/plain; charset=utf-8"
+		}
+		if isDiagnostic && len(f.diagnosticRunLogBody) == 0 {
 			body = f.diagnosticBody
 			name = "browser_diagnostic_json"
 			contentType = "application/json"
@@ -1042,17 +1498,28 @@ func (f *computeFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			sha = f.artifactSHA256
 		}
 		proofID := "proof-" + task.ID
+		ref := fmt.Sprintf("artifact://%s/tasks/%s/proofs/%s/%s", task.PoolID, task.ID, proofID, name)
+		if f.artifactRef != "" {
+			ref = f.artifactRef
+		}
 		f.writeJSON(w, map[string]any{"artifacts": []protocol.TaskArtifact{{
 			TaskID: task.ID, ProofID: proofID, PoolID: task.PoolID,
-			Name: name, Ref: fmt.Sprintf("artifact://%s/tasks/%s/proofs/%s/artifacts/%s", task.PoolID, task.ID, proofID, name),
+			Name: name, Ref: ref,
 			ContentType: contentType, SHA256: sha, SizeBytes: size,
 			CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour).UTC(),
 		}}})
 	case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/proofs/") && strings.Contains(r.URL.Path, "/artifacts/"):
 		body := f.productBody
+		if strings.HasSuffix(r.URL.Path, "/artifacts/run-logs/stderr.txt") {
+			body = f.runLogBody
+		}
 		for _, task := range f.submitted {
 			if strings.Contains(r.URL.Path, "/"+task.ID+"/") && task.Workload.Provider != nil && task.Workload.Provider.Operation == "browser_diagnostic" {
-				body = f.diagnosticBody
+				if strings.HasSuffix(r.URL.Path, "/artifacts/run-logs/stderr.txt") && len(f.diagnosticRunLogBody) > 0 {
+					body = f.diagnosticRunLogBody
+				} else {
+					body = f.diagnosticBody
+				}
 				break
 			}
 		}
@@ -1206,6 +1673,26 @@ func countRequests(requests []string, want string) int {
 	count := 0
 	for _, request := range requests {
 		if request == want {
+			count++
+		}
+	}
+	return count
+}
+
+func countFailureEvidenceReads(requests []string) int {
+	count := 0
+	for _, request := range requests {
+		if request == "GET /v1/proofs" || strings.Contains(request, "/artifacts") {
+			count++
+		}
+	}
+	return count
+}
+
+func countArtifactReads(requests []string) int {
+	count := 0
+	for _, request := range requests {
+		if strings.Contains(request, "/artifacts") {
 			count++
 		}
 	}
