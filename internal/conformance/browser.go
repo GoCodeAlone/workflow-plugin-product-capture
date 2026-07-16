@@ -1247,7 +1247,7 @@ func fetchRunHealth(
 			lastErr = responseErr
 		} else {
 			if !managedTunnel {
-				lastErr = errDiagnosticHealthEndpointUnreachable
+				lastErr = errors.Join(errDiagnosticHealthEndpointUnreachable, err)
 			} else {
 				var dnsErr *net.DNSError
 				switch {

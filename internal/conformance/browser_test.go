@@ -512,6 +512,29 @@ func TestFetchRunHealthRetriesTemporaryDNSForOperatorOrigin(t *testing.T) {
 	})
 }
 
+func TestFetchRunHealthPreservesOperatorTransportCauseOnExhaustion(t *testing.T) {
+	cause := errors.New("operator transport cause")
+	client := &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return nil, errors.Join(
+			&net.DNSError{Err: "temporary failure", Name: request.URL.Hostname(), IsTemporary: true},
+			cause,
+		)
+	})}
+	stopErr := errors.New("stop after operator health retry")
+	err := fetchRunHealth(
+		context.Background(),
+		client,
+		"https://operator.example/runs/run-123/healthz",
+		"run-123",
+		time.Millisecond,
+		false,
+		func(context.Context, time.Duration) error { return stopErr },
+	)
+	if !errors.Is(err, errDiagnosticHealthEndpointUnreachable) || !errors.Is(err, cause) || !errors.Is(err, stopErr) {
+		t.Fatalf("operator health error = %v, want endpoint classification, transport cause, and retry-stop cause", err)
+	}
+}
+
 func TestFetchRunHealthRetriesTemporaryDNSForManagedOrigin(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		calls := 0
