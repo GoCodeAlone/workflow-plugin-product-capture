@@ -687,7 +687,7 @@ The candidate conformance attached leg now runs the provider without `DISPLAY`,
 forcing its managed-Xvfb path; the exact local image passed direct-versus-attached
 comparison and all lifecycle scenarios with no residual container. The accepted
 exit-code-1 staging receipt is diagnostic evidence only: Task 4 remains open
-until the immutable `v0.1.64` digest returns an accepted successful staging proof.
+until the immutable `v0.1.65` digest returns an accepted successful staging proof.
 
 ### Backport 2026-07-14: Dual-stack diagnostic pin selection
 
@@ -807,6 +807,26 @@ boundaries. Ownership tests do not use short real-clock deadlines, and the TLS
 pin test trusts a hostname certificate while independently asserting the public
 IPv4 dial address and original-host SNI.
 
+### Backport 2026-07-16: Managed Cloudflare origin readiness
+
+Cause: release run `29484605136` fetched its generated Quick Tunnel health URL
+after the hostname's A record was published but about four seconds before
+`cloudflared` logged a registered tunnel connection. Cloudflare returned HTTP
+530, its [documented origin DNS resolution failure status](https://developers.cloudflare.com/support/troubleshooting/http-status-codes/cloudflare-5xx-errors/error-530/).
+The health classifier
+treated that response as terminal even though this auto-managed origin was still
+within its normal edge-route activation window.
+
+Change: classify HTTP 530 as retryable only for auto-managed Quick Tunnel health
+checks. Keep the existing two-minute health deadline, retry interval, and three
+fresh-tunnel attempt cap. Explicit operator-owned origins retain terminal status
+handling, and a persistent managed 530 still fails closed at the bounded
+deadline. Do not parse Cloudflare's HTML error body. The corrected unpublished
+runtime advances to `v0.1.65`; `v0.1.64` is not repointed.
+
+Scope: no locked Scope Manifest change; Tasks 3-4 retain the same diagnostic,
+release-conformance, and staging-proof boundaries.
+
 Runtime receipt: two consecutive exact-source conformance launches on 2026-07-16
 used candidate image
 `sha256:4836b1e159da8c8c3e2915440d61e56248f56780c96c09f4b5ef6660d8ec118d`.
@@ -814,6 +834,3 @@ Each fresh Quick Tunnel run returned schema `v1`, verdict `pass`, Chrome
 `150.0.7871.124`, Playwright `1.57.0`, Xvfb `2:21.1.7-3+deb12u12`, 23 stable
 comparisons, zero mismatches, and eight informational fields. Both runs removed
 their candidate containers and tunnel processes.
-
-Scope: no locked Scope Manifest change; Tasks 3-4 retain the same diagnostic,
-release-conformance, and staging-proof boundaries.
