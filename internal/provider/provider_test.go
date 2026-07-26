@@ -4219,7 +4219,7 @@ func TestProviderSchemaAcceptsBuyMyWishlistLiveInputAndRejectsDemoFields(t *test
 		"warmup_url":      "https://www.amazon.com/",
 		"capture_mode":    "browser",
 		"timeout_seconds": float64(60),
-		"max_html_bytes":  float64(1048576),
+		"max_html_bytes":  float64(10485760),
 		"max_image_count": float64(8),
 		"metadata_only":   false,
 	}

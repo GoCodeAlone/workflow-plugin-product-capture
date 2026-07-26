@@ -1,10 +1,13 @@
 package productcapture_test
 
 import (
+	"encoding/json"
 	"os"
 	"regexp"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 var pinnedActionRef = regexp.MustCompile(`^(-\s*)?uses:\s+\S+@[0-9a-f]{40}(\s+#\s+\S+)?$`)
@@ -123,6 +126,69 @@ func TestStagingProofDocsRequireMinimumScopedCredential(t *testing.T) {
 	}
 	if !strings.Contains(docs, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS=https://<diagnostic-host>") {
 		t.Fatal("staging proof docs omit the required browser diagnostic origin allowlist")
+	}
+}
+
+func TestBuyMyWishlistDocsUseVerifiedHTMLBound(t *testing.T) {
+	const verifiedMaxHTMLBytes = 10 << 20
+
+	data, err := os.ReadFile("docs/buymywishlist-live-usage.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	docs := strings.ReplaceAll(string(data), "\r\n", "\n")
+	_, workflowSection, found := strings.Cut(docs, "## Workflow Step")
+	if !found {
+		t.Fatal("BuyMyWishlist live-usage docs missing Workflow Step section")
+	}
+	_, workflowYAML, found := strings.Cut(workflowSection, "```yaml\n")
+	if !found {
+		t.Fatal("BuyMyWishlist Workflow Step section missing YAML block")
+	}
+	workflowYAML, _, found = strings.Cut(workflowYAML, "\n```")
+	if !found {
+		t.Fatal("BuyMyWishlist Workflow Step YAML block is not closed")
+	}
+	var workflow struct {
+		Steps []struct {
+			Type   string `yaml:"type"`
+			Config struct {
+				MaxHTMLBytes int64 `yaml:"max_html_bytes"`
+			} `yaml:"config"`
+		} `yaml:"steps"`
+	}
+	if err := yaml.Unmarshal([]byte(workflowYAML), &workflow); err != nil {
+		t.Fatalf("parse BuyMyWishlist Workflow Step YAML: %v", err)
+	}
+	var captureStepCount int
+	var documentedMaxHTMLBytes int64
+	for _, step := range workflow.Steps {
+		if step.Type == "step.product_capture" {
+			captureStepCount++
+			documentedMaxHTMLBytes = step.Config.MaxHTMLBytes
+		}
+	}
+	if captureStepCount != 1 {
+		t.Fatalf("BuyMyWishlist product-capture step count = %d, want 1", captureStepCount)
+	}
+	if documentedMaxHTMLBytes != verifiedMaxHTMLBytes {
+		t.Fatalf("BuyMyWishlist max_html_bytes = %d, want %d", documentedMaxHTMLBytes, verifiedMaxHTMLBytes)
+	}
+
+	schemaData, err := os.ReadFile("schemas/product-capture-operation-input.schema.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var schema struct {
+		Properties map[string]struct {
+			Maximum int64 `json:"maximum"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(schemaData, &schema); err != nil {
+		t.Fatalf("parse product-capture operation schema: %v", err)
+	}
+	if got := schema.Properties["max_html_bytes"].Maximum; got != verifiedMaxHTMLBytes {
+		t.Fatalf("max_html_bytes schema maximum = %d, want %d", got, verifiedMaxHTMLBytes)
 	}
 }
 
