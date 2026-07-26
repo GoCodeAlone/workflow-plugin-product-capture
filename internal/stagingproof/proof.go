@@ -35,6 +35,8 @@ const (
 	maxSummaryCurrencyBytes                      = 16
 	stagingRunLogRetentionSeconds                = 600
 	failureEvidenceTimeout                       = 5 * time.Second
+	failureEvidencePollInterval                  = 500 * time.Millisecond
+	failureProofMaxAttempts                      = 3
 	failureEvidenceMaxAttempts                   = 3
 	maxFailureRunLogBytes                        = 1 << 20
 	maxFailurePreviewBytes                       = 12 << 10
@@ -606,7 +608,7 @@ func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Conf
 			}
 			switch task.Status {
 			case protocol.TaskFailed, protocol.TaskStalled, protocol.TaskCanceled:
-				return protocol.Task{}, protocol.ProofReceipt{}, failedProviderTaskError(waitCtx, client, cfg, task, expected, expectedExecutor)
+				return protocol.Task{}, protocol.ProofReceipt{}, failedProviderTaskError(ctx, client, cfg, task, expected, expectedExecutor)
 			case protocol.TaskSucceeded:
 				foundProof, err := retryTransient(waitCtx, cfg.PollInterval, func() (proofSnapshot, error) {
 					proof, ok, err := client.FindProof(waitCtx, taskID)
@@ -625,7 +627,7 @@ func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Conf
 					}
 					if proof.ExitCode != 0 {
 						base := errors.New("accepted proof exit_code is nonzero")
-						return protocol.Task{}, protocol.ProofReceipt{}, failedProviderProofError(waitCtx, client, cfg, base, task, expected, expectedExecutor, proof)
+						return protocol.Task{}, protocol.ProofReceipt{}, failedProviderProofError(ctx, client, cfg, base, task, expected, expectedExecutor, proof)
 					}
 					return task, proof, nil
 				}
@@ -646,18 +648,46 @@ func waitForAcceptedProof(ctx context.Context, client *protocol.Client, cfg Conf
 
 func failedProviderTaskError(ctx context.Context, client *protocol.Client, cfg Config, task, expected protocol.Task, expectedExecutor protocol.ExecutorRef) error {
 	base := fmt.Errorf("task %s ended with status %s", task.ID, task.Status)
-	evidenceCtx, cancel := context.WithTimeout(ctx, failureEvidenceTimeout)
-	defer cancel()
-	remainingReads := failureEvidenceMaxAttempts
-	foundProof, err := retryTransientBudget(evidenceCtx, cfg.PollInterval, &remainingReads, func() (proofSnapshot, error) {
-		proof, found, err := client.FindProof(evidenceCtx, task.ID)
-		return proofSnapshot{Proof: proof, Found: found}, err
-	})
+	proofCtx, cancelProof := context.WithTimeout(ctx, failureEvidenceTimeout)
+	proofReads := failureProofMaxAttempts
+	foundProof, err := findFailureProof(proofCtx, client, task.ID, &proofReads)
+	cancelProof()
 	proof, found := foundProof.Proof, foundProof.Found
 	if err != nil || !found {
 		return base
 	}
-	return providerFailureEvidenceError(evidenceCtx, client, cfg, &remainingReads, base, task, expected, expectedExecutor, proof)
+	artifactCtx, cancelArtifacts := context.WithTimeout(ctx, failureEvidenceTimeout)
+	defer cancelArtifacts()
+	remainingReads := failureEvidenceMaxAttempts
+	return providerFailureEvidenceError(artifactCtx, client, cfg, &remainingReads, base, task, expected, expectedExecutor, proof)
+}
+
+func findFailureProof(ctx context.Context, client *protocol.Client, taskID string, remainingReads *int) (proofSnapshot, error) {
+	var lastErr error
+	for remainingReads != nil && *remainingReads > 0 {
+		*remainingReads--
+		proof, found, err := client.FindProof(ctx, taskID)
+		if err == nil && found {
+			switch proof.Verifier.Status {
+			case protocol.VerificationAccepted:
+				return proofSnapshot{Proof: proof, Found: true}, nil
+			case protocol.VerificationPending, protocol.VerificationUnknown:
+			default:
+				return proofSnapshot{}, nil
+			}
+		}
+		if err != nil && !isTransientControlError(err) {
+			return proofSnapshot{}, err
+		}
+		lastErr = err
+		if *remainingReads == 0 {
+			break
+		}
+		if err := waitForPoll(ctx, failureEvidencePollInterval); err != nil {
+			return proofSnapshot{}, errors.Join(err, lastErr)
+		}
+	}
+	return proofSnapshot{}, lastErr
 }
 
 func failedProviderProofError(ctx context.Context, client *protocol.Client, cfg Config, base error, task, expected protocol.Task, expectedExecutor protocol.ExecutorRef, proof protocol.ProofReceipt) error {
@@ -671,7 +701,7 @@ func providerFailureEvidenceError(ctx context.Context, client *protocol.Client, 
 	if proof.ExitCode == 0 || validateProofBinding(proof, task, expected, cfg, expectedExecutor) != nil {
 		return base
 	}
-	artifacts, err := retryTransientBudget(ctx, cfg.PollInterval, remainingReads, func() ([]protocol.TaskArtifact, error) {
+	artifacts, err := retryTransientBudget(ctx, failureEvidencePollInterval, remainingReads, func() ([]protocol.TaskArtifact, error) {
 		return client.ListTaskArtifacts(ctx, task.ID)
 	})
 	if err != nil {
@@ -694,7 +724,7 @@ func providerFailureEvidenceError(ctx context.Context, client *protocol.Client, 
 		!validSHA256(stderr.SHA256) {
 		return base
 	}
-	body, err := retryTransientBudget(ctx, cfg.PollInterval, remainingReads, func() ([]byte, error) {
+	body, err := retryTransientBudget(ctx, failureEvidencePollInterval, remainingReads, func() ([]byte, error) {
 		return client.DownloadTaskArtifact(ctx, stderr.Ref, maxFailureRunLogBytes)
 	})
 	if err != nil || int64(len(body)) != stderr.SizeBytes || sha256Ref(body) != stderr.SHA256 {

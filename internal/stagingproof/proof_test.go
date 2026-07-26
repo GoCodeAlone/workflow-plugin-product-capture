@@ -509,6 +509,62 @@ func TestRunReportsProviderFailureEvidenceForSucceededTaskWithNonzeroProof(t *te
 	}
 }
 
+func TestRunWaitsForDelayedFailedTaskProofBeforeReadingEvidence(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.pendingTerminalTaskReads = 1
+	fixture.omitProofReads = 1
+	fixture.runLogBody = []byte("Error: delayed failed-task proof retained provider detail\n")
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.PollInterval = 750 * time.Millisecond
+	cfg.ResultTimeout = time.Second
+
+	started := time.Now()
+	_, err := Run(t.Context(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "delayed failed-task proof retained provider detail") {
+		t.Fatalf("Run error = %v, want delayed proof-scoped provider evidence", err)
+	}
+	if elapsed := time.Since(started); elapsed <= cfg.ResultTimeout {
+		t.Fatalf("Run returned after %s, want evidence collection to outlive %s result timeout", elapsed, cfg.ResultTimeout)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if got := countRequests(fixture.requests, "GET /v1/proofs"); got != 2 {
+		t.Fatalf("proof reads = %d, want 2", got)
+	}
+}
+
+func TestRunWaitsForPendingFailedTaskProofBeforeReadingEvidence(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.pendingProofReads = 1
+	fixture.runLogBody = []byte("Error: accepted failed-task proof retained provider detail\n")
+	fixture.mutateProof = func(proof *protocol.ProofReceipt) {
+		proof.ExitCode = 1
+		proof.AgentSignature = protocol.SoftwareAgentProofSignature(*proof)
+	}
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.ResultTimeout = 2 * time.Second
+
+	_, err := Run(t.Context(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "accepted failed-task proof retained provider detail") {
+		t.Fatalf("Run error = %v, want accepted proof-scoped provider evidence", err)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if got := countRequests(fixture.requests, "GET /v1/proofs"); got != 2 {
+		t.Fatalf("proof reads = %d, want 2", got)
+	}
+}
+
 func TestRunRetriesTransientProviderFailureEvidenceReads(t *testing.T) {
 	fixture := newComputeFixture(t)
 	fixture.runLogBody = []byte("Error: retained worker runtime failed before navigation\n")
@@ -805,8 +861,32 @@ func TestRunBoundsTransientProviderFailureEvidenceReads(t *testing.T) {
 	}
 	fixture.mu.Lock()
 	defer fixture.mu.Unlock()
-	if got := countFailureEvidenceReads(fixture.requests); got != failureEvidenceMaxAttempts {
-		t.Fatalf("failure evidence reads = %d, want %d", got, failureEvidenceMaxAttempts)
+	if got := countRequests(fixture.requests, "GET /v1/proofs"); got != failureProofMaxAttempts {
+		t.Fatalf("proof reads = %d, want %d", got, failureProofMaxAttempts)
+	}
+	if got := countArtifactReads(fixture.requests); got != 0 {
+		t.Fatalf("artifact reads = %d, want 0", got)
+	}
+}
+
+func TestRunBoundsMissingFailureProofReads(t *testing.T) {
+	fixture := newComputeFixture(t)
+	fixture.taskStatus = protocol.TaskFailed
+	fixture.omitProofReads = failureProofMaxAttempts + 1
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	_, err := Run(t.Context(), testConfig(t, server.URL))
+	if err == nil || !strings.Contains(err.Error(), "ended with status failed") {
+		t.Fatalf("Run error = %v, want generic failed-task error", err)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if got := countRequests(fixture.requests, "GET /v1/proofs"); got != failureProofMaxAttempts {
+		t.Fatalf("proof reads = %d, want %d", got, failureProofMaxAttempts)
+	}
+	if got := countArtifactReads(fixture.requests); got != 0 {
+		t.Fatalf("artifact reads = %d, want 0", got)
 	}
 }
 
@@ -1305,6 +1385,9 @@ type computeFixture struct {
 	permanentFailures                 map[string]int
 	transientArtifactListFailures     int
 	transientArtifactDownloadFailures int
+	omitProofReads                    int
+	pendingProofReads                 int
+	pendingTerminalTaskReads          int
 	omitSubmittedTasks                bool
 	stallReason                       string
 	mutateProof                       func(*protocol.ProofReceipt)
@@ -1445,7 +1528,12 @@ func (f *computeFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		tasks := append([]protocol.Task(nil), f.queued...)
 		if !f.omitSubmittedTasks {
 			for _, submitted := range f.submitted {
-				submitted.Status = f.taskStatus
+				if f.pendingTerminalTaskReads > 0 {
+					f.pendingTerminalTaskReads--
+					submitted.Status = protocol.TaskQueued
+				} else {
+					submitted.Status = f.taskStatus
+				}
 				if f.mutateTerminalTask != nil {
 					f.mutateTerminalTask(&submitted)
 				}
@@ -1479,6 +1567,11 @@ func (f *computeFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusCreated)
 		f.writeJSON(w, protocol.TaskResponse{Task: created})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/proofs":
+		if f.omitProofReads > 0 {
+			f.omitProofReads--
+			f.writeJSON(w, protocol.ProofList{})
+			return
+		}
 		proofs := make([]protocol.ProofReceipt, 0, len(f.submitted))
 		for _, task := range f.submitted {
 			finishedAt := time.Now().UTC()
@@ -1509,6 +1602,11 @@ func (f *computeFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			proof.AgentSignature = protocol.SoftwareAgentProofSignature(proof)
 			if f.mutateProof != nil {
 				f.mutateProof(&proof)
+			}
+			if f.pendingProofReads > 0 {
+				f.pendingProofReads--
+				proof.Verifier.Status = protocol.VerificationPending
+				proof.AgentSignature = protocol.SoftwareAgentProofSignature(proof)
 			}
 			proofs = append(proofs, proof)
 		}
@@ -1752,16 +1850,6 @@ func countRequests(requests []string, want string) int {
 	count := 0
 	for _, request := range requests {
 		if request == want {
-			count++
-		}
-	}
-	return count
-}
-
-func countFailureEvidenceReads(requests []string) int {
-	count := 0
-	for _, request := range requests {
-		if request == "GET /v1/proofs" || strings.Contains(request, "/artifacts") {
 			count++
 		}
 	}
