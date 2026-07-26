@@ -128,6 +128,30 @@ func TestRunCompletesGenericProductCaptureRoundTrip(t *testing.T) {
 	}
 }
 
+func TestRunAcceptsVersionedRunLogLeasePolicy(t *testing.T) {
+	fixture := newComputeFixture(t)
+	lease := validLeaseForTest("worker-1", time.Now().UTC().Add(-5*time.Minute))
+	lease.CapabilitySnapshot.CapabilityTags = []string{"run-log-lease-policy-v1"}
+	fixture.leases = []protocol.Lease{lease}
+	fixture.leaseRunLogPolicy = json.RawMessage(`{"version":"v1","preserve_full_logs":false}`)
+	server := httptest.NewServer(fixture)
+	t.Cleanup(server.Close)
+
+	if _, err := Run(t.Context(), testConfig(t, server.URL)); err != nil {
+		t.Fatalf("Run with versioned run-log lease policy: %v", err)
+	}
+	fixture.mu.Lock()
+	defer fixture.mu.Unlock()
+	if len(fixture.submitted) != 1 {
+		t.Fatalf("submitted tasks = %d, want 1", len(fixture.submitted))
+	}
+	leaseRead := slices.Index(fixture.requests, "GET /v1/leases")
+	taskSubmit := slices.Index(fixture.requests, "POST /v1/tasks")
+	if leaseRead < 0 || taskSubmit < 0 || leaseRead >= taskSubmit {
+		t.Fatalf("requests = %v, want lease read before task submission", fixture.requests)
+	}
+}
+
 func TestRunMatchesNetworkProductDirectModeCanonicalization(t *testing.T) {
 	fixture := newComputeFixture(t)
 	fixture.mutateSubmittedResponse = func(task *protocol.Task) {
@@ -323,7 +347,7 @@ func TestRunWaitsForExactIdleRetainedCapacity(t *testing.T) {
 			f.agents = append(f.agents, other)
 		},
 		"active retained lease": func(f *computeFixture) {
-			f.leases = []protocol.Lease{{WorkerID: "worker-1", ExpiresAt: time.Now().Add(time.Hour)}}
+			f.leases = []protocol.Lease{validLeaseForTest("worker-1", time.Now().UTC().Add(time.Hour))}
 		},
 		"queued product task": func(f *computeFixture) {
 			f.queued = []protocol.Task{{
@@ -339,14 +363,16 @@ func TestRunWaitsForExactIdleRetainedCapacity(t *testing.T) {
 			server := httptest.NewServer(fixture)
 			t.Cleanup(server.Close)
 			cfg := testConfig(t, server.URL)
-			ctx, cancel := context.WithCancel(t.Context())
-			defer cancel()
-			fixture.afterCapacity = cancel
-			if _, err := Run(ctx, cfg); err == nil || !strings.Contains(err.Error(), "capacity") {
-				t.Fatalf("Run error = %v, want capacity rejection", err)
+			cfg.CapacityTimeout = 100 * time.Millisecond
+			cfg.PollInterval = time.Second
+			if _, err := Run(t.Context(), cfg); err == nil || !strings.Contains(err.Error(), "capacity unavailable before timeout") {
+				t.Fatalf("Run error = %v, want capacity timeout", err)
 			}
 			fixture.mu.Lock()
 			defer fixture.mu.Unlock()
+			if countRequests(fixture.requests, "GET /v1/tasks") == 0 {
+				t.Fatalf("requests = %v, want capacity task read", fixture.requests)
+			}
 			if len(fixture.submitted) != 0 {
 				t.Fatalf("submitted tasks = %d, want 0", len(fixture.submitted))
 			}
@@ -1261,6 +1287,7 @@ type computeFixture struct {
 	submitted                         []protocol.Task
 	agents                            []protocol.Agent
 	leases                            []protocol.Lease
+	leaseRunLogPolicy                 json.RawMessage
 	queued                            []protocol.Task
 	productBody                       []byte
 	diagnosticBody                    []byte
@@ -1392,7 +1419,28 @@ func (f *computeFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/agents":
 		f.writeJSON(w, map[string]any{"agents": f.agents, "summary": map[string]int{}})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/leases":
-		f.writeJSON(w, map[string]any{"leases": f.leases})
+		if f.leaseRunLogPolicy == nil {
+			f.writeJSON(w, map[string]any{"leases": f.leases})
+			return
+		}
+		leases := make([]map[string]json.RawMessage, 0, len(f.leases))
+		for _, lease := range f.leases {
+			encoded, err := json.Marshal(lease)
+			if err != nil {
+				f.handlerErrors = append(f.handlerErrors, fmt.Errorf("encode lease: %w", err))
+				http.Error(w, "encode lease", http.StatusInternalServerError)
+				return
+			}
+			var payload map[string]json.RawMessage
+			if err := json.Unmarshal(encoded, &payload); err != nil {
+				f.handlerErrors = append(f.handlerErrors, fmt.Errorf("decode lease fixture: %w", err))
+				http.Error(w, "decode lease fixture", http.StatusInternalServerError)
+				return
+			}
+			payload["run_log_policy"] = f.leaseRunLogPolicy
+			leases = append(leases, payload)
+		}
+		f.writeJSON(w, map[string]any{"leases": leases})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/tasks":
 		tasks := append([]protocol.Task(nil), f.queued...)
 		if !f.omitSubmittedTasks {
@@ -1527,6 +1575,37 @@ func (f *computeFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		f.handlerErrors = append(f.handlerErrors, fmt.Errorf("unexpected request: %s %s", r.Method, r.URL.Path))
 		http.Error(w, "unexpected request", http.StatusNotFound)
+	}
+}
+
+func validLeaseForTest(workerID string, expiresAt time.Time) protocol.Lease {
+	taskID := "task-for-" + workerID
+	leasedAt := time.Now().UTC().Add(-5 * time.Minute)
+	if !expiresAt.After(leasedAt) {
+		leasedAt = expiresAt.Add(-5 * time.Minute)
+	}
+	return protocol.Lease{
+		ID:       "lease-for-" + workerID,
+		TaskID:   taskID,
+		WorkerID: workerID,
+		PoolID:   "pool-1",
+		Executor: protocol.ExecutorRef{
+			Provider: "product-capture-browser",
+			Version:  "v0.1.60",
+		},
+		CapabilitySnapshot: protocol.Capabilities{
+			OS:   "linux",
+			Arch: "amd64",
+		},
+		NetworkPolicy: protocol.NetworkPolicy{Mode: protocol.NetworkModeDirect},
+		ResiduePolicy: protocol.ResiduePolicy{
+			Mode:                protocol.ResidueModeSessionBound,
+			SessionKey:          taskID,
+			PolicyHash:          sha256RefForTest([]byte("residue-policy")),
+			ExplicitWorkerBound: true,
+		},
+		LeasedAt:  leasedAt,
+		ExpiresAt: expiresAt,
 	}
 }
 
