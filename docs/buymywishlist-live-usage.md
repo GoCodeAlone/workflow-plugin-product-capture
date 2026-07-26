@@ -161,7 +161,7 @@ steps:
       provider_component_ref: provider://workflow-plugin-product-capture/browser/runtime
       provider_component_digest: sha256:<promoted-runtime-digest>
       capture_timeout_seconds: 60
-      max_html_bytes: 1048576
+      max_html_bytes: 10485760
       max_image_count: 8
       poll_interval: 2s
       wait_timeout: 5m
