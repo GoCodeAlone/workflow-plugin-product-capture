@@ -45,6 +45,13 @@ const (
 	browserDiagnosticDNSRetryWindow   = 15 * time.Second
 	browserDiagnosticDNSRetryInterval = 250 * time.Millisecond
 	maxBrowserDiagnosticBytes         = 1 << 20
+	maxBrowserDiagnosticStderrBytes   = 64 << 10
+	maxDynamicEnvelopeBytes           = 1 << 20
+	maxInputURLCharacters             = 2048
+	maxCaptureTimeoutSeconds          = 300
+	maxCaptureHTMLBytes               = int64(10 << 20)
+	defaultCaptureImageCount          = 8
+	maxCaptureImageCount              = 16
 )
 
 var Version = "0.1.0"
@@ -74,6 +81,12 @@ var browserCommandCleanupStates sync.Map
 var browserDiagnosticSchemaOnce sync.Once
 var browserDiagnosticSchema *jsonschema.Schema
 var browserDiagnosticSchemaErr error
+var productInputSchemaOnce sync.Once
+var productInputSchema *jsonschema.Schema
+var productInputSchemaErr error
+var productSnapshotSchemaOnce sync.Once
+var productSnapshotSchema *jsonschema.Schema
+var productSnapshotSchemaErr error
 
 type boundedDiagnosticBuffer struct {
 	bytes.Buffer
@@ -85,6 +98,30 @@ func (b *boundedDiagnosticBuffer) Write(data []byte) (int, error) {
 	}
 	return b.Buffer.Write(data)
 }
+
+type boundedTailBuffer struct {
+	data []byte
+	max  int
+}
+
+func (b *boundedTailBuffer) Write(data []byte) (int, error) {
+	written := len(data)
+	if b.max <= 0 {
+		return written, nil
+	}
+	if len(data) >= b.max {
+		b.data = append(b.data[:0], data[len(data)-b.max:]...)
+		return written, nil
+	}
+	if overflow := len(b.data) + len(data) - b.max; overflow > 0 {
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:len(b.data)-overflow]
+	}
+	b.data = append(b.data, data...)
+	return written, nil
+}
+
+func (b *boundedTailBuffer) String() string { return strings.ToValidUTF8(string(b.data), "?") }
 
 type browserCommandCleanupState struct {
 	mu  sync.Mutex
@@ -171,10 +208,16 @@ func WriteProbe(w io.Writer) error {
 	return enc.Encode(resp)
 }
 
-type browserDiagnosticRunner func(string, io.Writer, bool) error
+type browserDiagnosticOptions struct {
+	RequireIPv4                  bool
+	PersistentProfileConformance bool
+	CrashBeforeOwnerConformance  bool
+}
+
+type browserDiagnosticRunner func(string, io.Writer, browserDiagnosticOptions) error
 
 func Main(args []string, stdout, stderr io.Writer, stdin ...io.Reader) int {
-	return mainWithBrowserDiagnosticRunner(args, stdout, stderr, runBrowserDiagnosticWithPolicy, stdin...)
+	return mainWithBrowserDiagnosticRunner(args, stdout, stderr, runBrowserDiagnosticWithOptions, stdin...)
 }
 
 func mainWithBrowserDiagnosticRunner(args []string, stdout, stderr io.Writer, runDiagnostic browserDiagnosticRunner, stdin ...io.Reader) int {
@@ -185,6 +228,8 @@ func mainWithBrowserDiagnosticRunner(args []string, stdout, stderr io.Writer, ru
 	probe := fs.Bool("probe", false, "print provider capability probe")
 	browserDiagnosticURL := fs.String("browser-diagnostic-url", "", "operator-only URL for browser fingerprint diagnostics")
 	browserDiagnosticRequireIPv4 := fs.Bool("browser-diagnostic-require-ipv4", false, "require IPv4 publication for this browser diagnostic")
+	browserProfileConformance := fs.Bool("browser-profile-conformance", false, "use the managed anonymous profile for exact runtime conformance")
+	browserProfileCrashBeforeOwner := fs.Bool("browser-profile-conformance-crash-before-owner", false, "pause at the pre-owner managed-profile boundary for exact runtime conformance")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -192,12 +237,24 @@ func mainWithBrowserDiagnosticRunner(args []string, stdout, stderr io.Writer, ru
 		_, _ = fmt.Fprintln(stderr, "--browser-diagnostic-require-ipv4 requires --browser-diagnostic-url")
 		return 2
 	}
+	if *browserProfileCrashBeforeOwner && !*browserProfileConformance {
+		_, _ = fmt.Fprintln(stderr, "--browser-profile-conformance-crash-before-owner requires --browser-profile-conformance")
+		return 2
+	}
+	if *browserProfileConformance && *browserDiagnosticURL == "" {
+		_, _ = fmt.Fprintln(stderr, "--browser-profile-conformance requires --browser-diagnostic-url")
+		return 2
+	}
 	if *browserDiagnosticURL != "" {
 		if *probe || *requestPath != "" || *outputPath != "" {
 			fmt.Fprintln(stderr, "--browser-diagnostic-url cannot be combined with --probe, --request, or --output")
 			return 2
 		}
-		if err := runDiagnostic(*browserDiagnosticURL, stdout, *browserDiagnosticRequireIPv4); err != nil {
+		if err := runDiagnostic(*browserDiagnosticURL, stdout, browserDiagnosticOptions{
+			RequireIPv4:                  *browserDiagnosticRequireIPv4,
+			PersistentProfileConformance: *browserProfileConformance,
+			CrashBeforeOwnerConformance:  *browserProfileCrashBeforeOwner,
+		}); err != nil {
 			fmt.Fprintf(stderr, "browser diagnostic: %v\n", err)
 			return 1
 		}
@@ -251,6 +308,9 @@ func runDynamic(r io.Reader, stdout io.Writer) error {
 	var artifacts []string
 	switch env.Operation {
 	case CaptureOperation:
+		if err := validateProductCaptureInput(env.Input); err != nil {
+			return err
+		}
 		var workload Workload
 		if err := decodeDynamicOperationInput(env.Input, &workload); err != nil {
 			return err
@@ -298,8 +358,15 @@ func decodeDynamicOperationInput(data json.RawMessage, out any) error {
 }
 
 func readDynamicEnvelope(r io.Reader) (dynamicEnvelope, error) {
+	data, err := io.ReadAll(io.LimitReader(r, maxDynamicEnvelopeBytes+1))
+	if err != nil {
+		return dynamicEnvelope{}, fmt.Errorf("read provider envelope: %w", err)
+	}
+	if len(data) > maxDynamicEnvelopeBytes {
+		return dynamicEnvelope{}, fmt.Errorf("provider envelope exceeds %d bytes", maxDynamicEnvelopeBytes)
+	}
 	var env dynamicEnvelope
-	dec := json.NewDecoder(r)
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&env); err != nil {
 		return dynamicEnvelope{}, fmt.Errorf("decode provider envelope: %w", err)
@@ -495,7 +562,10 @@ func isZeroMetadata(value any) bool {
 }
 
 func runWorkload(workload Workload, outputPath string) error {
-	if err := validateWorkload(workload); err != nil {
+	requestedURL := strings.TrimSpace(workload.URL)
+	var err error
+	workload, err = normalizeWorkload(workload)
+	if err != nil {
 		return err
 	}
 
@@ -504,8 +574,9 @@ func runWorkload(workload Workload, outputPath string) error {
 		return err
 	}
 	snap, err := snapshot.ExtractAmazon(htmlText, snapshot.ExtractOptions{
-		URL:        workload.URL,
-		CapturedAt: time.Now().UTC(),
+		URL:          workload.URL,
+		RequestedURL: requestedURL,
+		CapturedAt:   time.Now().UTC(),
 	})
 	if err != nil {
 		return err
@@ -522,76 +593,220 @@ func readRequest(path string) (Request, error) {
 		return Request{}, fmt.Errorf("open request: %w", err)
 	}
 	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, maxDynamicEnvelopeBytes+1))
+	if err != nil {
+		return Request{}, fmt.Errorf("read request: %w", err)
+	}
+	if len(data) > maxDynamicEnvelopeBytes {
+		return Request{}, fmt.Errorf("request exceeds %d bytes", maxDynamicEnvelopeBytes)
+	}
 
-	var req Request
-	dec := json.NewDecoder(f)
+	var rawRequest struct {
+		Workload json.RawMessage `json:"workload"`
+	}
+	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&req); err != nil {
+	if err := dec.Decode(&rawRequest); err != nil {
 		return Request{}, fmt.Errorf("decode request: %w", err)
 	}
 	var extra struct{}
 	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 		return Request{}, errors.New("decode request: multiple JSON values")
 	}
+	if err := validateProductCaptureInput(rawRequest.Workload); err != nil {
+		return Request{}, err
+	}
+	var req Request
+	if err := decodeDynamicOperationInput(rawRequest.Workload, &req.Workload); err != nil {
+		return Request{}, err
+	}
 	return req, nil
 }
 
-func validateWorkload(w Workload) error {
+func validateProductCaptureInput(data json.RawMessage) error {
+	var document any
+	if err := json.Unmarshal(data, &document); err != nil {
+		return fmt.Errorf("product input schema: decode: %w", err)
+	}
+	schema, err := compiledProductInputSchema()
+	if err != nil {
+		return fmt.Errorf("product input schema: %w", err)
+	}
+	if err := schema.Validate(document); err != nil {
+		return fmt.Errorf("product input schema: %w", err)
+	}
+	return nil
+}
+
+func compiledProductInputSchema() (*jsonschema.Schema, error) {
+	productInputSchemaOnce.Do(func() {
+		var document any
+		if err := json.Unmarshal(providerschemas.ProductCaptureOperationInput(), &document); err != nil {
+			productInputSchemaErr = fmt.Errorf("decode embedded product input schema: %w", err)
+			return
+		}
+		const resource = "https://provider.invalid/product-input.schema.json"
+		compiler := jsonschema.NewCompiler()
+		compiler.AssertFormat()
+		if err := compiler.AddResource(resource, document); err != nil {
+			productInputSchemaErr = fmt.Errorf("load embedded product input schema: %w", err)
+			return
+		}
+		productInputSchema, productInputSchemaErr = compiler.Compile(resource)
+	})
+	return productInputSchema, productInputSchemaErr
+}
+
+func normalizeWorkload(w Workload) (Workload, error) {
+	if utf8.RuneCountInString(w.URL) > maxInputURLCharacters {
+		return Workload{}, fmt.Errorf("url exceeds %d characters", maxInputURLCharacters)
+	}
+	if strings.TrimSpace(w.URL) != w.URL {
+		return Workload{}, errors.New("url must not contain surrounding whitespace")
+	}
 	parsed, err := url.Parse(w.URL)
 	if err != nil {
-		return fmt.Errorf("parse url: %w", err)
+		return Workload{}, fmt.Errorf("parse url: %w", err)
 	}
-	if parsed.Scheme != "https" && parsed.Scheme != "http" {
-		return fmt.Errorf("unsupported url scheme %q", parsed.Scheme)
+	if parsed.Scheme != "https" {
+		return Workload{}, fmt.Errorf("unsupported url scheme %q", parsed.Scheme)
 	}
-	host := canonicalHost(parsed.Hostname())
-	if host == "" || net.ParseIP(host) != nil {
-		return fmt.Errorf("unsupported host %q", parsed.Hostname())
+	rawHostname := parsed.Hostname()
+	if strings.HasSuffix(rawHostname, ".") {
+		return Workload{}, fmt.Errorf("unsupported host %q", parsed.Host)
+	}
+	rawHost := canonicalHost(rawHostname)
+	if rawHost == "" || net.ParseIP(rawHost) != nil || parsed.User != nil || (parsed.Port() != "" && parsed.Port() != "443") {
+		return Workload{}, fmt.Errorf("unsupported host %q", parsed.Host)
+	}
+	host, supported := canonicalAmazonNavigationHost(rawHost)
+	if !supported {
+		return Workload{}, fmt.Errorf("unsupported host %q", rawHost)
 	}
 	if len(w.AllowedHosts) == 0 {
-		return errors.New("allowed_hosts is required")
+		return Workload{}, errors.New("allowed_hosts is required")
+	}
+	if len(w.AllowedHosts) > 2 {
+		return Workload{}, errors.New("allowed_hosts cannot contain more than 2 hosts")
 	}
 	allowed := false
 	for _, raw := range w.AllowedHosts {
-		if canonicalHost(raw) == host {
+		if strings.TrimSpace(raw) != raw || strings.HasSuffix(raw, ".") {
+			return Workload{}, fmt.Errorf("unsupported allowed host %q", raw)
+		}
+		allowedHost, ok := canonicalAmazonNavigationHost(raw)
+		if !ok {
+			return Workload{}, fmt.Errorf("unsupported allowed host %q", raw)
+		}
+		if allowedHost == host {
 			allowed = true
-			break
 		}
 	}
 	if !allowed {
-		return fmt.Errorf("url host %q is not in allowed_hosts", host)
+		return Workload{}, fmt.Errorf("url host %q is not in allowed_hosts", host)
 	}
-	if _, ok := supportedAmazonHosts[host]; !ok {
-		return fmt.Errorf("unsupported host %q", host)
+	asin := amazonProductASIN(parsed.Path)
+	if asin == "" {
+		return Workload{}, errors.New("url must identify an Amazon product ASIN")
 	}
-	if warmupURL := strings.TrimSpace(w.WarmupURL); warmupURL != "" {
-		warmup, err := url.Parse(warmupURL)
-		if err != nil {
-			return fmt.Errorf("parse warmup_url: %w", err)
+	if w.WarmupURL != "" {
+		if strings.TrimSpace(w.WarmupURL) != w.WarmupURL {
+			return Workload{}, errors.New("warmup_url must be same-origin with url and identify the origin homepage")
 		}
-		if !sameOriginURL(parsed, warmup) {
-			return errors.New("warmup_url must be same-origin with url")
+		warmup, err := url.Parse(w.WarmupURL)
+		if err != nil {
+			return Workload{}, fmt.Errorf("parse warmup_url: %w", err)
+		}
+		warmupHost, warmupSupported := canonicalAmazonNavigationHost(warmup.Hostname())
+		if !warmupSupported || warmupHost != host || !strings.EqualFold(warmup.Scheme, "https") ||
+			strings.HasSuffix(warmup.Hostname(), ".") ||
+			warmup.User != nil || (warmup.Port() != "" && warmup.Port() != "443") ||
+			warmup.Path != "/" || warmup.RawQuery != "" || warmup.Fragment != "" {
+			return Workload{}, errors.New("warmup_url must be same-origin with url and identify the origin homepage")
 		}
 	}
 	if w.CaptureMode != "" && w.CaptureMode != CaptureModeBrowser && w.CaptureMode != CaptureModeMeta {
-		return fmt.Errorf("unsupported capture_mode %q", w.CaptureMode)
+		return Workload{}, fmt.Errorf("unsupported capture_mode %q", w.CaptureMode)
 	}
 	if w.TimeoutSeconds < 0 {
-		return errors.New("timeout_seconds cannot be negative")
+		return Workload{}, errors.New("timeout_seconds cannot be negative")
+	}
+	if w.TimeoutSeconds > maxCaptureTimeoutSeconds {
+		return Workload{}, fmt.Errorf("timeout_seconds cannot exceed %d", maxCaptureTimeoutSeconds)
 	}
 	if w.MaxHTMLBytes < 0 {
-		return errors.New("max_html_bytes cannot be negative")
+		return Workload{}, errors.New("max_html_bytes cannot be negative")
+	}
+	if w.MaxHTMLBytes > maxCaptureHTMLBytes {
+		return Workload{}, fmt.Errorf("max_html_bytes cannot exceed %d", maxCaptureHTMLBytes)
 	}
 	if w.MaxImageCount < 0 {
-		return errors.New("max_image_count cannot be negative")
+		return Workload{}, errors.New("max_image_count cannot be negative")
 	}
-	return nil
+	if w.MaxImageCount > maxCaptureImageCount {
+		return Workload{}, fmt.Errorf("max_image_count cannot exceed %d", maxCaptureImageCount)
+	}
+	if w.MaxImageCount == 0 {
+		w.MaxImageCount = defaultCaptureImageCount
+	}
+	w.URL = (&url.URL{
+		Scheme:     "https",
+		Host:       host,
+		Path:       "/dp/" + asin,
+		ForceQuery: parsed.ForceQuery,
+		RawQuery:   parsed.RawQuery,
+		Fragment:   parsed.Fragment,
+	}).String()
+	w.AllowedHosts = []string{host}
+	w.WarmupURL = (&url.URL{Scheme: "https", Host: host, Path: "/"}).String()
+	return w, nil
+}
+
+func amazonProductASIN(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	for index := range parts {
+		candidate := ""
+		switch {
+		case parts[index] == "dp" && index+1 < len(parts):
+			candidate = parts[index+1]
+		case parts[index] == "gp" && index+2 < len(parts) && (parts[index+1] == "product" || (parts[index+1] == "aw" && index+3 < len(parts) && parts[index+2] == "d")):
+			if parts[index+1] == "product" {
+				candidate = parts[index+2]
+			} else {
+				candidate = parts[index+3]
+			}
+		}
+		candidate = strings.ToUpper(strings.TrimSpace(candidate))
+		if len(candidate) != 10 {
+			continue
+		}
+		valid := true
+		for _, char := range candidate {
+			if (char < 'A' || char > 'Z') && (char < '0' || char > '9') {
+				valid = false
+				break
+			}
+		}
+		if valid {
+			return candidate
+		}
+	}
+	return ""
 }
 
 func canonicalHost(host string) string {
 	host = strings.TrimSpace(strings.ToLower(host))
 	host = strings.TrimSuffix(host, ".")
 	return host
+}
+
+func canonicalAmazonNavigationHost(host string) (string, bool) {
+	switch canonicalHost(host) {
+	case "amazon.com", "www.amazon.com":
+		return "www.amazon.com", true
+	default:
+		return "", false
+	}
 }
 
 func sameOriginURL(a, b *url.URL) bool {
@@ -643,12 +858,32 @@ func readBoundedFile(path string, maxBytes int64) (string, error) {
 	return buf.String(), nil
 }
 
-func captureHTMLWithPlaywright(w Workload) (string, error) {
+func captureHTMLWithPlaywright(w Workload) (html string, retErr error) {
+	defer func() {
+		retErr = redactBrowserDiagnosticError(retErr, w.URL, w.WarmupURL)
+	}()
 	timeout := time.Duration(timeoutSeconds(w.TimeoutSeconds)) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), timeout+5*time.Second)
 	defer cancel()
 	if err := browserDisplayPreflight(runtime.GOOS, browserHeadlessEnabled(), strings.TrimSpace(os.Getenv("DISPLAY")), exec.LookPath); err != nil {
 		return "", err
+	}
+	persistentProfileDir := strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR"))
+	profileGeneration := ""
+	profileScopeSHA256 := ""
+	var profile managedBrowserProfile
+	if persistentProfileDir != "" {
+		acquiredProfile, err := acquireManagedBrowserProfile(persistentProfileDir)
+		if err != nil {
+			return "", err
+		}
+		profile = acquiredProfile
+		persistentProfileDir = profile.Dir
+		profileGeneration = profile.Generation
+		profileScopeSHA256 = profile.ScopeSHA256
+		defer func() {
+			retErr = errors.Join(retErr, profile.Release())
+		}()
 	}
 
 	scriptPath, err := writeBrowserCaptureScript()
@@ -660,11 +895,26 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	cmd := browserNodeCommand(ctx, scriptPath, w.URL, fmt.Sprintf("%d", timeout.Milliseconds()))
 	defer browserCommandCleanupStates.Delete(cmd)
 	cmd.WaitDelay = 2 * time.Second
-	cmd.Env = os.Environ()
+	cmd.Env = browserProcessEnvironment(os.Environ())
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", "")
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", "")
-	if strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")) == "" {
-		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_GENERATION", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE_SHA256", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_FD", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_LAUNCH_ID", "")
+	profileDir := persistentProfileDir
+	if profileDir == "" {
+		profileDir = filepath.Join(filepath.Dir(scriptPath), "chrome-profile")
+	} else {
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD", "1")
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_GENERATION", profileGeneration)
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE_SHA256", profileScopeSHA256)
+	}
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
+	if err := profile.ConfigureCommand(cmd); err != nil {
+		return "", err
 	}
 	warmupURL := strings.TrimSpace(w.WarmupURL)
 	if warmupURL == "" {
@@ -673,11 +923,14 @@ func captureHTMLWithPlaywright(w Workload) (string, error) {
 	if warmupURL != "" {
 		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_WARMUP_URL", warmupURL)
 	}
-	var stderr bytes.Buffer
+	stderr := boundedTailBuffer{max: maxBrowserDiagnosticStderrBytes}
 	var stdout limitedBuffer
 	stdout.max = maxHTMLBytes(w.MaxHTMLBytes)
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if err := profile.Verify(); err != nil {
+		return "", err
+	}
 	if err := cmd.Run(); err != nil {
 		cleanupErr := cleanupBrowserCommandAfterError(ctx, cmd)
 		if stdout.err != nil {
@@ -722,15 +975,80 @@ func withEnvValue(env []string, key, value string) []string {
 	return out
 }
 
+func browserProcessEnvironment(source []string) []string {
+	return browserProcessEnvironmentWithAdditionalKeys(source, additionalBrowserProcessEnvironmentKeys)
+}
+
+func browserProcessEnvironmentWithAdditionalKeys(source, additionalKeys []string) []string {
+	allowed := map[string]struct{}{
+		"PATH": {}, "Path": {}, "HOME": {}, "USERPROFILE": {},
+		"TMPDIR": {}, "TMP": {}, "TEMP": {}, "TZ": {},
+		"LANG": {}, "LANGUAGE": {}, "LC_ALL": {}, "LC_CTYPE": {},
+		"DISPLAY": {}, "XAUTHORITY": {}, "WAYLAND_DISPLAY": {},
+		"XDG_RUNTIME_DIR": {}, "XDG_CACHE_HOME": {}, "XDG_CONFIG_HOME": {},
+		"DBUS_SESSION_BUS_ADDRESS": {}, "SystemRoot": {}, "SYSTEMROOT": {},
+		"ComSpec": {}, "COMSPEC": {}, "LOCALAPPDATA": {}, "APPDATA": {},
+		"NODE_PATH": {}, "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD": {},
+		"PRODUCT_CAPTURE_BROWSER_HEADLESS":                  {},
+		"PRODUCT_CAPTURE_BROWSER_VIEWPORT":                  {},
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_DIR":               {},
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD":         {},
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_GENERATION":        {},
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE":             {},
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE_SHA256":      {},
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_FD":           {},
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_LAUNCH_ID":         {},
+		"PRODUCT_CAPTURE_BROWSER_WARMUP_URL":                {},
+		"PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN": {},
+		"PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES":       {},
+	}
+	for _, key := range additionalKeys {
+		if key != "" {
+			allowed[key] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(source))
+	for _, entry := range source {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		if _, ok := allowed[key]; ok {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+const browserProcessEnvironmentKeysPlaceholder = "__BROWSER_PROCESS_ENVIRONMENT_KEYS__"
+
+var additionalBrowserProcessEnvironmentKeys []string
+
+func renderBrowserScriptWithAdditionalEnvironmentKeys(script string, additionalKeys []string) string {
+	if additionalKeys == nil {
+		additionalKeys = []string{}
+	}
+	encodedKeys, err := json.Marshal(additionalKeys)
+	if err != nil {
+		panic(err)
+	}
+	return strings.ReplaceAll(script, browserProcessEnvironmentKeysPlaceholder, string(encodedKeys))
+}
+
+func renderBrowserScript(script string) string {
+	return renderBrowserScriptWithAdditionalEnvironmentKeys(script, additionalBrowserProcessEnvironmentKeys)
+}
+
 func defaultBrowserWarmupURL(rawURL string) string {
 	parsed, err := url.Parse(rawURL)
 	if err != nil {
 		return ""
 	}
-	if _, ok := supportedAmazonHosts[canonicalHost(parsed.Hostname())]; !ok {
+	host, ok := canonicalAmazonNavigationHost(parsed.Hostname())
+	if !ok || !strings.EqualFold(parsed.Scheme, "https") || (parsed.Port() != "" && parsed.Port() != "443") {
 		return ""
 	}
-	return parsed.Scheme + "://" + parsed.Host + "/"
+	return "https://" + host + "/"
 }
 
 func writeBrowserCaptureScript() (string, error) {
@@ -739,7 +1057,7 @@ func writeBrowserCaptureScript() (string, error) {
 		return "", fmt.Errorf("create browser temp dir: %w", err)
 	}
 	path := filepath.Join(dir, "capture.js")
-	if err := os.WriteFile(path, []byte(playwrightCaptureScript), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(renderBrowserScript(playwrightCaptureScript)), 0o600); err != nil {
 		os.RemoveAll(dir)
 		return "", fmt.Errorf("write browser capture script: %w", err)
 	}
@@ -747,18 +1065,16 @@ func writeBrowserCaptureScript() (string, error) {
 }
 
 func runBrowserDiagnostic(rawURL string, stdout io.Writer) error {
-	return runBrowserDiagnosticWithPolicy(rawURL, stdout, false)
+	return runBrowserDiagnosticWithOptions(rawURL, stdout, browserDiagnosticOptions{})
 }
 
-func runBrowserDiagnosticWithPolicy(rawURL string, stdout io.Writer, requireIPv4 bool) (runErr error) {
+func runBrowserDiagnosticWithOptions(rawURL string, stdout io.Writer, options browserDiagnosticOptions) (runErr error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	allowedOrigins := os.Getenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS")
-	if requireIPv4 {
-		defer func() {
-			runErr = redactBrowserDiagnosticError(runErr, rawURL, allowedOrigins)
-		}()
-	}
+	defer func() {
+		runErr = redactBrowserDiagnosticError(runErr, rawURL, allowedOrigins)
+	}()
 	if err := browserDisplayPreflight(runtime.GOOS, browserHeadlessEnabled(), strings.TrimSpace(os.Getenv("DISPLAY")), exec.LookPath); err != nil {
 		return err
 	}
@@ -767,7 +1083,7 @@ func runBrowserDiagnosticWithPolicy(rawURL string, stdout io.Writer, requireIPv4
 		rawURL,
 		allowedOrigins,
 		net.DefaultResolver.LookupIPAddr,
-		requireIPv4,
+		options.RequireIPv4,
 	)
 	if err != nil {
 		return err
@@ -777,17 +1093,54 @@ func runBrowserDiagnosticWithPolicy(rawURL string, stdout io.Writer, requireIPv4
 		return err
 	}
 	defer os.RemoveAll(filepath.Dir(scriptPath))
-	cmd := browserNodeCommand(ctx, scriptPath, rawURL)
+	var profile managedBrowserProfile
+	profileDir := filepath.Join(filepath.Dir(scriptPath), "chrome-profile")
+	if options.PersistentProfileConformance {
+		configuredProfileDir := strings.TrimSpace(os.Getenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR"))
+		if configuredProfileDir == "" {
+			return errors.New("browser profile conformance requires PRODUCT_CAPTURE_BROWSER_PROFILE_DIR")
+		}
+		profile, err = acquireManagedBrowserProfile(configuredProfileDir)
+		if err != nil {
+			return err
+		}
+		profileDir = profile.Dir
+		defer func() {
+			runErr = errors.Join(runErr, profile.Release())
+		}()
+	}
+	nodeArgs := []string{rawURL}
+	if options.CrashBeforeOwnerConformance {
+		nodeArgs = append(nodeArgs, "profile-startup-crash-before-owner")
+	}
+	cmd := browserNodeCommand(ctx, scriptPath, nodeArgs...)
 	defer browserCommandCleanupStates.Delete(cmd)
 	cmd.WaitDelay = 2 * time.Second
-	cmd.Env = os.Environ()
-	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", filepath.Join(filepath.Dir(scriptPath), "chrome-profile"))
+	cmd.Env = browserProcessEnvironment(os.Environ())
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_GENERATION", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE_SHA256", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_FD", "")
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_LAUNCH_ID", "")
+	if options.PersistentProfileConformance {
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD", "1")
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_GENERATION", profile.Generation)
+		cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE_SHA256", profile.ScopeSHA256)
+	}
+	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
+	if err := profile.ConfigureCommand(cmd); err != nil {
+		return err
+	}
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGIN", target.allowedOrigin)
 	cmd.Env = withEnvValue(cmd.Env, "PRODUCT_CAPTURE_BROWSER_HOST_RESOLVER_RULES", target.resolverRules)
 	var diagnosticOutput boundedDiagnosticBuffer
-	var stderr bytes.Buffer
+	stderr := boundedTailBuffer{max: maxBrowserDiagnosticStderrBytes}
 	cmd.Stdout = &diagnosticOutput
 	cmd.Stderr = &stderr
+	if err := profile.Verify(); err != nil {
+		return err
+	}
 	if err := cmd.Run(); err != nil {
 		cleanupErr := cleanupBrowserCommandAfterError(ctx, cmd)
 		msg := strings.TrimSpace(stderr.String())
@@ -881,8 +1234,8 @@ func resolveBrowserDiagnosticTargetWithPolicy(
 			resolveErr = redactBrowserDiagnosticError(resolveErr, rawURL, allowedOrigins)
 		}()
 	}
-	if utf8.RuneCountInString(rawURL) > 2048 {
-		return browserDiagnosticTarget{}, errors.New("browser diagnostic URL exceeds 2048 characters")
+	if utf8.RuneCountInString(rawURL) > maxInputURLCharacters {
+		return browserDiagnosticTarget{}, fmt.Errorf("browser diagnostic URL exceeds %d characters", maxInputURLCharacters)
 	}
 	if strings.TrimSpace(allowedOrigins) == "" {
 		return browserDiagnosticTarget{}, errors.New("browser diagnostics are disabled; PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS is unset")
@@ -997,6 +1350,12 @@ func browserDiagnosticRedactionSecrets(value string) []string {
 	}
 	if escapedPath := parsed.EscapedPath(); escapedPath != "" && escapedPath != "/" && escapedPath != parsed.Path {
 		secrets = append(secrets, escapedPath)
+	}
+	if parsed.RawQuery != "" {
+		secrets = append(secrets, parsed.RawQuery)
+	}
+	if parsed.Fragment != "" {
+		secrets = append(secrets, parsed.Fragment)
 	}
 	segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
 	for index := 0; index+1 < len(segments); index++ {
@@ -1168,7 +1527,7 @@ func writeBrowserDiagnosticScript() (string, error) {
 		return "", fmt.Errorf("create browser diagnostic temp dir: %w", err)
 	}
 	path := filepath.Join(dir, "diagnostic.js")
-	if err := os.WriteFile(path, []byte(playwrightBrowserDiagnosticScript), 0o600); err != nil {
+	if err := os.WriteFile(path, []byte(renderBrowserScript(playwrightBrowserDiagnosticScript)), 0o600); err != nil {
 		os.RemoveAll(dir)
 		return "", fmt.Errorf("write browser diagnostic script: %w", err)
 	}
@@ -1288,14 +1647,14 @@ func timeoutSeconds(value int) int {
 	if value <= 0 {
 		return 45
 	}
-	return min(value, 600)
+	return min(value, maxCaptureTimeoutSeconds)
 }
 
 func maxHTMLBytes(value int64) int64 {
 	if value <= 0 {
 		return 2 << 20
 	}
-	return min(value, 10<<20)
+	return min(value, maxCaptureHTMLBytes)
 }
 
 func writeSnapshot(path string, snap snapshot.Snapshot) error {
@@ -1303,8 +1662,38 @@ func writeSnapshot(path string, snap snapshot.Snapshot) error {
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
 	}
+	var document any
+	if err := json.Unmarshal(data, &document); err != nil {
+		return fmt.Errorf("decode snapshot for validation: %w", err)
+	}
+	schema, err := compiledProductSnapshotSchema()
+	if err != nil {
+		return fmt.Errorf("compile snapshot schema: %w", err)
+	}
+	if err := schema.Validate(document); err != nil {
+		return fmt.Errorf("validate snapshot: %w", err)
+	}
 	data = append(data, '\n')
 	return writeArtifactBytes(path, data)
+}
+
+func compiledProductSnapshotSchema() (*jsonschema.Schema, error) {
+	productSnapshotSchemaOnce.Do(func() {
+		var document any
+		if err := json.Unmarshal(providerschemas.ProductCaptureOperationOutput(), &document); err != nil {
+			productSnapshotSchemaErr = fmt.Errorf("decode embedded product output schema: %w", err)
+			return
+		}
+		const resource = "https://provider.invalid/product-output.schema.json"
+		compiler := jsonschema.NewCompiler()
+		compiler.AssertFormat()
+		if err := compiler.AddResource(resource, document); err != nil {
+			productSnapshotSchemaErr = fmt.Errorf("load embedded product output schema: %w", err)
+			return
+		}
+		productSnapshotSchema, productSnapshotSchemaErr = compiler.Compile(resource + "#/$defs/product_json")
+	})
+	return productSnapshotSchema, productSnapshotSchemaErr
 }
 
 func writeArtifactBytes(path string, data []byte) error {
@@ -1349,6 +1738,7 @@ const { chromium, errors } = require('playwright');
 const fs = require('fs');
 const http = require('http');
 const net = require('net');
+const nodeOS = require('os');
 const path = require('path');
 const { spawn } = require('child_process');
 
@@ -1411,6 +1801,59 @@ function parseBrowserHeadless() {
   return !['0', 'false', 'no', 'off', 'headed'].includes(raw);
 }
 
+function isBlockedLiteralHost(rawHost) {
+  const host = String(rawHost || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (!host) return true;
+  if (host === 'localhost' || host === 'localhost.localdomain') return true;
+  if (host.includes(':')) return true;
+  if (!/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return false;
+  const octets = host.split('.').map(Number);
+  if (octets.some((value) => !Number.isInteger(value) || value < 0 || value > 255)) return true;
+  const [first, second] = octets;
+  return (
+    first === 0 || first === 10 || first === 127 || first >= 224 ||
+    (first === 100 && second >= 64 && second <= 127) ||
+    (first === 169 && second === 254) ||
+    (first === 172 && second >= 16 && second <= 31) ||
+    (first === 192 && second === 168) ||
+    (first === 198 && (second === 18 || second === 19))
+  );
+}
+
+async function installCaptureNetworkPolicy(context, page, targetURL) {
+	const allowedURL = new URL(targetURL);
+  await context.route('**/*', async (route) => {
+    const request = route.request();
+    let requestURL;
+    try {
+      requestURL = new URL(request.url());
+    } catch {
+      await route.abort('blockedbyclient');
+      return;
+    }
+    const isHTTP = requestURL.protocol === 'http:' || requestURL.protocol === 'https:';
+    const blockedMainFrameNavigation = (
+      request.isNavigationRequest() &&
+      request.frame() === page.mainFrame() &&
+		(requestURL.protocol !== 'https:' || !sameCaptureNavigationOrigin(requestURL, allowedURL))
+    );
+    if ((isHTTP && isBlockedLiteralHost(requestURL.hostname)) || blockedMainFrameNavigation) {
+      await route.abort('blockedbyclient');
+      return;
+    }
+    await route.continue();
+  });
+}
+
+function sameCaptureNavigationOrigin(candidate, allowed) {
+	if (candidate.protocol !== allowed.protocol || candidate.port !== allowed.port) return false;
+	const canonicalHost = (host) => {
+		const normalized = String(host || '').trim().toLowerCase();
+		return normalized === 'amazon.com' || normalized === 'www.amazon.com' ? 'www.amazon.com' : normalized;
+	};
+	return canonicalHost(candidate.hostname) === canonicalHost(allowed.hostname);
+}
+
 function delay(milliseconds) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -1436,6 +1879,280 @@ function fileSystemEntryExists(entryPath) {
   } catch (err) {
     if (err && err.code === 'ENOENT') return false;
     throw err;
+  }
+}
+
+function readManagedProfileGeneration(profileDir) {
+  const expected = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_GENERATION || '').trim();
+  if (!/^[0-9a-f]{64}$/.test(expected)) {
+    throw new Error('provider-owned Chrome profile generation is missing or invalid');
+  }
+  const expectedScope = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE_SHA256 || '').trim();
+  if (!/^sha256:[0-9a-f]{64}$/.test(expectedScope)) {
+    throw new Error('provider-owned Chrome profile scope is missing or invalid');
+  }
+  const metadataPath = path.join(profileDir, '.product-capture-profile.json');
+  let state;
+  try {
+    state = fs.lstatSync(metadataPath);
+  } catch (err) {
+    throw new Error('provider-owned Chrome profile identity is unavailable', { cause: err });
+  }
+  if (!state.isFile() || state.isSymbolicLink()) {
+    throw new Error('provider-owned Chrome profile identity has invalid type');
+  }
+  let metadata;
+  try {
+    metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+  } catch (err) {
+    throw new Error('provider-owned Chrome profile identity is invalid', { cause: err });
+  }
+  if (
+    !metadata ||
+    metadata.schema !== 'product-capture-browser-profile.v2' ||
+    metadata.generation !== expected ||
+    metadata.scope_sha256 !== expectedScope
+  ) {
+    throw new Error('provider-owned Chrome profile identity does not match the held lock');
+  }
+  return expected;
+}
+
+function managedProfileLockFD() {
+  const providerLockHeld = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD || '').trim() === '1';
+  const raw = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_FD || '').trim();
+  if (!providerLockHeld) {
+    if (raw) throw new Error('ephemeral browser profile must not inherit a managed profile lock');
+    return null;
+  }
+  const lockFD = Number(raw);
+  if (!Number.isInteger(lockFD) || lockFD < 3) {
+    throw new Error('managed browser profile lock descriptor is missing or invalid');
+  }
+  return lockFD;
+}
+
+function readManagedProfileLaunch(profileDir) {
+  const generation = readManagedProfileGeneration(profileDir);
+  const expectedScope = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE_SHA256 || '').trim();
+  const expectedLaunchID = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_LAUNCH_ID || '').trim();
+  if (!/^[0-9a-f]{64}$/.test(expectedLaunchID)) {
+    throw new Error('provider-owned Chrome launch identity is missing or invalid');
+  }
+  const launchPath = path.join(profileDir, '.product-capture-chrome-launch.json');
+  let state;
+  let launch;
+  try {
+    state = fs.lstatSync(launchPath);
+    if (!state.isFile() || state.isSymbolicLink() || (state.mode & 0o077) !== 0) {
+      throw new Error('invalid type or permissions');
+    }
+    launch = JSON.parse(fs.readFileSync(launchPath, 'utf8'));
+  } catch (err) {
+    throw new Error('provider-owned Chrome launch journal is unavailable or invalid', { cause: err });
+  }
+  const lockFD = managedProfileLockFD();
+  let lockState;
+  try {
+    lockState = fs.fstatSync(lockFD, { bigint: true });
+  } catch (err) {
+    throw new Error('provider-owned browser profile lock descriptor is unavailable', { cause: err });
+  }
+  if (
+    !launch || launch.schema !== 'product-capture-chrome-launch.v1' ||
+    launch.generation !== generation || launch.scope_sha256 !== expectedScope ||
+    launch.launch_id !== expectedLaunchID || launch.hostname !== nodeOS.hostname() ||
+    launch.lock_dev !== String(lockState.dev) || launch.lock_ino !== String(lockState.ino)
+  ) {
+    throw new Error('provider-owned Chrome launch journal does not match the held profile lock');
+  }
+  return launch;
+}
+
+function readBoundedLinuxProcessFile(processID, name, maximumBytes) {
+  const data = fs.readFileSync('/proc/' + processID + '/' + name);
+  if (data.length > maximumBytes) throw new Error('Chrome procfs ' + name + ' exceeds identity bound');
+  return data;
+}
+
+function validChromeDebuggingArgument(args) {
+  const values = args.filter((arg) => String(arg).startsWith('--remote-debugging-port='));
+  if (values.length !== 1) return false;
+  const port = Number(values[0].slice('--remote-debugging-port='.length));
+  return Number.isInteger(port) && port > 0 && port <= 65535;
+}
+
+function validChromeLaunchArguments(args, profileDir) {
+  const profileArguments = args.filter((arg) => String(arg).startsWith('--user-data-dir='));
+  return profileArguments.length === 1 &&
+    profileArguments[0] === '--user-data-dir=' + profileDir &&
+    args.includes('--remote-debugging-address=127.0.0.1') &&
+    validChromeDebuggingArgument(args) &&
+    args[args.length - 1] === 'about:blank';
+}
+
+function linuxChromeExecutable(processID, profileDir, expectedProcessGroupID, expectedStartTime) {
+  try {
+    const before = linuxProcessStat(processID);
+    if (
+      !before || before.state === 'Z' || before.processGroupID !== expectedProcessGroupID ||
+      before.startTime !== expectedStartTime
+    ) return false;
+    const executable = fs.readlinkSync('/proc/' + processID + '/exe');
+    const comm = readBoundedLinuxProcessFile(processID, 'comm', 64).toString('utf8');
+    const commandLine = readBoundedLinuxProcessFile(processID, 'cmdline', 16384);
+    if (comm !== 'chrome\n' || commandLine.length === 0 || commandLine[commandLine.length - 1] !== 0) return false;
+    const args = commandLine.toString('utf8').split('\0');
+    args.pop();
+    let chromeArguments;
+    if (executable === '/run/rosetta/rosetta') {
+      if (
+        args.length < 4 || args[0] !== '/run/rosetta/rosetta' ||
+        args[1] !== '/opt/google/chrome/chrome' || args[2] !== '/usr/bin/google-chrome'
+      ) return false;
+      chromeArguments = args.slice(3);
+    } else {
+      const executableName = path.basename(executable).toLowerCase();
+      const argumentName = path.basename(args[0] || '').toLowerCase();
+      const acceptedNames = new Set(['chrome', 'google-chrome', 'google-chrome-stable']);
+      if (!acceptedNames.has(executableName) || !acceptedNames.has(argumentName)) return false;
+      chromeArguments = args.slice(1);
+    }
+    if (!validChromeLaunchArguments(chromeArguments, profileDir)) return false;
+    const after = linuxProcessStat(processID);
+    return !!after && after.state !== 'Z' &&
+      after.processGroupID === before.processGroupID && after.startTime === before.startTime;
+  } catch (err) {
+    if (err && (err.code === 'ENOENT' || err.code === 'ESRCH')) return false;
+    throw err;
+  }
+}
+
+function prepareChromeProfile(profileDir) {
+  const providerLockHeld = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD || '').trim() === '1';
+	if (providerLockHeld) readManagedProfileGeneration(profileDir);
+  const lockNames = ['SingletonLock', 'SingletonSocket', 'SingletonCookie'];
+  const existing = lockNames.filter((lockName) => fileSystemEntryExists(path.join(profileDir, lockName)));
+	if (existing.length > 0) {
+	  if (!providerLockHeld) throw new Error('Chrome profile is already active: ' + existing[0]);
+	  throw new Error('managed Chrome profile lock was not cleared by the provider: ' + existing[0]);
+	}
+	if (providerLockHeld) readManagedProfileLaunch(profileDir);
+}
+
+function publishChromeProfileConformanceBoundary(profileDir) {
+  const markerPath = path.join(profileDir, '.product-capture-chrome-conformance-pre-owner-ready');
+  const directoryFD = fs.openSync(profileDir, 'r');
+  try {
+    const markerFD = fs.openSync(
+      markerPath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      fs.writeFileSync(markerFD, 'ready\n', { encoding: 'utf8' });
+      fs.fsyncSync(markerFD);
+    } finally {
+      fs.closeSync(markerFD);
+    }
+    fs.fsyncSync(directoryFD);
+  } finally {
+    fs.closeSync(directoryFD);
+  }
+}
+
+async function readChromeSingletonLock(profileDir, timeoutMilliseconds) {
+  const lockPath = path.join(profileDir, 'SingletonLock');
+  const deadline = Date.now() + timeoutMilliseconds;
+  while (true) {
+    try {
+      return fs.readlinkSync(lockPath);
+    } catch (err) {
+      if (!err || err.code !== 'ENOENT' || Date.now() >= deadline) throw err;
+      await delay(10);
+    }
+  }
+}
+
+async function writeChromeProfileOwner(profileDir, chrome) {
+  const providerLockHeld = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD || '').trim() === '1';
+  if (!providerLockHeld) return;
+  const launch = readManagedProfileLaunch(profileDir);
+  if (process.platform !== 'linux') throw new Error('persistent browser profiles require Linux process identity');
+  if (!chrome || !Number.isInteger(chrome.browserPID) || !chrome.linuxBrowserStartTime) {
+    throw new Error('Chrome browser identity is unavailable for persistent profile ownership');
+  }
+  let target;
+  try {
+    target = await readChromeSingletonLock(profileDir, 1000);
+  } catch (err) {
+    throw new Error('Chrome did not create a verifiable SingletonLock', { cause: err });
+  }
+	const expectedTarget = nodeOS.hostname() + '-' + chrome.browserPID;
+	if (target !== expectedTarget) {
+		throw new Error('Chrome SingletonLock target does not match the launched browser identity');
+	}
+	if (!linuxChromeExecutable(
+		chrome.browserPID,
+		profileDir,
+		chrome.pid,
+		chrome.linuxBrowserStartTime,
+	)) {
+		throw new Error('Chrome process does not match the launched browser identity');
+	}
+  if (process.argv[3] === 'profile-startup-crash-before-owner') {
+    const ownerPath = path.join(profileDir, '.product-capture-chrome-owner.json');
+    if (fileSystemEntryExists(ownerPath)) {
+      throw new Error('pre-owner profile conformance reached an already-owned Chrome profile');
+    }
+    if (!signalChromeProcessBoundary(chrome, 'SIGSTOP')) {
+      throw new Error('pre-owner profile conformance could not pause Chrome');
+    }
+    if (fileSystemEntryExists(ownerPath)) {
+      throw new Error('pre-owner profile conformance owner publication occurred before the hold');
+    }
+    publishChromeProfileConformanceBoundary(profileDir);
+    process.kill(process.pid, 'SIGSTOP');
+    throw new Error('pre-owner profile conformance resumed without container termination');
+  }
+  const owner = {
+    schema: 'product-capture-chrome-owner.v2',
+    generation: launch.generation,
+    scope_sha256: launch.scope_sha256,
+    launch_id: launch.launch_id,
+    hostname: launch.hostname,
+    pid: chrome.browserPID,
+    processGroupId: chrome.pid,
+    processStart: chrome.linuxBrowserStartTime,
+  };
+  const ownerPath = path.join(profileDir, '.product-capture-chrome-owner.json');
+  const temporaryPath = ownerPath + '.tmp-' + process.pid + '-' + Date.now();
+  const directoryFD = fs.openSync(profileDir, 'r');
+  try {
+    const ownerFD = fs.openSync(temporaryPath, 'wx', 0o600);
+    try {
+      fs.writeFileSync(ownerFD, JSON.stringify(owner) + '\n', { encoding: 'utf8' });
+      fs.fsyncSync(ownerFD);
+    } finally {
+      fs.closeSync(ownerFD);
+    }
+    fs.linkSync(temporaryPath, ownerPath);
+    fs.unlinkSync(temporaryPath);
+    fs.fsyncSync(directoryFD);
+  } finally {
+    try { fs.unlinkSync(temporaryPath); } catch (err) { if (!err || err.code !== 'ENOENT') throw err; }
+    fs.closeSync(directoryFD);
+  }
+}
+
+function removeChromeProfileOwner(profileDir) {
+  const ownerPath = path.join(profileDir, '.product-capture-chrome-owner.json');
+  const directoryFD = fs.openSync(profileDir, 'r');
+  try {
+    try { fs.unlinkSync(ownerPath); } catch (err) { if (!err || err.code !== 'ENOENT') throw err; }
+    fs.fsyncSync(directoryFD);
+  } finally {
+    fs.closeSync(directoryFD);
   }
 }
 
@@ -1967,7 +2684,26 @@ const linuxChromeSupervisorScript = [
   'while :; do sleep 3600 & wait $!; done',
 ].join('\n');
 
+function chromeProcessEnvironment() {
+  const allowed = [
+    'PATH', 'Path', 'HOME', 'USERPROFILE', 'TMPDIR', 'TMP', 'TEMP', 'TZ',
+    'LANG', 'LANGUAGE', 'LC_ALL', 'LC_CTYPE', 'DISPLAY', 'XAUTHORITY',
+    'WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME',
+    'DBUS_SESSION_BUS_ADDRESS', 'SystemRoot', 'SYSTEMROOT', 'ComSpec', 'COMSPEC',
+	    'LOCALAPPDATA', 'APPDATA',
+  ];
+	  for (const key of __BROWSER_PROCESS_ENVIRONMENT_KEYS__) allowed.push(key);
+  const environment = {};
+  for (const key of allowed) {
+    if (Object.prototype.hasOwnProperty.call(process.env, key)) environment[key] = process.env[key];
+  }
+  return environment;
+}
+
 function spawnChromeProcess(chromeExecutable, chromeArgs) {
+	const stdio = ['ignore', 'pipe', 'pipe'];
+	const lockFD = managedProfileLockFD();
+	if (lockFD !== null) stdio.push(lockFD);
   if (process.platform === 'linux') {
     return spawn('/bin/sh', [
       '-c',
@@ -1977,12 +2713,14 @@ function spawnChromeProcess(chromeExecutable, chromeArgs) {
       ...chromeArgs,
     ], {
       detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+	  stdio,
+      env: chromeProcessEnvironment(),
     });
   }
   return spawn(chromeExecutable, chromeArgs, {
     detached: false,
-    stdio: ['ignore', 'ignore', 'pipe'],
+	stdio: lockFD === null ? ['ignore', 'ignore', 'pipe'] : ['ignore', 'ignore', 'pipe', lockFD],
+    env: chromeProcessEnvironment(),
   });
 }
 
@@ -2028,9 +2766,9 @@ async function launchChromeBrowserAttempt(profileDir, viewport) {
     await captureChromeProcessIdentityOrAbort(chrome, 500);
     if (process.platform === 'linux') {
       chrome.browserPID = await readLinuxChromeBrowserPID(chrome, 1000);
-    }
-    captureChromeBrowserProcessIdentity(chrome);
-    const cdpEndpoint = await waitForChromeEndpoint(chrome, cdpPort);
+	    }
+	    captureChromeBrowserProcessIdentity(chrome);
+	    const cdpEndpoint = await waitForChromeEndpoint(chrome, cdpPort);
     browser = await chromium.connectOverCDP(cdpEndpoint, { timeout: 10000 });
     const contexts = browser.contexts();
     if (!contexts || contexts.length !== 1) throw new Error('native Chrome default context is unavailable');
@@ -2039,11 +2777,13 @@ async function launchChromeBrowserAttempt(profileDir, viewport) {
     if (!pages || pages.length !== 1) throw new Error('native Chrome initial page is unavailable');
     const initialPage = pages[0];
     if (initialPage.url() !== 'about:blank') throw new Error('native Chrome initial page is not blank');
-    await verifyAttachedBrowserProcess(browser, chrome);
-    return {
+	    await verifyAttachedBrowserProcess(browser, chrome);
+	    await writeChromeProfileOwner(profileDir, chrome);
+	    return {
       browser,
       context,
       chrome,
+      profileDir,
       initialPage,
       initialPageConsumed: false,
     };
@@ -2060,11 +2800,7 @@ async function launchChromeBrowser() {
   const profileDir = String(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR || '').trim();
   if (!profileDir) throw new Error('PRODUCT_CAPTURE_BROWSER_PROFILE_DIR is required');
   fs.mkdirSync(profileDir, { recursive: true, mode: 0o700 });
-  for (const lockName of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
-    if (fileSystemEntryExists(path.join(profileDir, lockName))) {
-      throw new Error('Chrome profile is already active: ' + lockName);
-    }
-  }
+  prepareChromeProfile(profileDir);
   const viewport = parseBrowserViewport();
   const startupErrors = [];
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -2132,6 +2868,9 @@ async function closeCaptureBrowser(browser) {
     cleanupErrors.push(err);
   } finally {
     if (terminationComplete && activeChromeChild === browser.chrome) activeChromeChild = null;
+    if (terminationComplete && browser.profileDir && !fileSystemEntryExists(path.join(browser.profileDir, 'SingletonLock'))) {
+	  try { removeChromeProfileOwner(browser.profileDir); } catch (err) { cleanupErrors.push(err); }
+    }
   }
   if (cleanupErrors.length > 0) {
     throw new AggregateError(
@@ -2197,7 +2936,9 @@ function canonicalAmazonProductURL(value) {
   try {
     const parsed = new URL(String(value || ''));
     const asin = amazonASINFromURL(parsed.href, parsed.href);
-    return asin ? parsed.origin + '/dp/' + asin : '';
+    if (!asin) return '';
+    parsed.pathname = '/dp/' + asin;
+    return parsed.href;
   } catch {}
   return '';
 }
@@ -2902,6 +3643,7 @@ async function captureMain(url, deadline) {
   const browser = await launchChromeBrowser();
   try {
     const page = await newCapturePage(browser);
+    await installCaptureNetworkPolicy(browser.context, page, url);
     await gotoTargetWithOptionalWarmup(page, url, deadline);
     if (await hasAmazonInterstitial(page, url, deadline)) {
       throw await amazonManualReviewError(page, url);

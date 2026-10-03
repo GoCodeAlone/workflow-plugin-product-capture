@@ -17,8 +17,9 @@ import (
 )
 
 type ExtractOptions struct {
-	URL        string
-	CapturedAt time.Time
+	URL          string
+	RequestedURL string
+	CapturedAt   time.Time
 }
 
 func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
@@ -30,21 +31,26 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
-	canonicalURL := firstAttr(root, "link", "rel", "canonical", "href")
-	if canonicalURL == "" {
-		canonicalURL = opts.URL
+	requestedURL := strings.TrimSpace(opts.RequestedURL)
+	if requestedURL == "" {
+		requestedURL = opts.URL
 	}
-	requestedASIN := asinFromURL(opts.URL)
+	requestedASIN := asinFromURL(requestedURL)
+	canonicalURL, err := trustedAmazonCanonicalURL(
+		firstAttr(root, "link", "rel", "canonical", "href"),
+		opts.URL,
+		requestedASIN,
+	)
+	if err != nil {
+		return Snapshot{}, err
+	}
 	canonicalASIN := asinFromURL(canonicalURL)
-	if requestedASIN != "" && canonicalASIN != "" && requestedASIN != canonicalASIN {
-		return Snapshot{}, fmt.Errorf("amazon canonical ASIN %q does not match requested ASIN %q", canonicalASIN, requestedASIN)
-	}
 	out := Snapshot{
 		Provider:                 "browser_capture",
 		ProviderVersion:          "amazon-dom-v1",
 		Merchant:                 "amazon",
 		URL:                      opts.URL,
-		RequestedURL:             opts.URL,
+		RequestedURL:             requestedURL,
 		ExternalID:               firstNonEmpty(requestedASIN, canonicalASIN),
 		CapturedAt:               now,
 		RequiresUserConfirmation: true,
@@ -57,19 +63,19 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 	metadataTitle := amazonMetadataTitle(root, opts.URL, out.CanonicalURL)
 	broadTitle := amazonBroadProductTitle(root, opts.URL, out.CanonicalURL)
 	out.Title = firstNonEmpty(domTitle, metadataTitle, broadTitle)
-	trustedImageURL := firstNonEmpty(
+	trustedImageURL := firstAllowedAmazonImageURL(
 		firstAttrByID(root, "landingImage", "src"),
 		firstProductContainerImageAttr(root, "data-old-hires"),
 		firstProductContainerImageAttr(root, "src"),
 	)
 	out.ImageURL = trustedImageURL
 	if domTitle != "" && out.ImageURL == "" {
-		out.ImageURL = firstNonEmpty(
+		out.ImageURL = firstAllowedAmazonImageURL(
 			firstProductImageAttr(root, "data-old-hires"),
 			firstProductImageAttr(root, "src"),
 		)
 	}
-	out.Images = uniqueNonEmpty(dynamicImages(firstAttrByID(root, "landingImage", "data-a-dynamic-image")))
+	out.Images = allowedAmazonImageURLs(dynamicImages(firstAttrByID(root, "landingImage", "data-a-dynamic-image")))
 	if out.ImageURL != "" && !contains(out.Images, out.ImageURL) {
 		out.Images = append([]string{out.ImageURL}, out.Images...)
 	}
@@ -111,6 +117,71 @@ func ExtractAmazon(htmlText string, opts ExtractOptions) (Snapshot, error) {
 		out.Confidence = "medium"
 	}
 	return out, nil
+}
+
+func trustedAmazonCanonicalURL(candidate, fallback, requestedASIN string) (string, error) {
+	fallback = strings.TrimSpace(fallback)
+	if !isTrustedAmazonURL(fallback) {
+		return "", errors.New("amazon capture URL is not a trusted HTTPS Amazon URL")
+	}
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" || !isTrustedAmazonURL(candidate) {
+		return fallback, nil
+	}
+	candidateASIN := asinFromURL(candidate)
+	if requestedASIN != "" {
+		if candidateASIN == "" {
+			return fallback, nil
+		}
+		if candidateASIN != requestedASIN {
+			return "", fmt.Errorf("amazon canonical ASIN %q does not match requested ASIN %q", candidateASIN, requestedASIN)
+		}
+	} else if candidateASIN == "" {
+		return fallback, nil
+	}
+	return "https://www.amazon.com/dp/" + candidateASIN, nil
+}
+
+func isTrustedAmazonURL(raw string) bool {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.User != nil || (parsed.Port() != "" && parsed.Port() != "443") {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	return host == "amazon.com" || host == "www.amazon.com"
+}
+
+func IsAllowedAmazonImageURL(raw string) bool {
+	parsed, err := url.ParseRequestURI(strings.TrimSpace(raw))
+	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || (parsed.Port() != "" && parsed.Port() != "443") {
+		return false
+	}
+	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	return host == "m.media-amazon.com" ||
+		host == "images.amazon.com" ||
+		(strings.HasPrefix(host, "images-") && strings.HasSuffix(host, ".amazon.com")) ||
+		strings.HasSuffix(host, ".ssl-images-amazon.com") ||
+		strings.HasSuffix(host, ".images-amazon.com")
+}
+
+func firstAllowedAmazonImageURL(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if IsAllowedAmazonImageURL(value) {
+			return value
+		}
+	}
+	return ""
+}
+
+func allowedAmazonImageURLs(values []string) []string {
+	filtered := make([]string, 0, len(values))
+	for _, value := range values {
+		if IsAllowedAmazonImageURL(value) {
+			filtered = append(filtered, value)
+		}
+	}
+	return uniqueNonEmpty(filtered)
 }
 
 func amazonVariantDimensions(root *html.Node) map[string]string {

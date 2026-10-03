@@ -100,6 +100,58 @@ func TestCompareBrowserObservationsClassifiesSchemaV1Fields(t *testing.T) {
 	}
 }
 
+func TestProfilePersistenceEvidenceRequiresEveryRuntimeBoundary(t *testing.T) {
+	complete := ProfilePersistenceEvidence{
+		StartupCrashInjected: true,
+		SeedCookieObserved:   true,
+		CrashInjected:        true,
+		RecoveredAfterCrash:  true,
+		CookiePersisted:      true,
+	}
+	if !complete.Valid() {
+		t.Fatalf("complete profile persistence evidence is invalid: %+v", complete)
+	}
+	for _, field := range []string{"startup", "seed", "crash", "recovery", "cookie"} {
+		candidate := complete
+		switch field {
+		case "startup":
+			candidate.StartupCrashInjected = false
+		case "seed":
+			candidate.SeedCookieObserved = false
+		case "crash":
+			candidate.CrashInjected = false
+		case "recovery":
+			candidate.RecoveredAfterCrash = false
+		case "cookie":
+			candidate.CookiePersisted = false
+		}
+		if candidate.Valid() {
+			t.Errorf("profile persistence evidence without %s was accepted: %+v", field, candidate)
+		}
+	}
+}
+
+func TestApplyProfilePersistenceEvidenceFailsClosedWithoutLeakingCause(t *testing.T) {
+	report := Report{Verdict: VerdictPass}
+	cause := errors.New("cookie failure at https://secret-origin.example/runs/secret/profile-verify")
+	applyProfilePersistenceEvidence(&report, ProfilePersistenceEvidence{SeedCookieObserved: true}, cause)
+	if report.Verdict != VerdictFail || !slices.Contains(report.FailureClasses, failureClassProfilePersistence) {
+		t.Fatalf("profile persistence failure was not classified: %+v", report)
+	}
+	if len(report.Errors) != 1 || report.Errors[0] != "managed browser profile persistence conformance failed" {
+		t.Fatalf("profile persistence report errors = %v", report.Errors)
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{"secret-origin", "secret", "cookie failure"} {
+		if strings.Contains(string(data), secret) {
+			t.Fatalf("profile persistence report leaked %q: %s", secret, data)
+		}
+	}
+}
+
 func TestCompareBrowserObservationsTreatsBrowserChromeHeightAsInformational(t *testing.T) {
 	direct := matchingObservation("direct")
 	attached := matchingObservation("attached")
@@ -2047,6 +2099,91 @@ func TestCollectorRejectsWrongRunAndOversizedObservation(t *testing.T) {
 	}
 }
 
+func TestCollectorServesProfileSeedAndVerifyWithoutExposingCookieValue(t *testing.T) {
+	collector := NewCollector("run-123")
+	handler := collector.Handler()
+
+	seed := httptest.NewRecorder()
+	handler.ServeHTTP(seed, httptest.NewRequest(http.MethodGet, "https://diagnostic.example/runs/run-123/profile-seed", http.NoBody))
+	if seed.Code != http.StatusOK {
+		t.Fatalf("seed status = %d", seed.Code)
+	}
+	seedCookie := seed.Header().Get("Set-Cookie")
+	if !strings.Contains(seedCookie, "pc_runtime_conformance=") || !strings.Contains(seedCookie, "Secure") || !strings.Contains(seedCookie, "HttpOnly") {
+		t.Fatalf("seed cookie header = %q", seedCookie)
+	}
+	if strings.Contains(seed.Body.String(), "pc_runtime_conformance") || strings.Contains(seed.Body.String(), seedCookie) {
+		t.Fatalf("seed response exposed cookie material: %s", seed.Body.String())
+	}
+	cookies := seed.Result().Cookies()
+	if len(cookies) != 1 {
+		t.Fatalf("seed response cookies = %+v", cookies)
+	}
+	if cookies[0].MaxAge <= 0 {
+		t.Fatalf("seed cookie MaxAge = %d, want persistent cookie", cookies[0].MaxAge)
+	}
+
+	seedPost := httptest.NewRequest(
+		http.MethodPost,
+		"https://diagnostic.example/runs/run-123/profile-seed",
+		strings.NewReader(providerPayload(matchingObservation("direct").Browser)),
+	)
+	seedPost.AddCookie(cookies[0])
+	seedPostResult := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, seedPost)
+		seedPostResult <- response
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := collector.WaitProfileSeed(ctx); err != nil {
+		t.Fatalf("wait for exact profile seed cookie: %v", err)
+	}
+	select {
+	case <-seedPostResult:
+		t.Fatal("profile seed POST returned before crash injection release")
+	default:
+	}
+	collector.ReleaseProfileSeed()
+	if response := <-seedPostResult; response.Code != http.StatusAccepted {
+		t.Fatalf("seed POST status = %d", response.Code)
+	}
+
+	missingCookie := httptest.NewRecorder()
+	handler.ServeHTTP(missingCookie, httptest.NewRequest(http.MethodGet, "https://diagnostic.example/runs/run-123/profile-verify", http.NoBody))
+	if missingCookie.Code != http.StatusPreconditionFailed {
+		t.Fatalf("verify without exact cookie status = %d", missingCookie.Code)
+	}
+
+	verifyRequest := httptest.NewRequest(http.MethodGet, "https://diagnostic.example/runs/run-123/profile-verify", http.NoBody)
+	verifyRequest.AddCookie(cookies[0])
+	verify := httptest.NewRecorder()
+	handler.ServeHTTP(verify, verifyRequest)
+	if verify.Code != http.StatusOK || verify.Header().Get("Set-Cookie") != "" {
+		t.Fatalf("verify response status/cookie = %d/%q", verify.Code, verify.Header().Get("Set-Cookie"))
+	}
+	verifyPost := httptest.NewRequest(
+		http.MethodPost,
+		"https://diagnostic.example/runs/run-123/profile-verify",
+		strings.NewReader(providerPayload(matchingObservation("attached").Browser)),
+	)
+	verifyPost.AddCookie(cookies[0])
+	verifyPostResponse := httptest.NewRecorder()
+	handler.ServeHTTP(verifyPostResponse, verifyPost)
+	if verifyPostResponse.Code != http.StatusAccepted {
+		t.Fatalf("verify POST status = %d", verifyPostResponse.Code)
+	}
+	if err := collector.WaitProfileVerify(ctx); err != nil {
+		t.Fatalf("wait for exact persisted profile cookie: %v", err)
+	}
+	for _, body := range []string{seed.Body.String(), verify.Body.String(), verifyPostResponse.Body.String()} {
+		if strings.Contains(body, cookies[0].Value) {
+			t.Fatalf("profile response exposed cookie value: %s", body)
+		}
+	}
+}
+
 func TestCollectorRejectsMissingOrNullStableAutomationSignals(t *testing.T) {
 	tests := map[string]func(map[string]any){
 		"missing webdriver": func(signals map[string]any) {
@@ -2244,6 +2381,7 @@ func TestMainWritesRedactedReportAndReturnsBoundedConformanceFailure(t *testing.
 
 	output := filepath.Join(t.TempDir(), "conformance.json")
 	lifecycleCalls := 0
+	profilePersistenceCalls := 0
 	dependencies := Dependencies{
 		Tunnel:           tunnel,
 		HTTPClient:       client,
@@ -2256,6 +2394,16 @@ func TestMainWritesRedactedReportAndReturnsBoundedConformanceFailure(t *testing.
 		},
 		InspectVersions: func(context.Context, string) (Versions, error) {
 			return Versions{ImageID: "sha256:image", Chrome: "Google Chrome 140", Playwright: "1.57.0", Xvfb: "1.20.14"}, nil
+		},
+		ValidateProfilePersistence: func(_ context.Context, _, origin string, _ bool, collector *Collector) (ProfilePersistenceEvidence, error) {
+			profilePersistenceCalls++
+			return ProfilePersistenceEvidence{
+				StartupCrashInjected: true,
+				SeedCookieObserved:   true,
+				CrashInjected:        true,
+				RecoveredAfterCrash:  true,
+				CookiePersisted:      true,
+			}, fmt.Errorf("profile recovery failed at %s", origin+"/runs/"+collector.runID+"/profile-verify")
 		},
 	}
 	var stdout, stderr bytes.Buffer
@@ -2299,6 +2447,9 @@ func TestMainWritesRedactedReportAndReturnsBoundedConformanceFailure(t *testing.
 	if lifecycleCalls != 1 {
 		t.Fatalf("lifecycle calls = %d, want 1", lifecycleCalls)
 	}
+	if profilePersistenceCalls != 1 {
+		t.Fatalf("profile persistence calls = %d, want 1", profilePersistenceCalls)
+	}
 	data, readErr := os.ReadFile(output)
 	if readErr != nil {
 		t.Fatal(readErr)
@@ -2309,6 +2460,9 @@ func TestMainWritesRedactedReportAndReturnsBoundedConformanceFailure(t *testing.
 	}
 	if report.Verdict != VerdictFail || report.ExitCode() == 0 || report.Versions.ImageID != "sha256:image" {
 		t.Fatalf("report = %+v", report)
+	}
+	if !report.ProfilePersistence.Valid() {
+		t.Fatalf("profile persistence evidence = %+v", report.ProfilePersistence)
 	}
 	for _, forbidden := range []string{"run-", "diagnostic.example", "trycloudflare.com", "remote_addr", "cookie_value"} {
 		if strings.Contains(string(data), forbidden) {
@@ -2470,6 +2624,161 @@ func TestAttachedContainerArgsRunRealProviderDiagnostic(t *testing.T) {
 	for _, forbidden := range []string{"DISPLAY=", "Xvfb :99", headedContainerScript} {
 		if strings.Contains(joined, forbidden) {
 			t.Fatalf("attached provider must own its headed display; args contain %q", forbidden)
+		}
+	}
+}
+
+func TestProfileDiagnosticContainerArgsRunShippedProviderWithStableIdentity(t *testing.T) {
+	got := profileDiagnosticContainerArgs(
+		"candidate:test",
+		"https://diagnostic.example/runs/run/profile-seed",
+		false,
+		"product-capture-profile-volume",
+		"product-capture-profile-seed",
+	)
+	joined := strings.Join(got, " ")
+	for _, required := range []string{
+		"--entrypoint /usr/local/bin/product-capture-provider",
+		"--browser-diagnostic-url https://diagnostic.example/runs/run/profile-seed",
+		"--browser-profile-conformance",
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_DIR=/profile/chrome",
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE=runtime-conformance-v1",
+		"--hostname product-capture-profile-conformance",
+		"product-capture-profile-volume:/profile",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Errorf("profile diagnostic args missing %q: %s", required, joined)
+		}
+	}
+	if strings.Contains(joined, "--entrypoint node") || strings.Contains(joined, "playwright test") {
+		t.Fatalf("profile conformance bypasses the shipped provider: %s", joined)
+	}
+	if strings.Contains(joined, "--rm") {
+		t.Fatalf("profile conformance must retain the killed container until exit 137 is inspected: %s", joined)
+	}
+}
+
+func TestProfileStartupCrashContainerArgsExecuteShippedProviderAtPreOwnerBoundary(t *testing.T) {
+	got := profileStartupCrashContainerArgs(
+		"candidate:test",
+		"https://diagnostic.example/runs/run/profile-startup",
+		false,
+		"product-capture-profile-volume",
+		"product-capture-profile-startup-crash",
+	)
+	joined := strings.Join(got, " ")
+	for _, required := range []string{
+		"--entrypoint /usr/local/bin/product-capture-provider",
+		"--browser-profile-conformance",
+		"--browser-profile-conformance-crash-before-owner",
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_DIR=/profile/chrome",
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE=runtime-conformance-v1",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Errorf("profile startup crash args missing %q: %s", required, joined)
+		}
+	}
+	for _, forbidden := range []string{"PRODUCT_CAPTURE_TEST_", "chromium.launch", "playwright test", "fs.watch(", "SIGCONT", "PRODUCT_CAPTURE_PROFILE_STARTUP_MONITOR_SCRIPT"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("profile startup crash bypasses the shipped runtime with %q: %s", forbidden, joined)
+		}
+	}
+}
+
+func TestProfileStartupCrashProbeIsReadOnlyNetworklessAndValueBlind(t *testing.T) {
+	got := profileStartupCrashProbeContainerArgs(
+		"candidate:test",
+		"product-capture-profile-volume",
+		"product-capture-profile-startup-probe",
+	)
+	joined := strings.Join(got, " ")
+	for _, required := range []string{
+		"--network none",
+		"product-capture-profile-volume:/profile:ro",
+		"--entrypoint /bin/sh",
+		`test -L /profile/chrome/SingletonLock`,
+		`test -f /profile/chrome/.product-capture-chrome-launch.json`,
+		`test ! -L /profile/chrome/.product-capture-chrome-launch.json`,
+		`test ! -e /profile/chrome/.product-capture-chrome-owner.json`,
+		`test -f /profile/chrome/.product-capture-chrome-conformance-pre-owner-ready`,
+		`test ! -L /profile/chrome/.product-capture-chrome-conformance-pre-owner-ready`,
+		`printf 'confirmed\n'`,
+	} {
+		if !strings.Contains(joined, required) {
+			t.Errorf("profile startup crash probe args missing %q: %s", required, joined)
+		}
+	}
+	for _, forbidden := range []string{"cat ", "head ", "tail ", "hexdump", "od ", "readlink"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("profile startup crash probe reads marker contents with %q: %s", forbidden, joined)
+		}
+	}
+}
+
+func TestProfileStartupCrashProbeRequiresDurableBoundaryMarker(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("startup boundary probe requires a POSIX shell")
+	}
+	profileDir := t.TempDir()
+	if err := os.Symlink("host-123", filepath.Join(profileDir, "SingletonLock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, ".product-capture-chrome-launch.json"), []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runProbe := func() ([]byte, error) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		script := strings.ReplaceAll(profileStartupCrashProbeScript, "/profile/chrome", profileDir)
+		script = strings.Replace(script, `test "$attempt" -lt 600`, `test "$attempt" -lt 1`, 1)
+		cmd := exec.CommandContext(ctx, "/bin/sh", "-c", script)
+		return cmd.CombinedOutput()
+	}
+	if output, err := runProbe(); err == nil {
+		t.Fatalf("probe accepted early lock/journal state without boundary marker: %q", output)
+	}
+	marker := filepath.Join(profileDir, ".product-capture-chrome-conformance-pre-owner-ready")
+	if err := os.WriteFile(marker, []byte("ready\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	output, err := runProbe()
+	if err != nil {
+		t.Fatalf("probe rejected durable boundary marker: %v output=%q", err, output)
+	}
+	if string(output) != "confirmed\n" {
+		t.Fatalf("probe output = %q, want confirmed", output)
+	}
+}
+
+func TestProfileCookiePersistenceProbeIsReadOnlyAndValueBlind(t *testing.T) {
+	got := profileCookiePersistenceProbeContainerArgs(
+		"candidate:test",
+		"product-capture-profile-volume",
+		"diagnostic.example",
+		"/runs/run-123/",
+		"product-capture-profile-cookie-probe",
+	)
+	joined := strings.Join(got, " ")
+	for _, required := range []string{
+		"--network none",
+		"--user 1000:1000",
+		"product-capture-profile-volume:/profile:ro",
+		"--entrypoint node",
+		"candidate:test",
+		"diagnostic.example",
+		"/runs/run-123/",
+		"host_key = ?",
+		"name = 'pc_runtime_conformance'",
+		"path = ?",
+		"is_persistent = 1",
+	} {
+		if !strings.Contains(joined, required) {
+			t.Errorf("profile cookie persistence probe args missing %q: %s", required, joined)
+		}
+	}
+	for _, forbidden := range []string{"encrypted_value", "SELECT value", "select value"} {
+		if strings.Contains(joined, forbidden) {
+			t.Fatalf("profile cookie persistence probe reads cookie material %q: %s", forbidden, joined)
 		}
 	}
 }
@@ -3421,6 +3730,261 @@ func TestForceContainerAndWaitReapsAfterGraceTimeout(t *testing.T) {
 	}
 }
 
+func TestManagedProfileCrashWaitsForDurableCookieBeforeSIGKILL(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	stateDir := t.TempDir()
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+state=${PRODUCT_CAPTURE_TEST_DOCKER_STATE:?}
+case "${1:-}" in
+run)
+  printf '%s\n' "$$" >"$state/run.pid"
+  : >"$state/container"
+  while :; do sleep 0.01; done
+  ;;
+kill)
+  if [ ! -e "$state/durable" ]; then
+    : >"$state/killed-before-durable"
+	  kill -KILL "$(cat "$state/run.pid")"
+    exit 92
+  fi
+  kill -KILL "$(cat "$state/run.pid")"
+  ;;
+container)
+  if [ "${2:-}" = inspect ] && [ -e "$state/container" ]; then
+    if [ "${3:-}" = --format ]; then printf '%s\n' 137; fi
+    exit 0
+  fi
+  echo 'Error response from daemon: No such container' >&2
+  exit 1
+  ;;
+rm)
+  rm -f "$state/container"
+  ;;
+*)
+  echo "unexpected docker command: $*" >&2
+  exit 2
+  ;;
+esac
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_TEST_DOCKER_STATE", stateDir)
+	t.Cleanup(func() { killRecordedProcess(filepath.Join(stateDir, "run.pid")) })
+
+	collector := NewCollector("run-123")
+	result := make(chan error, 1)
+	go func() {
+		result <- runManagedProfileSeedCrash(
+			context.Background(),
+			collector,
+			"product-capture-profile-seed-test",
+			[]string{"run", "--name", "product-capture-profile-seed-test", "candidate:test"},
+			func(context.Context) error {
+				return os.WriteFile(filepath.Join(stateDir, "durable"), []byte("yes\n"), 0o600)
+			},
+		)
+	}()
+	waitForPath(t, filepath.Join(stateDir, "container"))
+	collector.markProfileSeedObserved()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("run managed profile seed crash: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("managed profile seed crash did not complete")
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "durable")); err != nil {
+		t.Fatalf("durable cookie probe was not called: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, "killed-before-durable")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("Chrome was killed before durable cookie evidence: %v", err)
+	}
+}
+
+func TestCleanupManagedProfileCrashSkipsAlreadyRemovedContainer(t *testing.T) {
+	wait := make(chan error)
+	done := make(chan error, 1)
+	go func() {
+		done <- cleanupManagedProfileCrash("already-removed", wait, true, true)
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("cleanup already-removed profile crash container: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("cleanup tried to consume an already-reaped wait result")
+	}
+}
+
+func TestRunManagedProfileStartupCrashCancelsAndJoinsBoundaryProbeAfterEarlyExit(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+case "${1:-}" in
+run) exit 42 ;;
+rm) exit 0 ;;
+container)
+  echo 'Error response from daemon: No such container' >&2
+  exit 1
+  ;;
+*) exit 0 ;;
+esac
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probeStarted := make(chan struct{})
+	probeStopped := make(chan struct{})
+	err := runManagedProfileStartupCrash(
+		ctx,
+		"product-capture-profile-startup-test",
+		[]string{"run", "--name", "product-capture-profile-startup-test", "candidate:test"},
+		func(ctx context.Context) error {
+			close(probeStarted)
+			<-ctx.Done()
+			close(probeStopped)
+			return ctx.Err()
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "exited before crash injection") {
+		t.Fatalf("runManagedProfileStartupCrash error = %v, want early exit", err)
+	}
+	select {
+	case <-probeStarted:
+	default:
+		t.Fatal("startup boundary probe was not started")
+	}
+	select {
+	case <-probeStopped:
+	default:
+		t.Fatal("startup boundary probe was not canceled and joined before return")
+	}
+}
+
+func TestCleanupManagedProfileCrashRemovesReapedContainerWithoutKillingAgain(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	stateDir := t.TempDir()
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+printf '%s\n' "$*" >>"$PRODUCT_CAPTURE_TEST_DOCKER_STATE/calls"
+if [ "${1:-}" = "rm" ] && [ "${2:-}" = "-f" ]; then
+  exit 0
+fi
+if [ "${1:-}" = "container" ] && [ "${2:-}" = "inspect" ]; then
+  echo 'Error response from daemon: No such container' >&2
+  exit 1
+fi
+if [ "${1:-}" = "kill" ]; then
+  echo 'already-exited container must not be killed again' >&2
+  exit 90
+fi
+exit 91
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_TEST_DOCKER_STATE", stateDir)
+
+	if err := cleanupManagedProfileCrash("already-exited", make(chan error), true, false); err != nil {
+		t.Fatalf("cleanup reaped profile crash container: %v", err)
+	}
+	calls, err := os.ReadFile(filepath.Join(stateDir, "calls"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(calls), "kill") || !strings.Contains(string(calls), "rm -f already-exited") {
+		t.Fatalf("reaped profile cleanup calls = %q", calls)
+	}
+}
+
+func TestProfileDiagnosticPostedRequiresSuccessfulControlledOriginPost(t *testing.T) {
+	for name, test := range map[string]struct {
+		output  string
+		wantErr bool
+	}{
+		"posted":     {output: `{"posted_to_origin":true}`},
+		"not posted": {output: `{"posted_to_origin":false}`, wantErr: true},
+		"malformed":  {output: `{`, wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := profileDiagnosticPosted(test.output)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("profileDiagnosticPosted(%q) error = %v, wantErr %t", test.output, err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestRunManagedContainerOutputParsesStdoutDespiteStderrWarning(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+case "${1:-}" in
+run)
+  printf '%s\n' '{"posted_to_origin":true}'
+  printf '%s\n' '[chrome] harmless warning' >&2
+  ;;
+stop|rm)
+  ;;
+container)
+  echo 'Error response from daemon: No such container' >&2
+  exit 1
+  ;;
+*)
+  echo "unexpected docker command: $*" >&2
+  exit 2
+  ;;
+esac
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	output, err := runManagedContainerOutput(
+		context.Background(),
+		"candidate-warning",
+		[]string{"run", "--name", "candidate-warning", "candidate:test"},
+		4096,
+	)
+	if err != nil {
+		t.Fatalf("run managed container output: %v", err)
+	}
+	if strings.Contains(output, "harmless warning") {
+		t.Fatalf("managed container stdout contains stderr warning: %q", output)
+	}
+	if err := profileDiagnosticPosted(output); err != nil {
+		t.Fatalf("parse managed container stdout: %v; output=%q", err, output)
+	}
+}
+
 func TestRunLifecycleScenarioCleansUpAfterContextCancellation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake docker executable requires a POSIX shell")
@@ -3486,7 +4050,7 @@ esac
 		result <- runLifecycleScenario(ctx, "candidate:test", "https://example.test/lifecycle-hang", time.Minute, "stop", false)
 	}()
 	container := filepath.Join(stateDir, "container")
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if _, err := os.Stat(container); err == nil {
 			break
@@ -3828,9 +4392,69 @@ esac
 	}
 }
 
+func TestDockerHelpersBoundFailureOutputBeforeFormatting(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+i=0
+while [ "$i" -lt 1024 ]; do
+  printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' >&2
+  i=$((i + 1))
+done
+exit 42
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	err := dockerCommand(context.Background(), "inspect", "candidate:test")
+	if err == nil {
+		t.Fatal("dockerCommand succeeded despite fake Docker failure")
+	}
+	if len(err.Error()) > 12<<10 {
+		t.Fatalf("dockerCommand retained unbounded failure output: %d bytes", len(err.Error()))
+	}
+	_, err = dockerOutput(context.Background(), "inspect", "candidate:test")
+	if err == nil {
+		t.Fatal("dockerOutput succeeded despite fake Docker failure")
+	}
+	if len(err.Error()) > 12<<10 {
+		t.Fatalf("dockerOutput retained unbounded failure output: %d bytes", len(err.Error()))
+	}
+}
+
+func TestDockerCommandDiscardsExcessSuccessfulOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake docker executable requires a POSIX shell")
+	}
+	binDir := t.TempDir()
+	dockerPath := filepath.Join(binDir, "docker")
+	fakeDocker := `#!/bin/sh
+set -eu
+i=0
+while [ "$i" -lt 1024 ]; do
+  printf '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n'
+  i=$((i + 1))
+done
+`
+	if err := os.WriteFile(dockerPath, []byte(fakeDocker), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := dockerCommand(context.Background(), "container", "inspect", "candidate:test"); err != nil {
+		t.Fatalf("dockerCommand rejected a successful command with discardable output: %v", err)
+	}
+}
+
 func waitForPath(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for {
 		if _, err := os.Stat(path); err == nil {
 			return
@@ -3893,6 +4517,10 @@ func TestCandidateReleaseBuildsOnceAndPublishesOnlyTestedImage(t *testing.T) {
 		"load: true",
 		"platforms: linux/amd64",
 		"go run ./cmd/browser-runtime-conformance --image \"$CANDIDATE\" --output conformance.json",
+		`.profile_persistence.seed_cookie_observed == true`,
+		`.profile_persistence.crash_injected == true`,
+		`.profile_persistence.recovered_after_crash == true`,
+		`.profile_persistence.cookie_persisted == true`,
 		"docker push \"$CANDIDATE\"",
 		"docker buildx imagetools inspect",
 		"steps.build.outputs.imageid",

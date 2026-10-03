@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -28,6 +29,7 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+	"unicode/utf8"
 
 	coreprotocol "github.com/GoCodeAlone/workflow-plugin-compute-core/protocol"
 	"github.com/GoCodeAlone/workflow-plugin-product-capture/internal/conformance"
@@ -144,6 +146,59 @@ func TestProviderContractAlignsWithWorkflowComputeGenericProviderABI(t *testing.
 	if len(diagnosticSpecs) != 1 || diagnosticSpecs[0].Name != BrowserDiagnosticJSONArtifact ||
 		diagnosticSpecs[0].ContentType != "application/json" || diagnosticSpecs[0].MaxBytes != 1<<20 {
 		t.Fatalf("diagnostic artifact specs = %+v", diagnosticSpecs)
+	}
+}
+
+func TestProviderContractSchemaDigestsMatchReferencedDocuments(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "contracts", "product-capture-provider.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contract coreprotocol.ProviderContract
+	if err := coreprotocol.DecodeStrict(bytes.NewReader(data), &contract); err != nil {
+		t.Fatal(err)
+	}
+	paths := map[string]string{
+		"schema://providers/workflow-plugin-product-capture/browser/v1":                                      "product-capture-provider.schema.json",
+		"schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/input/v1":     "product-capture-operation-input.schema.json",
+		"schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/output/v1":    "product-capture-operation-output.schema.json",
+		"schema://providers/workflow-plugin-product-capture/browser/operations/browser_diagnostic/input/v1":  "browser-diagnostic-operation-input.schema.json",
+		"schema://providers/workflow-plugin-product-capture/browser/operations/browser_diagnostic/output/v1": "browser-diagnostic-operation-output.schema.json",
+	}
+	type schemaRef struct {
+		ref    string
+		digest string
+	}
+	refs := []schemaRef{{ref: contract.ConfigSchemaRef, digest: contract.ConfigSchemaDigest}}
+	for _, operation := range contract.Operations {
+		refs = append(refs,
+			schemaRef{ref: operation.InputSchemaRef, digest: operation.InputSchemaDigest},
+			schemaRef{ref: operation.OutputSchemaRef, digest: operation.OutputSchemaDigest},
+		)
+	}
+	for _, candidate := range refs {
+		path, ok := paths[candidate.ref]
+		if !ok {
+			t.Fatalf("contract references unknown schema %q", candidate.ref)
+		}
+		schemaData, err := os.ReadFile(filepath.Join("..", "..", "schemas", path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var document struct {
+			ID string `json:"$id"`
+		}
+		if err := json.Unmarshal(schemaData, &document); err != nil {
+			t.Fatalf("decode schema %q: %v", candidate.ref, err)
+		}
+		if document.ID != candidate.ref {
+			t.Errorf("schema %q id = %q", candidate.ref, document.ID)
+		}
+		sum := sha256.Sum256(schemaData)
+		want := "sha256:" + hex.EncodeToString(sum[:])
+		if candidate.digest != want {
+			t.Errorf("schema %q digest = %q, want %q", candidate.ref, candidate.digest, want)
+		}
 	}
 }
 
@@ -396,6 +451,18 @@ func TestMainRejectsUnknownRequestFields(t *testing.T) {
 	}
 }
 
+func TestReadRequestRejectsOversizedInput(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "request.json")
+	request := []byte(`{"workload":{"url":"https://www.amazon.com/dp/B08H75RTZ8","allowed_hosts":["www.amazon.com"]}}`)
+	request = append(request, bytes.Repeat([]byte(" "), maxDynamicEnvelopeBytes+1-len(request))...)
+	if err := os.WriteFile(path, request, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readRequest(path); err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("readRequest error = %v, want bounded input rejection", err)
+	}
+}
+
 func TestMainRejectsUnsupportedHosts(t *testing.T) {
 	dir := t.TempDir()
 	req := filepath.Join(dir, "request.json")
@@ -409,8 +476,8 @@ func TestMainRejectsUnsupportedHosts(t *testing.T) {
 	if code == 0 {
 		t.Fatalf("expected failure, stdout=%s", stdout.String())
 	}
-	if !strings.Contains(stderr.String(), "unsupported host") {
-		t.Fatalf("stderr missing host error: %s", stderr.String())
+	if !strings.Contains(stderr.String(), "product input schema") || !strings.Contains(stderr.String(), "allowed_hosts") {
+		t.Fatalf("stderr missing authoritative host schema error: %s", stderr.String())
 	}
 }
 
@@ -419,8 +486,9 @@ func TestMainCapturesAmazonFixture(t *testing.T) {
 	req := filepath.Join(dir, "request.json")
 	out := filepath.Join(dir, "snapshot.json")
 	fixture := filepath.Join("..", "snapshot", "testdata", "amazon_xbox.html")
+	const requestedURL = "https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8?tag=wishlist#reviews"
 	t.Setenv("PRODUCT_CAPTURE_HTML_FIXTURE", fixture)
-	if err := os.WriteFile(req, []byte(`{"workload":{"url":"https://www.amazon.com/Microsoft-Xbox-Gaming-Console-video-game/dp/B08H75RTZ8","allowed_hosts":["www.amazon.com"],"capture_mode":"browser","timeout_seconds":30,"max_html_bytes":1048576,"max_image_count":4}}`), 0o600); err != nil {
+	if err := os.WriteFile(req, []byte(`{"workload":{"url":"`+requestedURL+`","allowed_hosts":["www.amazon.com"],"capture_mode":"browser","timeout_seconds":30,"max_html_bytes":1048576,"max_image_count":4}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -458,7 +526,7 @@ func TestMainCapturesAmazonFixture(t *testing.T) {
 	if got.Price != "637.00" {
 		t.Fatalf("price: %q", got.Price)
 	}
-	if got.RequestedURL == "" || got.ExternalID != "B08H75RTZ8" || got.CanonicalURL == "" {
+	if got.RequestedURL != requestedURL || got.ExternalID != "B08H75RTZ8" || got.CanonicalURL == "" {
 		t.Fatalf("product identity fields missing: %+v", got)
 	}
 	if got.ImageURL == "" || got.VariantKey == "" || !got.RequiresUserConfirmation {
@@ -626,25 +694,25 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	}
 }
 
-func TestMainForwardsIPv4PolicyToBrowserDiagnostic(t *testing.T) {
+func TestMainForwardsBrowserDiagnosticOptions(t *testing.T) {
 	var gotURL string
-	var gotRequireIPv4 bool
+	var gotOptions browserDiagnosticOptions
 	var stdout, stderr bytes.Buffer
 	code := mainWithBrowserDiagnosticRunner(
-		[]string{"--browser-diagnostic-url", "https://diagnostic.example/probe", "--browser-diagnostic-require-ipv4"},
+		[]string{"--browser-diagnostic-url", "https://diagnostic.example/probe", "--browser-diagnostic-require-ipv4", "--browser-profile-conformance", "--browser-profile-conformance-crash-before-owner"},
 		&stdout,
 		&stderr,
-		func(rawURL string, _ io.Writer, requireIPv4 bool) error {
+		func(rawURL string, _ io.Writer, options browserDiagnosticOptions) error {
 			gotURL = rawURL
-			gotRequireIPv4 = requireIPv4
+			gotOptions = options
 			return nil
 		},
 	)
 	if code != 0 || stderr.Len() != 0 {
 		t.Fatalf("Main code/stderr = %d/%q, want successful policy forwarding", code, stderr.String())
 	}
-	if gotURL != "https://diagnostic.example/probe" || !gotRequireIPv4 {
-		t.Fatalf("browser diagnostic runner got URL/requireIPv4 = %q/%v", gotURL, gotRequireIPv4)
+	if gotURL != "https://diagnostic.example/probe" || !gotOptions.RequireIPv4 || !gotOptions.PersistentProfileConformance || !gotOptions.CrashBeforeOwnerConformance {
+		t.Fatalf("browser diagnostic runner got URL/options = %q/%+v", gotURL, gotOptions)
 	}
 }
 
@@ -653,6 +721,27 @@ func TestMainRejectsIPv4PolicyWithoutBrowserDiagnosticURL(t *testing.T) {
 	code := Main([]string{"--browser-diagnostic-require-ipv4"}, &stdout, &stderr, strings.NewReader("{}"))
 	if code != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "requires --browser-diagnostic-url") {
 		t.Fatalf("Main code/stdout/stderr = %d/%q/%q, want scoped policy rejection", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestMainRejectsProfileConformanceWithoutBrowserDiagnosticURL(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Main([]string{"--browser-profile-conformance"}, &stdout, &stderr, strings.NewReader("{}"))
+	if code != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "requires --browser-diagnostic-url") {
+		t.Fatalf("Main code/stdout/stderr = %d/%q/%q, want scoped profile-conformance rejection", code, stdout.String(), stderr.String())
+	}
+}
+
+func TestMainRejectsProfileStartupCrashWithoutProfileConformance(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Main(
+		[]string{"--browser-diagnostic-url", "https://diagnostic.example/probe", "--browser-profile-conformance-crash-before-owner"},
+		&stdout,
+		&stderr,
+		strings.NewReader("{}"),
+	)
+	if code != 2 || stdout.Len() != 0 || !strings.Contains(stderr.String(), "requires --browser-profile-conformance") {
+		t.Fatalf("Main code/stdout/stderr = %d/%q/%q, want scoped startup-crash rejection", code, stdout.String(), stderr.String())
 	}
 }
 
@@ -807,6 +896,60 @@ func TestRunBrowserDiagnosticPreservesProcessErrorWithBrowserStderr(t *testing.T
 	}
 }
 
+func TestRunBrowserDiagnosticRedactsDefaultDiagnosticFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\nprintf 'failed at %s\\n' \"$2\" >&2\nexit 17\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
+	const target = "https://93.184.216.34/runs/secret-run-42/attached"
+
+	err := runBrowserDiagnostic(target, io.Discard)
+	if err == nil {
+		t.Fatal("expected browser diagnostic process failure")
+	}
+	for _, forbidden := range []string{target, "93.184.216.34", "secret-run-42", "/runs/"} {
+		if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(forbidden)) {
+			t.Fatalf("default browser diagnostic error leaked %q: %v", forbidden, err)
+		}
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 17 {
+		t.Fatalf("error chain = %v, want exit code 17", err)
+	}
+}
+
+func TestRunBrowserDiagnosticBoundsBrowserStderrTail(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\nprintf '%0131072d' 0 >&2\nprintf 'diagnostic-tail-marker\\n' >&2\nexit 17\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS", "https://93.184.216.34")
+
+	err := runBrowserDiagnostic("https://93.184.216.34/probe", io.Discard)
+	if err == nil {
+		t.Fatal("expected browser diagnostic process failure")
+	}
+	if len(err.Error()) > 70<<10 {
+		t.Fatalf("browser diagnostic error retained %d stderr bytes, want a bounded preview", len(err.Error()))
+	}
+	if !strings.Contains(err.Error(), "diagnostic-tail-marker") {
+		t.Fatalf("browser diagnostic error lost the stderr tail: %v", err)
+	}
+}
+
 func TestBrowserDiagnosticScriptSharesNativeChromeLaunchPath(t *testing.T) {
 	if !strings.Contains(playwrightBrowserDiagnosticScript, "launchChromeBrowser") {
 		t.Fatalf("diagnostic script must use the shared browser launcher")
@@ -872,6 +1015,51 @@ func TestNativeChromeScriptUsesStableLinuxProcessGroupSupervisor(t *testing.T) {
 		if !strings.Contains(playwrightBrowserPrelude, required) {
 			t.Errorf("Linux Chrome supervisor contract missing %q", required)
 		}
+	}
+}
+
+func TestNativeChromeScriptRecognizesOnlyExactRosettaChromeIdentity(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(() => {
+  const profileDir = '/profile/chrome';
+  const stat = '42 (chrome) S 1 40 40 ' + Array(15).fill('0').join(' ') + ' 123 0\n';
+  const cases = [
+    { name: 'exact', comm: 'chrome\n', guest: '/opt/google/chrome/chrome', wrapper: '/usr/bin/google-chrome', profile: profileDir, want: true },
+    { name: 'wrong comm', comm: 'node\n', guest: '/opt/google/chrome/chrome', wrapper: '/usr/bin/google-chrome', profile: profileDir, want: false },
+    { name: 'wrong guest', comm: 'chrome\n', guest: '/tmp/chrome', wrapper: '/usr/bin/google-chrome', profile: profileDir, want: false },
+    { name: 'wrong wrapper', comm: 'chrome\n', guest: '/opt/google/chrome/chrome', wrapper: '/tmp/google-chrome', profile: profileDir, want: false },
+    { name: 'wrong profile', comm: 'chrome\n', guest: '/opt/google/chrome/chrome', wrapper: '/usr/bin/google-chrome', profile: '/profile/other', want: false },
+  ];
+  const nativeReadlinkSync = fs.readlinkSync;
+  const nativeReadFileSync = fs.readFileSync;
+  try {
+    fs.readlinkSync = () => '/run/rosetta/rosetta';
+    for (const testCase of cases) {
+      fs.readFileSync = (filePath, encoding) => {
+        let value;
+        if (String(filePath).endsWith('/stat')) value = stat;
+        else if (String(filePath).endsWith('/comm')) value = testCase.comm;
+        else if (String(filePath).endsWith('/cmdline')) {
+          value = ['/run/rosetta/rosetta', testCase.guest, testCase.wrapper, '--user-data-dir=' + testCase.profile, '--remote-debugging-port=9222', '--remote-debugging-address=127.0.0.1', 'about:blank'].join('\0') + '\0';
+        } else throw new Error('unexpected procfs read ' + filePath);
+        return encoding ? value : Buffer.from(value);
+      };
+      const got = linuxChromeExecutable(42, profileDir, 40, '123');
+      if (got !== testCase.want) {
+        const debugArgs = fs.readFileSync('/proc/42/cmdline').toString('utf8').split('\0');
+        debugArgs.pop();
+        throw new Error(testCase.name + ' Rosetta identity = ' + got + ', want ' + testCase.want + '; stat=' + JSON.stringify(linuxProcessStat(42)) + '; args=' + JSON.stringify(debugArgs) + '; launch=' + validChromeLaunchArguments(debugArgs.slice(3), profileDir));
+      }
+    }
+  } finally {
+    fs.readlinkSync = nativeReadlinkSync;
+    fs.readFileSync = nativeReadFileSync;
+  }
+  process.stdout.write('validated');
+})()
+`)
+	if err != nil || stdout.String() != "validated" {
+		t.Fatalf("Rosetta Chrome identity validation failed: %v\nstdout=%s\nstderr=%s", err, stdout.String(), stderr.String())
 	}
 }
 
@@ -941,6 +1129,40 @@ func TestNativeChromeScriptRetriesBoundedStartupFailures(t *testing.T) {
 		if !strings.Contains(playwrightBrowserPrelude, required) {
 			t.Errorf("native Chrome startup retry missing %q", required)
 		}
+	}
+}
+
+func TestNativeChromeScriptHoldsExactPreOwnerConformanceBoundary(t *testing.T) {
+	for _, required := range []string{
+		"profile-startup-crash-before-owner",
+		"signalChromeProcessBoundary(chrome, 'SIGSTOP')",
+		"publishChromeProfileConformanceBoundary(profileDir)",
+		"process.kill(process.pid, 'SIGSTOP')",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Errorf("pre-owner conformance boundary missing %q", required)
+		}
+	}
+	ownerStart := strings.Index(playwrightBrowserPrelude, "async function writeChromeProfileOwner(profileDir, chrome)")
+	ownerEnd := strings.Index(playwrightBrowserPrelude[ownerStart:], "\n}\n\nfunction removeChromeProfileOwner(profileDir)")
+	if ownerStart < 0 || ownerEnd < 0 {
+		t.Fatal("Chrome profile owner writer is missing")
+	}
+	ownerWriter := playwrightBrowserPrelude[ownerStart : ownerStart+ownerEnd]
+	identity := strings.Index(ownerWriter, "if (!linuxChromeExecutable(")
+	stopChrome := strings.Index(ownerWriter, "signalChromeProcessBoundary(chrome, 'SIGSTOP')")
+	publishBoundary := strings.Index(ownerWriter, "publishChromeProfileConformanceBoundary(profileDir)")
+	stopProvider := strings.Index(ownerWriter, "process.kill(process.pid, 'SIGSTOP')")
+	ownerRecord := strings.Index(ownerWriter, "const owner = {")
+	ownerWrite := strings.Index(ownerWriter, "fs.openSync(temporaryPath, 'wx', 0o600)")
+	if identity < 0 || stopChrome <= identity || publishBoundary <= stopChrome || stopProvider <= publishBoundary || ownerRecord <= stopProvider || ownerWrite <= ownerRecord {
+		t.Fatalf("pre-owner conformance boundary order is invalid: identity=%d stopChrome=%d publishBoundary=%d stopProvider=%d ownerRecord=%d ownerWrite=%d", identity, stopChrome, publishBoundary, stopProvider, ownerRecord, ownerWrite)
+	}
+	if strings.Count(playwrightBrowserPrelude, "await writeChromeProfileOwner(profileDir, chrome)") != 1 {
+		t.Fatal("Chrome profile owner publication must have exactly one call site")
+	}
+	if strings.Contains(playwrightBrowserPrelude, "holdManagedProfileBeforeOwnerPublication") {
+		t.Fatal("pre-owner hold must be inseparable from the sole owner writer")
 	}
 }
 
@@ -3147,6 +3369,295 @@ exports.errors = { TimeoutError: class TimeoutError extends Error {} };
 	}
 }
 
+func TestBrowserPreludePreservesStaleChromeLocksForGoManager(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("persistent browser profiles are Linux-only")
+	}
+	profileDir := filepath.Join(t.TempDir(), "chrome-profile")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	generation := strings.Repeat("a", 64)
+	writeTestBrowserProfileMetadata(t, profileDir, generation)
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const stalePID = 99999999
+	if err := os.Symlink(fmt.Sprintf("%s-%d", hostname, stalePID), filepath.Join(profileDir, "SingletonLock")); err != nil {
+		t.Skipf("create Chrome-style profile lock symlink: %v", err)
+	}
+	for _, name := range []string{"SingletonSocket", "SingletonCookie"} {
+		if err := os.Symlink("stale", filepath.Join(profileDir, name)); err != nil {
+			t.Skipf("create Chrome-style profile lock symlink: %v", err)
+		}
+	}
+	writeTestChromeOwnerMetadata(t, profileDir, generation, hostname, stalePID, "123")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD", "1")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_GENERATION", generation)
+
+	_, stderr, err := runBrowserPreludeSnippet(t, `
+prepareChromeProfile(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR);
+`)
+	if err == nil {
+		t.Fatal("Node prelude accepted a stale lock that the Go manager did not clear")
+	}
+	if !strings.Contains(stderr.String(), "managed Chrome profile lock was not cleared by the provider") {
+		t.Fatalf("stderr missing managed lock error: %s", stderr.String())
+	}
+	for _, name := range []string{"SingletonLock", "SingletonSocket", "SingletonCookie"} {
+		if _, err := os.Lstat(filepath.Join(profileDir, name)); err != nil {
+			t.Fatalf("Node prelude removed stale %s: %v", name, err)
+		}
+	}
+}
+
+func TestBrowserPreludePreservesLiveChromeProfileLock(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("persistent browser profiles are Linux-only")
+	}
+	profileDir := filepath.Join(t.TempDir(), "chrome-profile")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	generation := strings.Repeat("b", 64)
+	writeTestBrowserProfileMetadata(t, profileDir, generation)
+	chromePath := filepath.Join(t.TempDir(), "google-chrome")
+	sleepBinary, err := os.ReadFile("/bin/sleep")
+	if err != nil {
+		t.Skipf("read sleep helper: %v", err)
+	}
+	if err := os.WriteFile(chromePath, sleepBinary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	chrome := exec.Command(chromePath, "30")
+	if err := chrome.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = chrome.Process.Kill()
+		_ = chrome.Wait()
+	})
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(profileDir, "SingletonLock")
+	if err := os.Symlink(fmt.Sprintf("%s-%d", hostname, chrome.Process.Pid), lockPath); err != nil {
+		t.Skipf("create Chrome-style profile lock symlink: %v", err)
+	}
+	writeTestChromeOwnerMetadata(t, profileDir, generation, hostname, chrome.Process.Pid, linuxProcessStartTimeForTest(t, chrome.Process.Pid))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD", "1")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_GENERATION", generation)
+
+	_, stderr, err := runBrowserPreludeSnippet(t, `
+prepareChromeProfile(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR);
+`)
+	if err == nil {
+		t.Fatal("live Chrome profile lock was removed")
+	}
+	if !strings.Contains(stderr.String(), "managed Chrome profile lock was not cleared by the provider") {
+		t.Fatalf("stderr missing active profile error: %s", stderr.String())
+	}
+	if _, err := os.Lstat(lockPath); err != nil {
+		t.Fatalf("live Chrome lock was removed: %v", err)
+	}
+}
+
+func TestBrowserPreludeRejectsUnknownChromeProfileLockUnderProviderLock(t *testing.T) {
+	profileDir := filepath.Join(t.TempDir(), "chrome-profile")
+	if err := os.MkdirAll(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	generation := strings.Repeat("c", 64)
+	writeTestBrowserProfileMetadata(t, profileDir, generation)
+	lockPath := filepath.Join(profileDir, "SingletonLock")
+	if err := os.WriteFile(lockPath, []byte("unknown-format"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD", "1")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_GENERATION", generation)
+
+	_, stderr, err := runBrowserPreludeSnippet(t, `
+prepareChromeProfile(process.env.PRODUCT_CAPTURE_BROWSER_PROFILE_DIR);
+`)
+	if err == nil {
+		t.Fatal("unknown Chrome profile lock was removed")
+	}
+	if !strings.Contains(stderr.String(), "managed Chrome profile lock was not cleared by the provider") {
+		t.Fatalf("stderr missing unknown ownership error: %s", stderr.String())
+	}
+	if _, err := os.Lstat(lockPath); err != nil {
+		t.Fatalf("unknown Chrome lock was removed: %v", err)
+	}
+}
+
+func TestBrowserPreludeNeverDeletesManagedChromeLocks(t *testing.T) {
+	start := strings.Index(playwrightBrowserPrelude, "function prepareChromeProfile(profileDir)")
+	end := strings.Index(playwrightBrowserPrelude, "async function writeChromeProfileOwner(profileDir, chrome)")
+	if start < 0 || end <= start {
+		t.Fatal("browser profile preparation functions are missing")
+	}
+	prepare := playwrightBrowserPrelude[start:end]
+	if strings.Contains(prepare, "unlinkSync") {
+		t.Fatal("Node browser prelude must not delete managed Chrome locks by pathname")
+	}
+}
+
+func writeTestBrowserProfileMetadata(t *testing.T, profileDir, generation string) {
+	t.Helper()
+	scopeSum := sha256.Sum256([]byte("org-1/pool-1/provider-enrollment-product-capture:v1"))
+	scopeSHA256 := "sha256:" + hex.EncodeToString(scopeSum[:])
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE_SHA256", scopeSHA256)
+	data, err := json.Marshal(map[string]string{
+		"schema":       "product-capture-browser-profile.v2",
+		"generation":   generation,
+		"scope_sha256": scopeSHA256,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, ".product-capture-profile.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeTestChromeOwnerMetadata(t *testing.T, profileDir, generation, hostname string, processID int, startTime string) {
+	t.Helper()
+	data, err := json.Marshal(map[string]any{
+		"schema":         "product-capture-chrome-owner.v1",
+		"generation":     generation,
+		"hostname":       hostname,
+		"pid":            processID,
+		"processGroupId": processID,
+		"processStart":   startTime,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, ".product-capture-chrome-owner.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func linuxProcessStartTimeForTest(t *testing.T, processID int) string {
+	t.Helper()
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", processID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	close := strings.LastIndex(text, ")")
+	if close < 0 {
+		t.Fatalf("malformed proc stat for PID %d", processID)
+	}
+	fields := strings.Fields(text[close+2:])
+	if len(fields) < 20 {
+		t.Fatalf("short proc stat for PID %d", processID)
+	}
+	return fields[19]
+}
+
+func TestBrowserProfileLockSerializesPersistentProfile(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("persistent browser profiles are Linux-only")
+	}
+	profileDir := filepath.Join(t.TempDir(), "chrome-profile")
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	release, err := acquireBrowserProfileLockForTest(profileDir)
+	if err != nil {
+		t.Fatalf("acquire first browser profile lock: %v", err)
+	}
+	if _, err := acquireBrowserProfileLockForTest(profileDir); err == nil {
+		t.Fatal("acquired browser profile lock concurrently")
+	}
+	if err := release(); err != nil {
+		t.Fatalf("release first browser profile lock: %v", err)
+	}
+	release, err = acquireBrowserProfileLockForTest(profileDir)
+	if err != nil {
+		t.Fatalf("reacquire browser profile lock after release: %v", err)
+	}
+	if err := release(); err != nil {
+		t.Fatalf("release reacquired browser profile lock: %v", err)
+	}
+}
+
+func TestManagedBrowserProfileRejectsExistingUnmanagedDirectory(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("persistent browser profiles are Linux-only")
+	}
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE", "org-1/pool-1/provider-enrollment-product-capture:v1")
+	profileDir := filepath.Join(t.TempDir(), "chrome-profile")
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(profileDir, "Cookies"), []byte("credentialed"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireManagedBrowserProfile(profileDir); err == nil || !strings.Contains(err.Error(), "not provider-owned") {
+		t.Fatalf("acquire unmanaged profile error = %v, want provider-owned rejection", err)
+	}
+}
+
+func TestManagedBrowserProfileRejectsExistingEmptyUnmanagedDirectory(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("persistent browser profiles are Linux-only")
+	}
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE", "org-1/pool-1/provider-enrollment-product-capture:v1")
+	profileDir := filepath.Join(t.TempDir(), "chrome-profile")
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireManagedBrowserProfile(profileDir); err == nil || !strings.Contains(err.Error(), "not provider-owned") {
+		t.Fatalf("acquire empty unmanaged profile error = %v, want provider-owned rejection", err)
+	}
+}
+
+func TestManagedBrowserProfileRejectsSymlinkedDirectory(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("persistent browser profiles are Linux-only")
+	}
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE", "org-1/pool-1/provider-enrollment-product-capture:v1")
+	realDir := filepath.Join(t.TempDir(), "real-profile")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	profileDir := filepath.Join(t.TempDir(), "profile-link")
+	if err := os.Symlink(realDir, profileDir); err != nil {
+		t.Skipf("create profile symlink: %v", err)
+	}
+	if _, err := acquireManagedBrowserProfile(profileDir); err == nil || !strings.Contains(err.Error(), "symlink") {
+		t.Fatalf("acquire symlinked profile error = %v, want symlink rejection", err)
+	}
+}
+
+func TestBrowserProfileLockRejectsSymlinkedLockFile(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("persistent browser profiles are Linux-only")
+	}
+	dir := t.TempDir()
+	profileDir := filepath.Join(dir, "chrome-profile")
+	if err := os.Mkdir(profileDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(dir, "outside-lock")
+	if err := os.WriteFile(outside, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(profileDir, ".product-capture.lock")); err != nil {
+		t.Skipf("create lock symlink: %v", err)
+	}
+	if _, err := acquireBrowserProfileLockForTest(profileDir); err == nil || !strings.Contains(err.Error(), "symbolic link") {
+		t.Fatalf("acquire symlinked lock error = %v, want no-follow rejection", err)
+	}
+}
+
 func TestBrowserScriptCaptureDoesNotInheritDiagnosticDNSPin(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake node executable uses a POSIX shell script")
@@ -3800,6 +4311,44 @@ func TestCaptureHTMLWithPlaywrightPreservesProcessErrorWithBrowserStderr(t *test
 	}
 }
 
+func TestCaptureHTMLWithPlaywrightBoundsAndRedactsBrowserStderr(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake node executable uses a POSIX shell script")
+	}
+	dir := t.TempDir()
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte("#!/bin/sh\nprintf '%0131072d' 0 >&2\nprintf 'failed at %s host=%s path=%s query=%s capture-tail-marker\\n' \"$2\" 'www.amazon.com' '/dp/B09B8V1LZ3' 'variant-secret=blue' >&2\nexit 17\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	const target = "https://www.amazon.com/dp/B09B8V1LZ3?variant-secret=blue"
+
+	_, err := captureHTMLWithPlaywright(Workload{
+		URL:            target,
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err == nil {
+		t.Fatal("expected browser process failure")
+	}
+	if len(err.Error()) > 70<<10 {
+		t.Fatalf("browser capture error retained %d stderr bytes, want a bounded tail", len(err.Error()))
+	}
+	if !strings.Contains(err.Error(), "capture-tail-marker") {
+		t.Fatalf("browser capture error lost stderr tail: %v", err)
+	}
+	for _, forbidden := range []string{target, "www.amazon.com", "/dp/B09B8V1LZ3", "variant-secret=blue"} {
+		if strings.Contains(strings.ToLower(err.Error()), strings.ToLower(forbidden)) {
+			t.Fatalf("browser capture error leaked %q: %v", forbidden, err)
+		}
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 17 {
+		t.Fatalf("error chain = %v, want exit code 17", err)
+	}
+}
+
 func TestCaptureHTMLWithPlaywrightPassesWarmupURLToBrowserRuntime(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake node executable uses a POSIX shell script")
@@ -3852,7 +4401,7 @@ func TestCaptureHTMLWithPlaywrightDefaultsAmazonWarmupURL(t *testing.T) {
 	}
 }
 
-func TestCaptureHTMLWithPlaywrightHonorsLongCaptureBudget(t *testing.T) {
+func TestCaptureHTMLWithPlaywrightHonorsPublishedMaximumCaptureBudget(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("fake node executable uses a POSIX shell script")
 	}
@@ -3866,13 +4415,13 @@ func TestCaptureHTMLWithPlaywrightHonorsLongCaptureBudget(t *testing.T) {
 	html, err := captureHTMLWithPlaywright(Workload{
 		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
 		AllowedHosts:   []string{"www.amazon.com"},
-		TimeoutSeconds: 480,
+		TimeoutSeconds: 300,
 		MaxHTMLBytes:   1024,
 	})
 	if err != nil {
 		t.Fatalf("captureHTMLWithPlaywright returned error: %v", err)
 	}
-	if html != `<html data-timeout="480000"></html>` {
+	if html != `<html data-timeout="300000"></html>` {
 		t.Fatalf("unexpected timeout arg in html: %q", html)
 	}
 }
@@ -3932,8 +4481,8 @@ func TestDefaultBrowserWarmupURLRequiresSupportedAmazonHost(t *testing.T) {
 		want string
 	}{
 		{name: "www amazon", url: "https://www.amazon.com/dp/B09B8V1LZ3", want: "https://www.amazon.com/"},
-		{name: "amazon", url: "https://amazon.com/dp/B09B8V1LZ3", want: "https://amazon.com/"},
-		{name: "preserves port", url: "https://www.amazon.com:443/dp/B09B8V1LZ3", want: "https://www.amazon.com:443/"},
+		{name: "amazon", url: "https://amazon.com/dp/B09B8V1LZ3", want: "https://www.amazon.com/"},
+		{name: "default port", url: "https://www.amazon.com:443/dp/B09B8V1LZ3", want: "https://www.amazon.com/"},
 		{name: "unsupported", url: "https://example.com/product", want: ""},
 		{name: "invalid", url: "://bad", want: ""},
 	} {
@@ -3953,7 +4502,7 @@ func TestCaptureHTMLWithPlaywrightProvidesDefaultProfileDir(t *testing.T) {
 	node := filepath.Join(dir, "node")
 	if err := os.WriteFile(node, []byte(`#!/bin/sh
 case "$PRODUCT_CAPTURE_BROWSER_PROFILE_DIR" in
-  /tmp/product-capture-browser-*/chrome-profile) ;;
+  "$PRODUCT_CAPTURE_TEST_TEMP_DIR"/product-capture-browser-*/chrome-profile) ;;
   *) echo "profile=$PRODUCT_CAPTURE_BROWSER_PROFILE_DIR" >&2; exit 24 ;;
 esac
 printf '<html></html>'
@@ -3962,6 +4511,7 @@ printf '<html></html>'
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", "")
+	t.Setenv("PRODUCT_CAPTURE_TEST_TEMP_DIR", filepath.Clean(os.TempDir()))
 
 	html, err := captureHTMLWithPlaywright(Workload{
 		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
@@ -3975,6 +4525,113 @@ printf '<html></html>'
 	if html != "<html></html>" {
 		t.Fatalf("unexpected html: %q", html)
 	}
+}
+
+func TestCaptureHTMLWithPlaywrightMarksLockedPersistentProfile(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("persistent browser profiles are Linux-only")
+	}
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE", "org-1/pool-1/provider-enrollment-product-capture:v1")
+	dir := t.TempDir()
+	profileDir := filepath.Join(dir, "persistent-profile")
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte(`#!/bin/sh
+[ "$PRODUCT_CAPTURE_BROWSER_PROFILE_DIR" = "$PRODUCT_CAPTURE_TEST_PROFILE_DIR" ] || { echo "profile=$PRODUCT_CAPTURE_BROWSER_PROFILE_DIR" >&2; exit 24; }
+[ "$PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_HELD" = "1" ] || { echo "profile lock marker missing" >&2; exit 25; }
+[ -n "$PRODUCT_CAPTURE_BROWSER_PROFILE_GENERATION" ] || { echo "profile generation missing" >&2; exit 27; }
+[ -f "$PRODUCT_CAPTURE_BROWSER_PROFILE_DIR/.product-capture.lock" ] || { echo "profile lock file missing" >&2; exit 26; }
+[ -f "$PRODUCT_CAPTURE_BROWSER_PROFILE_DIR/.product-capture-profile.json" ] || { echo "profile identity missing" >&2; exit 28; }
+printf '<html></html>'
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
+	t.Setenv("PRODUCT_CAPTURE_TEST_PROFILE_DIR", profileDir)
+
+	html, err := captureHTMLWithPlaywright(Workload{
+		URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts:   []string{"www.amazon.com"},
+		TimeoutSeconds: 1,
+		MaxHTMLBytes:   1024,
+	})
+	if err != nil {
+		t.Fatalf("captureHTMLWithPlaywright returned error: %v", err)
+	}
+	if html != "<html></html>" {
+		t.Fatalf("unexpected html: %q", html)
+	}
+}
+
+func TestCaptureHTMLWithPlaywrightHoldsPersistentProfileOSLockAcrossChild(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("persistent browser profiles are Linux-only")
+	}
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE", "org-1/pool-1/provider-enrollment-product-capture:v1")
+	dir := t.TempDir()
+	profileDir := filepath.Join(dir, "persistent-profile")
+	started := filepath.Join(dir, "started")
+	release := filepath.Join(dir, "release")
+	node := filepath.Join(dir, "node")
+	if err := os.WriteFile(node, []byte(`#!/bin/sh
+touch "$PRODUCT_CAPTURE_TEST_STARTED"
+while [ ! -f "$PRODUCT_CAPTURE_TEST_RELEASE" ]; do sleep 0.01; done
+printf '<html></html>'
+`), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_HEADLESS", "1")
+	t.Setenv("PRODUCT_CAPTURE_BROWSER_PROFILE_DIR", profileDir)
+	t.Setenv("PRODUCT_CAPTURE_TEST_STARTED", started)
+	t.Setenv("PRODUCT_CAPTURE_TEST_RELEASE", release)
+	done := make(chan error, 1)
+	go func() {
+		_, err := captureHTMLWithPlaywright(Workload{
+			URL:            "https://www.amazon.com/dp/B09B8V1LZ3",
+			AllowedHosts:   []string{"www.amazon.com"},
+			TimeoutSeconds: 5,
+			MaxHTMLBytes:   1024,
+		})
+		done <- err
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(started); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for capture child")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	helper := exec.Command(os.Args[0], "-test.run=TestBrowserProfileLockExternalHelper")
+	helper.Env = append(os.Environ(),
+		"PRODUCT_CAPTURE_TEST_LOCK_HELPER=1",
+		"PRODUCT_CAPTURE_TEST_PROFILE_DIR="+profileDir,
+	)
+	output, err := helper.CombinedOutput()
+	if err == nil || !strings.Contains(string(output), "browser profile is already active") {
+		t.Fatalf("external lock helper error = %v output=%s, want active-profile rejection", err, output)
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("capture HTML: %v", err)
+	}
+}
+
+func TestBrowserProfileLockExternalHelper(t *testing.T) {
+	if os.Getenv("PRODUCT_CAPTURE_TEST_LOCK_HELPER") != "1" {
+		return
+	}
+	release, err := acquireBrowserProfileLockForTest(os.Getenv("PRODUCT_CAPTURE_TEST_PROFILE_DIR"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release() //nolint:errcheck
 }
 
 func TestCaptureHTMLWithPlaywrightRunsHeadedBrowserThroughManagedXvfbWhenNoDisplay(t *testing.T) {
@@ -4163,13 +4820,14 @@ func TestValidateWorkloadRequiresWarmupSameOrigin(t *testing.T) {
 		warmup  string
 		wantErr bool
 	}{
-		{name: "trimmed same origin", warmup: " https://www.amazon.com/ ", wantErr: false},
+		{name: "surrounding whitespace", warmup: " https://www.amazon.com/ ", wantErr: true},
 		{name: "explicit default port", warmup: "https://www.amazon.com:443/", wantErr: false},
-		{name: "different host", warmup: "https://amazon.com/", wantErr: true},
+		{name: "amazon alias", warmup: "https://amazon.com/", wantErr: false},
+		{name: "trailing DNS dot", warmup: "https://www.amazon.com./", wantErr: true},
 		{name: "different scheme", warmup: "http://www.amazon.com/", wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateWorkload(Workload{
+			_, err := normalizeWorkload(Workload{
 				URL:          "https://www.amazon.com/dp/B09B8V1LZ3",
 				AllowedHosts: []string{"www.amazon.com"},
 				WarmupURL:    tc.warmup,
@@ -4187,6 +4845,329 @@ func TestValidateWorkloadRequiresWarmupSameOrigin(t *testing.T) {
 				t.Fatalf("same-origin warmup rejected: %v", err)
 			}
 		})
+	}
+}
+
+func TestNormalizeWorkloadEnforcesPublishedSchemaBounds(t *testing.T) {
+	valid := Workload{
+		URL:          "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts: []string{"www.amazon.com"},
+	}
+	tests := map[string]Workload{
+		"url length": func() Workload {
+			workload := valid
+			workload.URL = "https://www.amazon.com/" + strings.Repeat("x", 2048) + "/dp/B09B8V1LZ3"
+			return workload
+		}(),
+		"timeout seconds": func() Workload {
+			workload := valid
+			workload.TimeoutSeconds = 301
+			return workload
+		}(),
+		"maximum HTML bytes": func() Workload {
+			workload := valid
+			workload.MaxHTMLBytes = (10 << 20) + 1
+			return workload
+		}(),
+		"allowed hosts": func() Workload {
+			workload := valid
+			workload.AllowedHosts = []string{"www.amazon.com", "amazon.com", "WWW.AMAZON.COM"}
+			return workload
+		}(),
+	}
+	for name, workload := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := normalizeWorkload(workload); err == nil {
+				t.Fatal("normalizeWorkload accepted a value beyond the published input schema")
+			}
+		})
+	}
+}
+
+func TestReadDynamicEnvelopeRejectsOversizedInput(t *testing.T) {
+	encoded, err := json.Marshal(validWorkflowComputeProviderEnvelope(t))
+	if err != nil {
+		t.Fatalf("marshal provider envelope: %v", err)
+	}
+	if len(encoded) > maxDynamicEnvelopeBytes {
+		t.Fatalf("provider envelope fixture is %d bytes, exceeds test boundary", len(encoded))
+	}
+	exact := append(encoded, bytes.Repeat([]byte(" "), maxDynamicEnvelopeBytes-len(encoded))...)
+	got, err := readDynamicEnvelope(bytes.NewReader(exact))
+	if err != nil {
+		t.Fatalf("read exact-limit provider envelope: %v", err)
+	}
+	if got.TaskID != "task-product-capture-live" {
+		t.Fatalf("exact-limit provider envelope task_id = %q", got.TaskID)
+	}
+
+	_, err = readDynamicEnvelope(bytes.NewReader(append(exact, ' ')))
+	if err == nil || !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("readDynamicEnvelope error = %v, want bounded input rejection", err)
+	}
+}
+
+func TestBoundedTailBufferReturnsValidUTF8AfterRuneTruncation(t *testing.T) {
+	buffer := boundedTailBuffer{max: 2}
+	if _, err := buffer.Write([]byte("a\u20ac")); err != nil {
+		t.Fatalf("write bounded tail: %v", err)
+	}
+	got := buffer.String()
+	if !utf8.ValidString(got) {
+		t.Fatalf("bounded tail returned invalid UTF-8: %q", got)
+	}
+	if len(got) > buffer.max {
+		t.Fatalf("bounded tail string is %d bytes, exceeds %d-byte bound", len(got), buffer.max)
+	}
+}
+
+func TestNormalizeWorkloadCanonicalizesAmazonProductURL(t *testing.T) {
+	workload, err := normalizeWorkload(Workload{
+		URL:          "https://WWW.AMAZON.COM/Echo-Dot/dp/b09b8v1lz3/ref=sr_1_1?tag=tracking#reviews",
+		AllowedHosts: []string{"www.amazon.com", "amazon.com"},
+	})
+	if err != nil {
+		t.Fatalf("normalize workload: %v", err)
+	}
+	if workload.URL != "https://www.amazon.com/dp/B09B8V1LZ3?tag=tracking#reviews" {
+		t.Fatalf("normalized URL = %q", workload.URL)
+	}
+	if workload.WarmupURL != "https://www.amazon.com/" {
+		t.Fatalf("normalized warmup URL = %q", workload.WarmupURL)
+	}
+	if !reflect.DeepEqual(workload.AllowedHosts, []string{"www.amazon.com"}) {
+		t.Fatalf("normalized allowed hosts = %#v", workload.AllowedHosts)
+	}
+}
+
+func TestNormalizeWorkloadRejectsSchemaInvalidLexicalForms(t *testing.T) {
+	tests := map[string]Workload{
+		"URL whitespace": {
+			URL:          " https://www.amazon.com/dp/B09B8V1LZ3 ",
+			AllowedHosts: []string{"www.amazon.com"},
+		},
+		"URL trailing DNS dot": {
+			URL:          "https://www.amazon.com./dp/B09B8V1LZ3",
+			AllowedHosts: []string{"www.amazon.com"},
+		},
+		"allowed host whitespace": {
+			URL:          "https://www.amazon.com/dp/B09B8V1LZ3",
+			AllowedHosts: []string{" www.amazon.com "},
+		},
+		"allowed host trailing DNS dot": {
+			URL:          "https://www.amazon.com/dp/B09B8V1LZ3",
+			AllowedHosts: []string{"www.amazon.com."},
+		},
+	}
+	for name, workload := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := normalizeWorkload(workload); err == nil {
+				t.Fatal("normalizeWorkload accepted a lexical form rejected by the input schema")
+			}
+		})
+	}
+}
+
+func TestNormalizeWorkloadPreservesAmazonProductQueryAndFragment(t *testing.T) {
+	workload, err := normalizeWorkload(Workload{
+		URL:          "https://www.amazon.com/Echo-Dot/dp/b09b8v1lz3/ref=sr_1_1?th=1&psc=1#details",
+		AllowedHosts: []string{"www.amazon.com"},
+	})
+	if err != nil {
+		t.Fatalf("normalize workload: %v", err)
+	}
+	if workload.URL != "https://www.amazon.com/dp/B09B8V1LZ3?th=1&psc=1#details" {
+		t.Fatalf("normalized URL = %q, want submitted offer selectors preserved", workload.URL)
+	}
+}
+
+func TestNormalizeWorkloadDefaultsAndBoundsImageCount(t *testing.T) {
+	base := Workload{
+		URL:          "https://www.amazon.com/dp/B09B8V1LZ3",
+		AllowedHosts: []string{"www.amazon.com"},
+	}
+	got, err := normalizeWorkload(base)
+	if err != nil {
+		t.Fatalf("normalize default image count: %v", err)
+	}
+	if got.MaxImageCount != 8 {
+		t.Fatalf("default max_image_count = %d, want 8", got.MaxImageCount)
+	}
+	base.MaxImageCount = 17
+	if _, err := normalizeWorkload(base); err == nil || !strings.Contains(err.Error(), "max_image_count cannot exceed 16") {
+		t.Fatalf("oversized max_image_count error = %v, want maximum rejection", err)
+	}
+}
+
+func TestNormalizeWorkloadCanonicalizesBareAmazonAlias(t *testing.T) {
+	workload, err := normalizeWorkload(Workload{
+		URL:          "https://amazon.com/Echo-Dot/dp/B09B8V1LZ3?tag=wishlist",
+		AllowedHosts: []string{"www.amazon.com"},
+		WarmupURL:    "https://amazon.com/",
+	})
+	if err != nil {
+		t.Fatalf("normalize workload: %v", err)
+	}
+	if workload.URL != "https://www.amazon.com/dp/B09B8V1LZ3?tag=wishlist" {
+		t.Fatalf("normalized URL = %q", workload.URL)
+	}
+	if workload.WarmupURL != "https://www.amazon.com/" {
+		t.Fatalf("normalized warmup URL = %q", workload.WarmupURL)
+	}
+	if !reflect.DeepEqual(workload.AllowedHosts, []string{"www.amazon.com"}) {
+		t.Fatalf("normalized allowed hosts = %#v", workload.AllowedHosts)
+	}
+}
+
+func TestNormalizeWorkloadRejectsUnsafeOrNonProductAmazonURL(t *testing.T) {
+	for name, rawURL := range map[string]string{
+		"http":             "http://www.amazon.com/dp/B09B8V1LZ3",
+		"userinfo":         "https://user@www.amazon.com/dp/B09B8V1LZ3",
+		"nonstandard port": "https://www.amazon.com:8443/dp/B09B8V1LZ3",
+		"homepage":         "https://www.amazon.com/",
+		"search":           "https://www.amazon.com/s?k=echo",
+		"malformed asin":   "https://www.amazon.com/dp/not-an-asin",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := normalizeWorkload(Workload{URL: rawURL, AllowedHosts: []string{"www.amazon.com"}}); err == nil {
+				t.Fatalf("normalizeWorkload(%q) succeeded", rawURL)
+			}
+		})
+	}
+}
+
+func TestBrowserCaptureInstallsMainFrameAndPrivateNetworkPolicy(t *testing.T) {
+	for _, required := range []string{
+		"installCaptureNetworkPolicy",
+		"request.isNavigationRequest()",
+		"request.frame() === page.mainFrame()",
+		"!sameCaptureNavigationOrigin(requestURL, allowedURL)",
+		"isBlockedLiteralHost(requestURL.hostname)",
+		"route.abort('blockedbyclient')",
+	} {
+		if !strings.Contains(playwrightCaptureScript, required) {
+			t.Fatalf("capture browser policy is missing %q", required)
+		}
+	}
+}
+
+func TestBrowserCaptureNetworkPolicyRoutesRequests(t *testing.T) {
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+(async () => {
+  const mainFrame = {};
+  const page = { mainFrame: () => mainFrame };
+  let handler;
+  const context = { route: async (_pattern, candidate) => { handler = candidate; } };
+  await installCaptureNetworkPolicy(context, page, 'https://www.amazon.com/dp/B09B8V1LZ3');
+  const cases = [
+    ['private-ipv4', 'http://169.254.169.254/latest/meta-data', false, false],
+    ['ipv6', 'https://[2001:db8::1]/resource', false, false],
+    ['malformed', 'not a URL', false, false],
+    ['cross-origin-main-frame', 'https://example.com/product', true, true],
+	['file-main-frame', 'file:///etc/passwd', true, true],
+	['data-main-frame', 'data:text/html,unexpected', true, true],
+	['ftp-main-frame', 'ftp://www.amazon.com/product', true, true],
+	['amazon-alias-main-frame', 'https://amazon.com/dp/B09B8V1LZ3', true, true],
+    ['same-origin-main-frame', 'https://www.amazon.com/dp/B09B8V1LZ3', true, true],
+    ['allowed-cdn-subresource', 'https://m.media-amazon.com/images/I/example.jpg', false, false],
+  ];
+  const outcomes = [];
+  for (const [name, requestURL, navigation, main] of cases) {
+    let action = '';
+    await handler({
+      request: () => ({
+        url: () => requestURL,
+        isNavigationRequest: () => navigation,
+        frame: () => main ? mainFrame : {},
+      }),
+      abort: async () => { action = 'abort'; },
+      continue: async () => { action = 'continue'; },
+    });
+    outcomes.push({ name, action });
+  }
+  process.stdout.write(JSON.stringify(outcomes));
+})().catch((err) => { console.error(err); process.exitCode = 1; });
+`)
+	if err != nil {
+		t.Fatalf("execute capture network policy: %v stderr=%s", err, stderr.String())
+	}
+	var outcomes []struct {
+		Name   string `json:"name"`
+		Action string `json:"action"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &outcomes); err != nil {
+		t.Fatalf("decode route outcomes: %v stdout=%s", err, stdout.String())
+	}
+	want := map[string]string{
+		"private-ipv4":            "abort",
+		"ipv6":                    "abort",
+		"malformed":               "abort",
+		"cross-origin-main-frame": "abort",
+		"file-main-frame":         "abort",
+		"data-main-frame":         "abort",
+		"ftp-main-frame":          "abort",
+		"amazon-alias-main-frame": "continue",
+		"same-origin-main-frame":  "continue",
+		"allowed-cdn-subresource": "continue",
+	}
+	if len(outcomes) != len(want) {
+		t.Fatalf("route outcomes = %+v, want %d entries", outcomes, len(want))
+	}
+	for _, outcome := range outcomes {
+		if want[outcome.Name] != outcome.Action {
+			t.Errorf("route %s action = %q, want %q", outcome.Name, outcome.Action, want[outcome.Name])
+		}
+	}
+}
+
+func TestBrowserProcessEnvironmentExcludesProviderSecrets(t *testing.T) {
+	env := browserProcessEnvironmentWithAdditionalKeys([]string{
+		"PATH=/usr/bin",
+		"HOME=/tmp",
+		"NODE_PATH=/usr/local/lib/node_modules",
+		"PRODUCT_CAPTURE_BROWSER_HEADLESS=false",
+		"PRODUCT_CAPTURE_TEST_BINARY=/tmp/provider.test",
+		"BMW_STRIPE_SECRET=sk_test_canary",
+		"COMPUTE_API_TOKEN=compute-canary",
+	}, nil)
+	joined := strings.Join(env, "\n")
+	for _, required := range []string{"PATH=/usr/bin", "HOME=/tmp", "NODE_PATH=/usr/local/lib/node_modules", "PRODUCT_CAPTURE_BROWSER_HEADLESS=false"} {
+		if !strings.Contains(joined, required) {
+			t.Errorf("browser process environment missing %q: %v", required, env)
+		}
+	}
+	for _, secret := range []string{"BMW_STRIPE_SECRET", "sk_test_canary", "COMPUTE_API_TOKEN", "compute-canary", "PRODUCT_CAPTURE_TEST_BINARY", "provider.test"} {
+		if strings.Contains(joined, secret) {
+			t.Errorf("browser process environment leaked %q: %v", secret, env)
+		}
+	}
+}
+
+func TestChromeProcessEnvironmentExcludesNodeAndProviderSecrets(t *testing.T) {
+	t.Setenv("BMW_STRIPE_SECRET", "sk_test_canary")
+	t.Setenv("COMPUTE_API_TOKEN", "compute-canary")
+	t.Setenv("NODE_PATH", "/usr/local/lib/node_modules")
+	stdout, stderr, err := runBrowserPreludeSnippet(t, `
+process.stdout.write(JSON.stringify(chromeProcessEnvironment()));
+`)
+	if err != nil {
+		t.Fatalf("execute Chrome environment policy: %v stderr=%s", err, stderr.String())
+	}
+	var env map[string]string
+	if err := json.Unmarshal(stdout.Bytes(), &env); err != nil {
+		t.Fatalf("decode Chrome environment: %v stdout=%s", err, stdout.String())
+	}
+	for _, key := range []string{"BMW_STRIPE_SECRET", "COMPUTE_API_TOKEN", "NODE_PATH"} {
+		if _, ok := env[key]; ok {
+			t.Errorf("Chrome environment contains %s", key)
+		}
+	}
+	if !strings.Contains(playwrightBrowserPrelude, "env: chromeProcessEnvironment()") {
+		t.Fatal("Chrome spawn does not use the minimal environment")
+	}
+	productionPrelude := renderBrowserScriptWithAdditionalEnvironmentKeys(playwrightBrowserPrelude, nil)
+	if strings.Contains(productionPrelude, "PRODUCT_CAPTURE_TEST_") || strings.Contains(productionPrelude, browserProcessEnvironmentKeysPlaceholder) {
+		t.Fatalf("production Chrome prelude contains test environment controls: %s", productionPrelude)
 	}
 }
 
@@ -4226,6 +5207,38 @@ func TestProviderSchemaAcceptsBuyMyWishlistLiveInputAndRejectsDemoFields(t *test
 	if err := schema.Validate(liveInput); err != nil {
 		t.Fatalf("BuyMyWishlist live input rejected: %v", err)
 	}
+	caseInsensitiveInput := map[string]any{
+		"url":           "https://WWW.AMAZON.COM/dp/B08H75RTZ8",
+		"allowed_hosts": []any{"WWW.AMAZON.COM"},
+		"warmup_url":    "https://WWW.AMAZON.COM/",
+	}
+	if err := schema.Validate(caseInsensitiveInput); err != nil {
+		t.Fatalf("case-insensitive Amazon input rejected: %v", err)
+	}
+	for name, unsafeURL := range map[string]string{
+		"plaintext product": "http://www.amazon.com/dp/B08H75RTZ8",
+		"search endpoint":   "https://www.amazon.com/s?k=xbox",
+	} {
+		t.Run(name, func(t *testing.T) {
+			unsafeInput := map[string]any{
+				"url":           unsafeURL,
+				"allowed_hosts": []any{"www.amazon.com"},
+			}
+			if err := schema.Validate(unsafeInput); err == nil {
+				t.Fatalf("schema accepted unsafe URL %q", unsafeURL)
+			}
+		})
+	}
+	tooManyHosts := maps.Clone(liveInput)
+	tooManyHosts["allowed_hosts"] = []any{"www.amazon.com", "amazon.com", "WWW.AMAZON.COM"}
+	if err := schema.Validate(tooManyHosts); err == nil {
+		t.Fatal("schema accepted more than two allowed hosts")
+	}
+	zeroImages := maps.Clone(liveInput)
+	zeroImages["max_image_count"] = float64(0)
+	if err := schema.Validate(zeroImages); err == nil {
+		t.Fatal("schema accepted explicit max_image_count zero")
+	}
 
 	for _, tc := range []struct {
 		name  string
@@ -4247,6 +5260,120 @@ func TestProviderSchemaAcceptsBuyMyWishlistLiveInputAndRejectsDemoFields(t *test
 				t.Fatalf("schema accepted demo-only field %q", tc.field)
 			}
 		})
+	}
+}
+
+func TestProviderEntryPointsRejectInputsOutsidePublishedSchema(t *testing.T) {
+	tests := map[string]json.RawMessage{
+		"explicit zero image count": json.RawMessage(`{
+			"url":"https://www.amazon.com/dp/B08H75RTZ8",
+			"allowed_hosts":["www.amazon.com"],
+			"max_image_count":0
+		}`),
+		"duplicate allowed host": json.RawMessage(`{
+			"url":"https://www.amazon.com/dp/B08H75RTZ8",
+			"allowed_hosts":["www.amazon.com","www.amazon.com"]
+		}`),
+		"percent encoded ASIN": json.RawMessage(`{
+			"url":"https://www.amazon.com/dp/%4208H75RTZ8",
+			"allowed_hosts":["www.amazon.com"]
+		}`),
+		"uppercase warmup scheme": json.RawMessage(`{
+			"url":"https://www.amazon.com/dp/B08H75RTZ8",
+			"allowed_hosts":["www.amazon.com"],
+			"warmup_url":"HTTPS://www.amazon.com/"
+		}`),
+	}
+	for name, input := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "request.json")
+			request := append([]byte(`{"workload":`), input...)
+			request = append(request, '}')
+			if err := os.WriteFile(path, request, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := readRequest(path); err == nil || !strings.Contains(err.Error(), "product input schema") {
+				t.Fatalf("legacy request error = %v, want product input schema rejection", err)
+			}
+
+			envelope := validWorkflowComputeProviderEnvelope(t)
+			envelope.Input = input
+			encoded, err := json.Marshal(envelope)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := runDynamic(bytes.NewReader(encoded), io.Discard); err == nil || !strings.Contains(err.Error(), "product input schema") {
+				t.Fatalf("dynamic request error = %v, want product input schema rejection", err)
+			}
+		})
+	}
+}
+
+func TestProviderProductOutputSchemaBoundsDynamicFields(t *testing.T) {
+	compiler := jsonschema.NewCompiler()
+	compiler.AssertFormat()
+	schemaPath := filepath.Join("..", "..", "schemas", "product-capture-operation-output.schema.json")
+	schema, err := compiler.Compile(schemaPath + "#/$defs/product_json")
+	if err != nil {
+		t.Fatalf("compile product output schema: %v", err)
+	}
+	valid := map[string]any{
+		"provider":                   "browser_capture",
+		"url":                        "https://www.amazon.com/dp/B09B8V1LZ3",
+		"requested_url":              "https://www.amazon.com/dp/B09B8V1LZ3",
+		"title":                      "Amazon Echo Dot",
+		"variant_key":                "exact-url-sha256:" + strings.Repeat("a", 64),
+		"captured_at":                "2026-10-02T00:00:00Z",
+		"requires_user_confirmation": true,
+	}
+	if err := schema.Validate(valid); err != nil {
+		t.Fatalf("valid product output rejected: %v", err)
+	}
+	for name, mutate := range map[string]func(map[string]any){
+		"title": func(product map[string]any) {
+			product["title"] = strings.Repeat("t", 1025)
+		},
+		"images": func(product map[string]any) {
+			images := make([]any, 17)
+			for index := range images {
+				images[index] = fmt.Sprintf("https://m.media-amazon.com/images/I/%02d.jpg", index)
+			}
+			product["images"] = images
+		},
+		"variant dimensions": func(product map[string]any) {
+			dimensions := make(map[string]any, 33)
+			for index := 0; index < 33; index++ {
+				dimensions[fmt.Sprintf("dimension_%02d", index)] = "selected"
+			}
+			product["variant_dimensions"] = dimensions
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			product := maps.Clone(valid)
+			mutate(product)
+			if err := schema.Validate(product); err == nil {
+				t.Fatalf("product output schema accepted unbounded %s", name)
+			}
+		})
+	}
+}
+
+func TestWriteSnapshotRejectsProductOutsideOutputSchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "product.json")
+	err := writeSnapshot(path, snapshot.Snapshot{
+		Provider:                 "browser_capture",
+		URL:                      "https://www.amazon.com/dp/B09B8V1LZ3",
+		RequestedURL:             "https://www.amazon.com/dp/B09B8V1LZ3",
+		Title:                    strings.Repeat("t", 1025),
+		VariantKey:               "exact-url-sha256:" + strings.Repeat("a", 64),
+		CapturedAt:               time.Date(2026, 10, 2, 0, 0, 0, 0, time.UTC),
+		RequiresUserConfirmation: true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "validate snapshot") {
+		t.Fatalf("write oversized snapshot error = %v, want schema rejection", err)
+	}
+	if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("invalid snapshot artifact exists: %v", statErr)
 	}
 }
 
@@ -4456,6 +5583,30 @@ func TestPlaywrightScriptUsesInstalledGoogleChrome(t *testing.T) {
 		if strings.Contains(playwrightCaptureScript, disallowed) {
 			t.Fatalf("playwright script should not silently fall back to non-Chrome launch path %q", disallowed)
 		}
+	}
+}
+
+func TestPlaywrightScriptBindsPersistentLaunchToInheritedProfileLock(t *testing.T) {
+	for _, required := range []string{
+		"product-capture-chrome-launch.v1",
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_LOCK_FD",
+		"PRODUCT_CAPTURE_BROWSER_PROFILE_LAUNCH_ID",
+		"fs.fstatSync(lockFD, { bigint: true })",
+		"launch.lock_dev !== String(lockState.dev)",
+		"launch.lock_ino !== String(lockState.ino)",
+		"if (lockFD !== null) stdio.push(lockFD)",
+		"schema: 'product-capture-chrome-owner.v2'",
+		"fs.linkSync(temporaryPath, ownerPath)",
+		"fs.fsyncSync(directoryFD)",
+	} {
+		if !strings.Contains(playwrightBrowserPrelude, required) {
+			t.Errorf("native Chrome launch journal missing %q", required)
+		}
+	}
+	prepare := strings.Index(playwrightBrowserPrelude, "prepareChromeProfile(profileDir);")
+	launchAttempt := strings.Index(playwrightBrowserPrelude, "return await launchChromeBrowserAttempt(profileDir, viewport);")
+	if prepare < 0 || launchAttempt < 0 || prepare > launchAttempt {
+		t.Fatalf("managed profile launch validation must precede Chrome launch attempt: prepare=%d launch=%d", prepare, launchAttempt)
 	}
 }
 
@@ -7507,11 +8658,11 @@ exports.chromium = {
 };
 exports.errors = { TimeoutError };
 `
-	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3")
+	stdout, stderr, err := runPlaywrightScriptWithFakeURL(t, fakePlaywright, "https://www.amazon.com/Amazon-vibrant-helpful-routines-Charcoal/dp/B09B8V1LZ3?th=1&psc=1#customerReviews")
 	if err != nil {
 		t.Fatalf("capture script should retry canonical dp URL after Amazon home landing: %v\nstderr=%s", err, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), `goto:https://www.amazon.com/dp/B09B8V1LZ3`) {
+	if !strings.Contains(stdout.String(), `goto:https://www.amazon.com/dp/B09B8V1LZ3?th=1&psc=1#customerReviews`) {
 		t.Fatalf("capture script did not retry canonical dp URL after home landing: %s", stdout.String())
 	}
 	if !strings.Contains(stdout.String(), `id="productTitle"`) {
@@ -8114,7 +9265,7 @@ func runPlaywrightScriptWithFakeURLTimeoutAndCommandTimeout(t *testing.T, fakePl
 	}
 	dir := t.TempDir()
 	script := filepath.Join(dir, "capture.js")
-	if err := os.WriteFile(script, []byte(playwrightCaptureScript), 0o600); err != nil {
+	if err := os.WriteFile(script, []byte(renderBrowserScript(playwrightCaptureScript)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	moduleDir := filepath.Join(dir, "node_modules", "playwright")
@@ -8156,7 +9307,7 @@ func runBrowserDiagnosticScriptWithFake(t *testing.T, fakePlaywright string) (by
 	}
 	dir := t.TempDir()
 	script := filepath.Join(dir, "diagnostic.js")
-	if err := os.WriteFile(script, []byte(playwrightBrowserDiagnosticScript), 0o600); err != nil {
+	if err := os.WriteFile(script, []byte(renderBrowserScript(playwrightBrowserDiagnosticScript)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	moduleDir := filepath.Join(dir, "node_modules", "playwright")
@@ -8189,7 +9340,7 @@ func runBrowserPreludeSnippet(t *testing.T, snippet string) (bytes.Buffer, bytes
 	}
 	dir := t.TempDir()
 	script := filepath.Join(dir, "prelude-test.js")
-	if err := os.WriteFile(script, []byte(playwrightBrowserPrelude+snippet), 0o600); err != nil {
+	if err := os.WriteFile(script, []byte(renderBrowserScript(playwrightBrowserPrelude+snippet)), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	moduleDir := filepath.Join(dir, "node_modules", "playwright")
@@ -8217,6 +9368,10 @@ if (exports.chromium && typeof exports.chromium.connectOverCDP !== 'function') {
   const productCaptureTestFS = require('fs');
   const productCaptureTestPath = require('path');
   exports.chromium.connectOverCDP = async () => {
+    const connectDelay = Number(process.env.PRODUCT_CAPTURE_TEST_CONNECT_DELAY_MS || 0);
+    if (Number.isFinite(connectDelay) && connectDelay > 0) {
+      await new Promise((resolve) => setTimeout(resolve, connectDelay));
+    }
     const launched = await productCaptureFakeLaunch();
     const initialPage = await launched.newPage();
     const productCaptureFakeURL = typeof initialPage.url === 'function'
@@ -8254,17 +9409,41 @@ if (exports.chromium && typeof exports.chromium.connectOverCDP !== 'function') {
 
 func installFakeGoogleChrome(t *testing.T, dir string) {
 	t.Helper()
-	chrome := filepath.Join(dir, "google-chrome")
-	if err := os.WriteFile(chrome, []byte("#!/bin/sh\nexec \"$PRODUCT_CAPTURE_TEST_BINARY\" -test.run=^TestNativeChromeHelper$ -- \"$@\"\n"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-	t.Setenv("PRODUCT_CAPTURE_TEST_NATIVE_CHROME", "1")
 	testBinary, err := filepath.Abs(os.Args[0])
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PRODUCT_CAPTURE_TEST_BINARY", testBinary)
+	chromeBinary := filepath.Join(dir, "chrome")
+	if err := os.Link(testBinary, chromeBinary); err != nil {
+		t.Fatalf("link native Chrome test helper: %v", err)
+	}
+	chrome := filepath.Join(dir, "google-chrome")
+	launcher := `#!/bin/sh
+if [ "$(readlink /proc/$$/exe 2>/dev/null)" = "/run/rosetta/rosetta" ] &&
+   [ -n "$PRODUCT_CAPTURE_TEST_CRASH_ON_VERSION_ONCE" ] &&
+   [ -e "$PRODUCT_CAPTURE_TEST_CRASH_ON_VERSION_ONCE" ]; then
+	profile_dir=
+	for arg in "$@"; do
+		case "$arg" in --user-data-dir=*) profile_dir=${arg#--user-data-dir=} ;; esac
+	done
+	[ -n "$profile_dir" ] || exit 64
+	printf '%s' "$$" > "$profile_dir/.test-chrome-pid"
+	launch_count=0
+	if [ -r "$profile_dir/.test-launch-count" ]; then
+		read -r launch_count < "$profile_dir/.test-launch-count"
+	fi
+	case "$launch_count" in ''|*[!0-9]*) launch_count=0 ;; esac
+	printf '%s\n' "$((launch_count + 1))" > "$profile_dir/.test-launch-count"
+	exec /usr/bin/google-chrome "$@"
+fi
+exec "$PRODUCT_CAPTURE_TEST_CHROME_BINARY" -test.run=^TestNativeChromeHelper$ -- "$@"
+`
+	if err := os.WriteFile(chrome, []byte(launcher), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("PRODUCT_CAPTURE_TEST_NATIVE_CHROME", "1")
+	t.Setenv("PRODUCT_CAPTURE_TEST_CHROME_BINARY", chromeBinary)
 }
 
 func TestNativeChromeHelper(t *testing.T) {
@@ -8290,7 +9469,38 @@ func TestNativeChromeHelper(t *testing.T) {
 	if err := os.MkdirAll(profileDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
+	hostname, err := os.Hostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(profileDir, "SingletonLock")
+	if err := os.Symlink(fmt.Sprintf("%s-%d", hostname, os.Getpid()), lockPath); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(lockPath)
 	if err := os.WriteFile(filepath.Join(profileDir, ".test-chrome-pid"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if os.Getenv("PRODUCT_CAPTURE_TEST_PERSIST_SESSION_STATE") == "1" {
+		statePath := filepath.Join(profileDir, ".test-anonymous-session-state")
+		if data, err := os.ReadFile(statePath); err == nil {
+			if string(data) != "anonymous-session\n" {
+				t.Fatalf("persistent anonymous session marker changed: %q", data)
+			}
+		} else if errors.Is(err, os.ErrNotExist) {
+			if err := os.WriteFile(statePath, []byte("anonymous-session\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			t.Fatal(err)
+		}
+	}
+	launchCountPath := filepath.Join(profileDir, ".test-launch-count")
+	launchCount := 0
+	if data, err := os.ReadFile(launchCountPath); err == nil {
+		launchCount, _ = strconv.Atoi(strings.TrimSpace(string(data)))
+	}
+	if err := os.WriteFile(launchCountPath, []byte(strconv.Itoa(launchCount+1)+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if debugPort <= 0 || debugPort > 65535 {
@@ -8308,6 +9518,17 @@ func TestNativeChromeHelper(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"webSocketDebuggerUrl":"ws://127.0.0.1:%d/devtools/browser/product-capture-test"}`, debugPort)
+		if crashMarker := os.Getenv("PRODUCT_CAPTURE_TEST_CRASH_ON_VERSION_ONCE"); crashMarker != "" {
+			if _, err := os.Stat(crashMarker); errors.Is(err, os.ErrNotExist) {
+				if err := os.WriteFile(crashMarker, nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+				go func() {
+					time.Sleep(10 * time.Millisecond)
+					os.Exit(42)
+				}()
+			}
+		}
 	})}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(listener) }()

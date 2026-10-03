@@ -28,8 +28,8 @@ func TestRunLoadsInputsExecutesProofAndWritesRestrictedSummary(t *testing.T) {
 			cfg.ProviderImageRef != "ghcr.io/example/browser@sha256:"+strings.Repeat("a", 64) {
 			t.Fatalf("config = %+v", cfg)
 		}
-		if cfg.Contract.ContractID != "product-capture.browser.v1" || len(cfg.ProductSchema) == 0 || len(cfg.DiagnosticSchema) == 0 {
-			t.Fatalf("contract/schemas not loaded: %+v, %d, %d", cfg.Contract, len(cfg.ProductSchema), len(cfg.DiagnosticSchema))
+		if cfg.Contract.ContractID != "product-capture.browser.v1" || len(cfg.ProductInputSchema) == 0 || len(cfg.ProductSchema) == 0 || len(cfg.DiagnosticInputSchema) == 0 || len(cfg.DiagnosticSchema) == 0 {
+			t.Fatalf("contract/schemas not loaded: %+v, %d, %d, %d, %d", cfg.Contract, len(cfg.ProductInputSchema), len(cfg.ProductSchema), len(cfg.DiagnosticInputSchema), len(cfg.DiagnosticSchema))
 		}
 		if cfg.ArtifactTimeout != 17*time.Second {
 			t.Fatalf("artifact timeout = %s, want 17s", cfg.ArtifactTimeout)
@@ -55,7 +55,9 @@ func TestRunLoadsInputsExecutesProofAndWritesRestrictedSummary(t *testing.T) {
 		"--browser-diagnostic-url", "https://diagnostic.example.test/browser",
 		"--provider-image-ref", "ghcr.io/example/browser@sha256:" + strings.Repeat("a", 64),
 		"--contract", filepath.Join("..", "..", "contracts", "product-capture-provider.json"),
+		"--product-input-schema", filepath.Join("..", "..", "schemas", "product-capture-operation-input.schema.json"),
 		"--product-schema", filepath.Join("..", "..", "schemas", "product-capture-operation-output.schema.json"),
+		"--diagnostic-input-schema", filepath.Join("..", "..", "schemas", "browser-diagnostic-operation-input.schema.json"),
 		"--diagnostic-schema", filepath.Join("..", "..", "schemas", "browser-diagnostic-result.schema.json"),
 		"--artifact-timeout", "17s",
 		"--output", output,
@@ -116,13 +118,15 @@ func TestRunProductOnlyDoesNotReadDiagnosticSchema(t *testing.T) {
 		"--server", "https://compute.example.test",
 		"--token-env", "TEST_PROOF_TOKEN",
 		"--contract", filepath.Join("..", "..", "contracts", "product-capture-provider.json"),
+		"--product-input-schema", filepath.Join("..", "..", "schemas", "product-capture-operation-input.schema.json"),
 		"--product-schema", filepath.Join("..", "..", "schemas", "product-capture-operation-output.schema.json"),
+		"--diagnostic-input-schema", filepath.Join(t.TempDir(), "missing-diagnostic-input-schema.json"),
 		"--diagnostic-schema", filepath.Join(t.TempDir(), "missing-diagnostic-schema.json"),
 		"--output", output,
 	}, &bytes.Buffer{}, func(string) string { return "scoped-token" }, func(_ context.Context, cfg stagingproof.Config) (stagingproof.Summary, error) {
 		executed = true
-		if len(cfg.DiagnosticSchema) != 0 {
-			t.Fatalf("diagnostic schema bytes = %d, want 0", len(cfg.DiagnosticSchema))
+		if len(cfg.DiagnosticInputSchema) != 0 || len(cfg.DiagnosticSchema) != 0 {
+			t.Fatalf("diagnostic input/output schema bytes = %d/%d, want 0/0", len(cfg.DiagnosticInputSchema), len(cfg.DiagnosticSchema))
 		}
 		return stagingproof.Summary{SchemaVersion: "product-capture-staging-proof.v1"}, nil
 	})

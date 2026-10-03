@@ -21,7 +21,9 @@ func TestWriteSnapshotOverridesRestrictiveUmaskForHostReadableArtifact(t *testin
 	err := writeSnapshot(path, snapshot.Snapshot{
 		Provider:                 "browser_capture",
 		URL:                      "https://www.amazon.com/dp/B08H75RTZ8",
+		RequestedURL:             "https://www.amazon.com/dp/B08H75RTZ8",
 		Title:                    "Xbox Series X",
+		VariantKey:               "exact-url-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		CapturedAt:               time.Unix(0, 0).UTC(),
 		RequiresUserConfirmation: true,
 	})
