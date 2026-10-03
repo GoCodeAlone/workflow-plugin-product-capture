@@ -74,24 +74,45 @@ The image contains Node, the Playwright package, and Google Chrome. It sets
 `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`; Playwright controls the installed Chrome
 child over CDP rather than downloading or launching bundled Chromium.
 
-Set `PRODUCT_CAPTURE_BROWSER_PROFILE_DIR` on a retained provider worker only
-when anonymous Chrome state should survive between captures. This lets
-non-login Amazon friction cookies persist after benign continuation gates. Do
-not point it at a credentialed browser profile, and delete the directory to
-reset the capture identity. The provider rejects a profile with an active Chrome
-singleton lock instead of cloning it or deleting lock state.
+On Linux, set `PRODUCT_CAPTURE_BROWSER_PROFILE_DIR` to a new private directory
+on a retained provider worker when anonymous Chrome state should survive
+between captures. Also set `PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE` to a stable,
+trusted deployment identity containing the org, pool, provider enrollment, and
+an explicit rotation version, for example
+`org-1/pool-1/bmw-product-capture:v1`. This lets non-login Amazon friction
+cookies persist after benign continuation gates without sharing state across
+worker trust domains. The provider binds its ownership identity to a hash of
+that scope and refuses preexisting unmanaged, credentialed, symlinked,
+foreign-owned, non-private, or differently scoped profiles. Delete the
+directory and increment the scope version to rotate the capture identity. An OS
+lock serializes captures for the full child-process lifetime. A durable launch
+journal bound to the profile generation, scope, and inherited lock authorizes
+recovery if Chrome exits before publishing its owner record. After owner
+publication, that bound owner identity authorizes cleanup only when the exact
+same-host Chrome process is gone. Live identity mismatches and otherwise
+unknown lock states fail closed.
+Persistent profiles are intentionally unsupported on other operating systems
+until equivalent process identity validation is available.
 
-Amazon browser captures default to a same-origin homepage warmup before
-document navigation to the product URL, so staging tasks that omit `warmup_url`
-still enter through the submitted URL's scheme and Amazon host, such as
-`https://www.amazon.com/` for HTTPS `www.amazon.com` submissions. Set
-`warmup_url` only when the caller needs a different same-origin page. The
-default browser viewport is `1920x1080`; operators can override it with
+Amazon browser captures canonicalize supported `amazon.com` aliases to
+`https://www.amazon.com`, load that origin's `/` homepage, and then navigate to
+the canonical `/dp/<ASIN>` product URL. A supplied `warmup_url` must identify
+the same canonical HTTPS root homepage; other paths are rejected. The default
+browser viewport is `1920x1080`; operators can override it with
 `PRODUCT_CAPTURE_BROWSER_VIEWPORT=<width>x<height>` within the supported
 desktop range. Standalone capture remains headless by default. Set
 `PRODUCT_CAPTURE_BROWSER_HEADLESS=false` for headed operation; when `DISPLAY`
 is unset, the provider starts and reaps a dedicated Xvfb display with a
 `1920x1080x24` virtual screen.
+
+Capture inputs are canonicalized to an HTTPS Amazon `/dp/<ASIN>` path before
+navigation while retaining the submitted query and fragment on the normalized
+navigation URL and `requested_url`. A trusted page canonical is reduced to the
+same product path only after its HTTPS host and ASIN are validated. Cross-origin
+main-frame navigation and literal private/link-local IP requests are blocked in
+the browser. The sandbox runtime must additionally deny private, link-local,
+cloud metadata, and workflow-control-plane egress at the container/network
+boundary so DNS resolution cannot bypass the browser-layer check.
 
 ## Browser diagnostics
 
@@ -116,7 +137,10 @@ presence and length only; it does not emit cookie values.
 
 The diagnostic endpoint should log request headers, TLS/client metadata, remote
 IP/ASN, and the POST body. Compare that output with a normal Chrome visit before
-changing capture behavior. Do not run it from a credentialed shopping profile.
+changing capture behavior. The automation comparison checks only
+`window.__playwright__binding__` and `window.__pwInitScripts`; their absence is
+limited comparative evidence, not proof that no automation context is
+detectable. Do not run it from a credentialed shopping profile.
 
 Release candidates use the repository-owned conformance command to compare a
 direct headed Chrome visit with the real provider diagnostic from the same
@@ -124,7 +148,7 @@ loaded amd64 image:
 
 ```sh
 go run ./cmd/browser-runtime-conformance \
-  --image product-capture:v0.1.65 \
+  --image product-capture:v0.1.66 \
   --output /tmp/product-capture-conformance.json
 ```
 
@@ -134,6 +158,20 @@ the checksum-pinned ephemeral Quick Tunnel described in
 Pass `--origin` and `--listen` together when an operator-managed HTTPS reverse
 proxy is available. Shared JSON contains only versions, stable comparisons,
 informational values, and the verdict; the run ID and endpoint host are redacted.
+
+Release conformance also uses a fresh anonymous managed profile with a stable
+hostname and profile scope. Its guarded conformance mode pauses Chrome and the
+real provider after verifying the launch journal and `SingletonLock`, but before
+owner publication. A read-only, networkless probe confirms that exact boundary
+before the harness kills the container and requires recovery.
+The controlled endpoint then sets one run-specific, host-only, secure,
+HTTP-only, non-authentication cookie. A read-only, networkless probe waits for
+its metadata row to become durable without reading cookie values; the harness
+kills that provider with `SIGKILL`, verifies exit 137, and requires the next
+provider to return the exact cookie. Five booleans record the two crashes and
+recovery boundaries, and the named volume is deleted afterward. This CLI-only
+check does not change ordinary diagnostics, which continue to use temporary
+profiles, and it does not permit credentialed shopping sessions.
 
 ## Workflow step
 

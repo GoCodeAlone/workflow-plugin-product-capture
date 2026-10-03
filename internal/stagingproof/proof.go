@@ -56,25 +56,27 @@ var (
 )
 
 type Config struct {
-	ServerURL            string
-	Token                string
-	OrgID                string
-	PoolID               string
-	ProductID            string
-	PolicyID             string
-	WorkerID             string
-	ProductURL           string
-	AllowedHost          string
-	BrowserDiagnosticURL string
-	ProviderImageRef     string
-	Contract             protocol.ProviderContract
-	ProductSchema        []byte
-	DiagnosticSchema     []byte
-	PollInterval         time.Duration
-	CapacityTimeout      time.Duration
-	ResultTimeout        time.Duration
-	ArtifactTimeout      time.Duration
-	TaskTimeoutSeconds   int
+	ServerURL             string
+	Token                 string
+	OrgID                 string
+	PoolID                string
+	ProductID             string
+	PolicyID              string
+	WorkerID              string
+	ProductURL            string
+	AllowedHost           string
+	BrowserDiagnosticURL  string
+	ProviderImageRef      string
+	Contract              protocol.ProviderContract
+	ProductInputSchema    []byte
+	ProductSchema         []byte
+	DiagnosticInputSchema []byte
+	DiagnosticSchema      []byte
+	PollInterval          time.Duration
+	CapacityTimeout       time.Duration
+	ResultTimeout         time.Duration
+	ArtifactTimeout       time.Duration
+	TaskTimeoutSeconds    int
 }
 
 type Summary struct {
@@ -275,11 +277,11 @@ func validateConfig(cfg Config) (protocol.ProviderOperation, *jsonschema.Schema,
 		return protocol.ProviderOperation{}, nil, err
 	}
 	parsedProductURL, err := url.ParseRequestURI(cfg.ProductURL)
-	if err != nil || (parsedProductURL.Scheme != "http" && parsedProductURL.Scheme != "https") || parsedProductURL.Hostname() == "" || parsedProductURL.User != nil {
-		return protocol.ProviderOperation{}, nil, errors.New("product_url must be an absolute http(s) URL without user info")
+	if err != nil || parsedProductURL.Scheme != "https" || parsedProductURL.Hostname() == "" || parsedProductURL.User != nil {
+		return protocol.ProviderOperation{}, nil, errors.New("product_url must be an absolute HTTPS URL without user info")
 	}
-	if !strings.EqualFold(parsedProductURL.Hostname(), cfg.AllowedHost) {
-		return protocol.ProviderOperation{}, nil, errors.New("allowed_host must exactly match product_url host")
+	if canonicalProductHost(parsedProductURL.Hostname()) != canonicalProductHost(cfg.AllowedHost) {
+		return protocol.ProviderOperation{}, nil, errors.New("allowed_host must match product_url Amazon host")
 	}
 	if snapshot.AmazonASINFromURL(cfg.ProductURL) == "" {
 		return protocol.ProviderOperation{}, nil, errors.New("product_url must contain a supported Amazon ASIN path")
@@ -303,6 +305,16 @@ func validateConfig(cfg Config) (protocol.ProviderOperation, *jsonschema.Schema,
 	if len(operation.ArtifactSpecs) == 0 {
 		return protocol.ProviderOperation{}, nil, errors.New("capture_product must declare bounded artifact_specs")
 	}
+	if sha256Ref(cfg.ProductInputSchema) != operation.InputSchemaDigest {
+		return protocol.ProviderOperation{}, nil, errors.New("product input schema does not match capture_product input_schema_digest")
+	}
+	inputSchema, err := compileRootSchema(cfg.ProductInputSchema, "https://proof.invalid/product-capture-input.schema.json")
+	if err != nil {
+		return protocol.ProviderOperation{}, nil, fmt.Errorf("capture_product input schema: %w", err)
+	}
+	if err := inputSchema.Validate(productTaskInput(cfg)); err != nil {
+		return protocol.ProviderOperation{}, nil, fmt.Errorf("capture_product input schema: %w", err)
+	}
 	if sha256Ref(cfg.ProductSchema) != operation.OutputSchemaDigest {
 		return protocol.ProviderOperation{}, nil, errors.New("product schema does not match capture_product output_schema_digest")
 	}
@@ -316,6 +328,16 @@ func validateConfig(cfg Config) (protocol.ProviderOperation, *jsonschema.Schema,
 		}
 		if diagnostic.InputSchemaDigest != browserDiagnosticOperationInputSchemaSHA256 {
 			return protocol.ProviderOperation{}, nil, errors.New("browser_diagnostic input_schema_digest does not match the pinned operation input schema")
+		}
+		if sha256Ref(cfg.DiagnosticInputSchema) != diagnostic.InputSchemaDigest {
+			return protocol.ProviderOperation{}, nil, errors.New("diagnostic input schema does not match browser_diagnostic input_schema_digest")
+		}
+		diagnosticInputSchema, err := compileRootSchema(cfg.DiagnosticInputSchema, "https://proof.invalid/browser-diagnostic-input.schema.json")
+		if err != nil {
+			return protocol.ProviderOperation{}, nil, fmt.Errorf("browser_diagnostic input schema: %w", err)
+		}
+		if err := diagnosticInputSchema.Validate(diagnosticTaskInput(cfg)); err != nil {
+			return protocol.ProviderOperation{}, nil, fmt.Errorf("browser_diagnostic input schema: %w", err)
 		}
 		if diagnostic.OutputSchemaRef != browserDiagnosticOperationOutputSchemaRef {
 			return protocol.ProviderOperation{}, nil, errors.New("browser_diagnostic output_schema_ref does not match the pinned operation output schema")
@@ -491,26 +513,34 @@ func compatibleExecutor(agent protocol.Agent, cfg Config) (protocol.ExecutorRef,
 }
 
 func submitProductTask(ctx context.Context, client *protocol.Client, cfg Config) (protocol.Task, error) {
-	input, err := json.Marshal(map[string]any{
-		"url":             cfg.ProductURL,
-		"allowed_hosts":   []string{cfg.AllowedHost},
-		"capture_mode":    string(protocol.ProductCaptureModeBrowser),
-		"timeout_seconds": cfg.TaskTimeoutSeconds - providerResultMarginSeconds,
-		"max_html_bytes":  stagingCaptureMaxHTMLBytes,
-		"max_image_count": 8,
-	})
+	input, err := json.Marshal(productTaskInput(cfg))
 	if err != nil {
 		return protocol.Task{}, err
 	}
 	return submitProviderTask(ctx, client, cfg, "capture_product", input)
 }
 
+func productTaskInput(cfg Config) map[string]any {
+	return map[string]any{
+		"url":             cfg.ProductURL,
+		"allowed_hosts":   []any{cfg.AllowedHost},
+		"capture_mode":    string(protocol.ProductCaptureModeBrowser),
+		"timeout_seconds": cfg.TaskTimeoutSeconds - providerResultMarginSeconds,
+		"max_html_bytes":  stagingCaptureMaxHTMLBytes,
+		"max_image_count": 8,
+	}
+}
+
 func submitDiagnosticTask(ctx context.Context, client *protocol.Client, cfg Config) (protocol.Task, error) {
-	input, err := json.Marshal(map[string]string{"url": cfg.BrowserDiagnosticURL})
+	input, err := json.Marshal(diagnosticTaskInput(cfg))
 	if err != nil {
 		return protocol.Task{}, err
 	}
 	return submitProviderTask(ctx, client, cfg, "browser_diagnostic", input)
+}
+
+func diagnosticTaskInput(cfg Config) map[string]any {
+	return map[string]any{"url": cfg.BrowserDiagnosticURL}
 }
 
 func submitProviderTask(ctx context.Context, client *protocol.Client, cfg Config, operation string, input json.RawMessage) (protocol.Task, error) {
@@ -720,7 +750,7 @@ func providerFailureEvidenceError(ctx context.Context, client *protocol.Client, 
 	}
 	expectedRef := fmt.Sprintf("artifact://%s/tasks/%s/proofs/%s/%s", task.PoolID, task.ID, proof.ID, runLogStderrArtifactName)
 	if stderr == nil || stderr.TaskID != task.ID || stderr.ProofID != proof.ID || stderr.PoolID != task.PoolID || stderr.Ref != expectedRef ||
-		stderr.ContentType != "text/plain; charset=utf-8" || stderr.SizeBytes <= 0 || stderr.SizeBytes > maxFailureRunLogBytes ||
+		stderr.ContentType != "application/octet-stream" || stderr.SizeBytes <= 0 || stderr.SizeBytes > maxFailureRunLogBytes ||
 		!validSHA256(stderr.SHA256) {
 		return base
 	}
@@ -1088,6 +1118,9 @@ func validateArtifactMetadata(task protocol.Task, proof protocol.ProofReceipt, a
 	if artifact.SizeBytes < 0 || artifact.SizeBytes > spec.MaxBytes {
 		return fmt.Errorf("artifact %q size %d exceeds contract limit %d", artifact.Name, artifact.SizeBytes, spec.MaxBytes)
 	}
+	if artifact.Truncated {
+		return fmt.Errorf("artifact %q is truncated", artifact.Name)
+	}
 	if !validSHA256(artifact.SHA256) {
 		return fmt.Errorf("artifact %q sha256 is invalid", artifact.Name)
 	}
@@ -1102,8 +1135,9 @@ func boundedProductSummary(product productArtifact, cfg Config) (ProductSummary,
 		return ProductSummary{}, errors.New("product requested_url does not match submitted URL")
 	}
 	resultURL, err := url.ParseRequestURI(product.URL)
-	if err != nil || (resultURL.Scheme != "http" && resultURL.Scheme != "https") || resultURL.Hostname() == "" || resultURL.User != nil ||
-		!strings.EqualFold(resultURL.Hostname(), cfg.AllowedHost) {
+	if err != nil || resultURL.Scheme != "https" || resultURL.Hostname() == "" || resultURL.User != nil ||
+		(resultURL.Port() != "" && resultURL.Port() != "443") ||
+		canonicalProductHost(resultURL.Hostname()) != canonicalProductHost(cfg.AllowedHost) {
 		return ProductSummary{}, errors.New("product url host does not match allowed host")
 	}
 	requestedASIN := snapshot.AmazonASINFromURL(cfg.ProductURL)
@@ -1114,8 +1148,9 @@ func boundedProductSummary(product productArtifact, cfg Config) (ProductSummary,
 		return ProductSummary{}, errors.New("product external_id does not match submitted product ASIN")
 	}
 	canonicalURL, err := url.ParseRequestURI(product.CanonicalURL)
-	if err != nil || (canonicalURL.Scheme != "http" && canonicalURL.Scheme != "https") || canonicalURL.Hostname() == "" || canonicalURL.User != nil ||
-		!strings.EqualFold(canonicalURL.Hostname(), cfg.AllowedHost) || snapshot.AmazonASINFromURL(product.CanonicalURL) != requestedASIN {
+	if err != nil || canonicalURL.Scheme != "https" || canonicalURL.Hostname() == "" || canonicalURL.User != nil ||
+		(canonicalURL.Port() != "" && canonicalURL.Port() != "443") ||
+		canonicalProductHost(canonicalURL.Hostname()) != canonicalProductHost(cfg.AllowedHost) || snapshot.AmazonASINFromURL(product.CanonicalURL) != requestedASIN {
 		return ProductSummary{}, errors.New("product canonical_url does not match submitted product ASIN")
 	}
 	for name, value := range map[string]string{
@@ -1134,11 +1169,18 @@ func boundedProductSummary(product productArtifact, cfg Config) (ProductSummary,
 	if !canonicalPricePattern.MatchString(product.Price) || product.Currency != "USD" {
 		return ProductSummary{}, errors.New("product price must use canonical USD decimal format")
 	}
-	imageURL, err := url.ParseRequestURI(product.ImageURL)
-	if err != nil || (imageURL.Scheme != "http" && imageURL.Scheme != "https") || imageURL.Hostname() == "" || imageURL.User != nil {
-		return ProductSummary{}, errors.New("product image_url must be absolute http(s)")
+	if !snapshot.IsAllowedAmazonImageURL(product.ImageURL) {
+		return ProductSummary{}, errors.New("product image_url must be an allowed Amazon HTTPS image URL")
 	}
 	return ProductSummary{Title: product.Title, ImageURL: product.ImageURL, Price: product.Price, Currency: product.Currency}, nil
+}
+
+func canonicalProductHost(host string) string {
+	host = strings.ToLower(host)
+	if host == "amazon.com" || host == "www.amazon.com" {
+		return "www.amazon.com"
+	}
+	return host
 }
 
 func waitForPoll(ctx context.Context, interval time.Duration) error {

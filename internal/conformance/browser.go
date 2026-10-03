@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
@@ -176,6 +177,7 @@ const (
 	failureClassDirectInvalidEvidence     FailureClass = "direct.invalid_stable_evidence"
 	failureClassAttachedInvalidEvidence   FailureClass = "attached.invalid_stable_evidence"
 	failureClassAutomationGlobalsPresent  FailureClass = "browser.automation.globals_present"
+	failureClassProfilePersistence        FailureClass = "browser.profile_persistence"
 	failureClassReportValidation          FailureClass = "report.validation"
 )
 
@@ -213,6 +215,7 @@ func validFailureClass(value FailureClass) bool {
 		failureClassDirectInvalidEvidence,
 		failureClassAttachedInvalidEvidence,
 		failureClassAutomationGlobalsPresent,
+		failureClassProfilePersistence,
 		failureClassReportValidation:
 		return true
 	default:
@@ -252,13 +255,26 @@ func validComparisonField(value string) bool {
 }
 
 type Report struct {
-	Schema            string                       `json:"schema"`
-	Versions          Versions                     `json:"versions"`
-	StableComparisons []Comparison                 `json:"stable_comparisons"`
-	Informational     map[string]InformationalPair `json:"informational"`
-	Errors            []string                     `json:"errors,omitempty"`
-	FailureClasses    []FailureClass               `json:"failure_classes,omitempty"`
-	Verdict           string                       `json:"verdict"`
+	Schema             string                       `json:"schema"`
+	Versions           Versions                     `json:"versions"`
+	ProfilePersistence ProfilePersistenceEvidence   `json:"profile_persistence"`
+	StableComparisons  []Comparison                 `json:"stable_comparisons"`
+	Informational      map[string]InformationalPair `json:"informational"`
+	Errors             []string                     `json:"errors,omitempty"`
+	FailureClasses     []FailureClass               `json:"failure_classes,omitempty"`
+	Verdict            string                       `json:"verdict"`
+}
+
+type ProfilePersistenceEvidence struct {
+	StartupCrashInjected bool `json:"startup_crash_injected"`
+	SeedCookieObserved   bool `json:"seed_cookie_observed"`
+	CrashInjected        bool `json:"crash_injected"`
+	RecoveredAfterCrash  bool `json:"recovered_after_crash"`
+	CookiePersisted      bool `json:"cookie_persisted"`
+}
+
+func (e ProfilePersistenceEvidence) Valid() bool {
+	return e.StartupCrashInjected && e.SeedCookieObserved && e.CrashInjected && e.RecoveredAfterCrash && e.CookiePersisted
 }
 
 func normalizedBrandSet(brands []Brand) []Brand {
@@ -610,19 +626,27 @@ func Compare(direct, attached Observation, versions Versions) Report {
 }
 
 type Collector struct {
-	runID        string
-	mu           sync.Mutex
-	navigations  map[string]navigationObservation
-	observations map[string]Observation
-	updated      chan struct{}
+	runID                 string
+	profileCookieValue    string
+	mu                    sync.Mutex
+	navigations           map[string]navigationObservation
+	observations          map[string]Observation
+	profileSeedObserved   bool
+	profileVerifyObserved bool
+	updated               chan struct{}
+	profileSeedRelease    chan struct{}
+	releaseProfileSeed    sync.Once
 }
 
 func NewCollector(runID string) *Collector {
+	cookieSum := sha256.Sum256([]byte("product-capture-profile-conformance\x00" + runID))
 	return &Collector{
-		runID:        runID,
-		navigations:  make(map[string]navigationObservation),
-		observations: make(map[string]Observation),
-		updated:      make(chan struct{}, 1),
+		runID:              runID,
+		profileCookieValue: hex.EncodeToString(cookieSum[:]),
+		navigations:        make(map[string]navigationObservation),
+		observations:       make(map[string]Observation),
+		updated:            make(chan struct{}, 1),
+		profileSeedRelease: make(chan struct{}),
 	}
 }
 
@@ -647,18 +671,37 @@ func (c *Collector) Handler() http.Handler {
 			writeJSON(w, http.StatusOK, map[string]string{"schema": SchemaV1, "run_id": c.runID})
 			return
 		}
-		if kind != "direct" && kind != "attached" {
+		if !validObservationKind(kind) {
 			http.NotFound(w, r)
 			return
 		}
 		if r.Method == http.MethodGet {
+			if kind == "profile-verify" && !c.hasProfileCookie(r) {
+				http.Error(w, "profile persistence precondition failed", http.StatusPreconditionFailed)
+				return
+			}
 			c.recordNavigation(kind, r)
+			if kind == "profile-seed" {
+				http.SetCookie(w, &http.Cookie{
+					Name:     "pc_runtime_conformance",
+					Value:    c.profileCookieValue,
+					Path:     prefix,
+					Secure:   true,
+					HttpOnly: true,
+					SameSite: http.SameSiteStrictMode,
+					MaxAge:   600,
+				})
+			}
 			serveSelfReportingPage(w, kind == "direct")
 			return
 		}
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", http.MethodGet+", "+http.MethodPost)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if (kind == "profile-seed" || kind == "profile-verify") && !c.hasProfileCookie(r) {
+			http.Error(w, "profile persistence precondition failed", http.StatusPreconditionFailed)
 			return
 		}
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, MaxObservationBytes))
@@ -675,8 +718,57 @@ func (c *Collector) Handler() http.Handler {
 			http.Error(w, err.Error(), http.StatusConflict)
 			return
 		}
+		if kind == "profile-seed" {
+			c.markProfileSeedObserved()
+			select {
+			case <-c.profileSeedRelease:
+			case <-r.Context().Done():
+				return
+			}
+		}
+		if kind == "profile-verify" {
+			c.markProfileVerifyObserved()
+		}
 		writeJSON(w, http.StatusAccepted, map[string]string{"status": "accepted"})
 	})
+}
+
+func validObservationKind(kind string) bool {
+	switch kind {
+	case "direct", "attached", "profile-seed", "profile-verify":
+		return true
+	default:
+		return false
+	}
+}
+
+func (c *Collector) hasProfileCookie(r *http.Request) bool {
+	cookie, err := r.Cookie("pc_runtime_conformance")
+	if err != nil || len(cookie.Value) != len(c.profileCookieValue) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(cookie.Value), []byte(c.profileCookieValue)) == 1
+}
+
+func (c *Collector) markProfileSeedObserved() {
+	c.mu.Lock()
+	c.profileSeedObserved = true
+	c.mu.Unlock()
+	c.signalUpdate()
+}
+
+func (c *Collector) markProfileVerifyObserved() {
+	c.mu.Lock()
+	c.profileVerifyObserved = true
+	c.mu.Unlock()
+	c.signalUpdate()
+}
+
+func (c *Collector) signalUpdate() {
+	select {
+	case c.updated <- struct{}{}:
+	default:
+	}
 }
 
 type navigationObservation struct {
@@ -749,6 +841,7 @@ func (c *Collector) recordNavigation(kind string, r *http.Request) {
 		c.navigations[kind] = navigation
 	}
 	c.mu.Unlock()
+	c.signalUpdate()
 }
 
 func requestOrigin(r *http.Request) string {
@@ -789,10 +882,7 @@ func (c *Collector) recordObservation(kind string, payload diagnosticPayload) er
 		FirstNavigationOrigin: navigation.origin,
 		Timing:                payload.Timing,
 	}
-	select {
-	case c.updated <- struct{}{}:
-	default:
-	}
+	c.signalUpdate()
 	return nil
 }
 
@@ -813,6 +903,34 @@ func (c *Collector) Wait(ctx context.Context, kind string) (Observation, error) 
 			_, navigationObserved := c.navigations[kind]
 			c.mu.Unlock()
 			return Observation{}, fmt.Errorf("wait for %s observation (navigation_observed=%t): %w", kind, navigationObserved, ctx.Err())
+		case <-c.updated:
+		}
+	}
+}
+
+func (c *Collector) WaitProfileSeed(ctx context.Context) error {
+	return c.waitProfileCondition(ctx, "seed", func() bool { return c.profileSeedObserved })
+}
+
+func (c *Collector) ReleaseProfileSeed() {
+	c.releaseProfileSeed.Do(func() { close(c.profileSeedRelease) })
+}
+
+func (c *Collector) WaitProfileVerify(ctx context.Context) error {
+	return c.waitProfileCondition(ctx, "verify", func() bool { return c.profileVerifyObserved })
+}
+
+func (c *Collector) waitProfileCondition(ctx context.Context, phase string, observed func() bool) error {
+	for {
+		c.mu.Lock()
+		ready := observed()
+		c.mu.Unlock()
+		if ready {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("wait for managed profile %s evidence: %w", phase, ctx.Err())
 		case <-c.updated:
 		}
 	}
@@ -878,16 +996,17 @@ type Tunnel interface {
 }
 
 type Dependencies struct {
-	Tunnel              Tunnel
-	HTTPClient          *http.Client
-	TunnelHTTPClient    *http.Client
-	TunnelHealthTimeout time.Duration
-	HealthRetryWait     diagnosticHealthRetryWait
-	Listen              func(string, string) (net.Listener, error)
-	LaunchDirect        func(context.Context, string, string, bool) error
-	LaunchAttached      func(context.Context, string, string, bool) error
-	ValidateLifecycle   func(context.Context, string, string, bool) error
-	InspectVersions     func(context.Context, string) (Versions, error)
+	Tunnel                     Tunnel
+	HTTPClient                 *http.Client
+	TunnelHTTPClient           *http.Client
+	TunnelHealthTimeout        time.Duration
+	HealthRetryWait            diagnosticHealthRetryWait
+	Listen                     func(string, string) (net.Listener, error)
+	LaunchDirect               func(context.Context, string, string, bool) error
+	LaunchAttached             func(context.Context, string, string, bool) error
+	ValidateLifecycle          func(context.Context, string, string, bool) error
+	ValidateProfilePersistence func(context.Context, string, string, bool, *Collector) (ProfilePersistenceEvidence, error)
+	InspectVersions            func(context.Context, string) (Versions, error)
 }
 
 type Options struct {
@@ -1113,6 +1232,14 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 		return redactManagedTunnelError(err, managedTunnel, attachedTarget, origin)
 	}
 	report := Compare(direct, attached, versions)
+	var profileEvidence ProfilePersistenceEvidence
+	var profileErr error
+	if r.Dependencies.ValidateProfilePersistence == nil {
+		profileErr = errors.New("managed browser profile persistence dependency is unavailable")
+	} else {
+		profileEvidence, profileErr = r.Dependencies.ValidateProfilePersistence(ctx, options.Image, origin, managedTunnel, collector)
+	}
+	applyProfilePersistenceEvidence(&report, profileEvidence, profileErr)
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal conformance report: %w", err)
@@ -1121,10 +1248,31 @@ func (r Runner) Run(ctx context.Context, options Options) (runErr error) {
 	if err := os.WriteFile(options.Output, data, 0o600); err != nil {
 		return fmt.Errorf("write conformance report: %w", err)
 	}
+	if profileErr != nil {
+		profileSeedTarget := origin + "/runs/" + runID + "/profile-seed"
+		profileVerifyTarget := origin + "/runs/" + runID + "/profile-verify"
+		return errors.Join(
+			conformanceFailureError(report),
+			redactManagedTunnelError(profileErr, managedTunnel, profileSeedTarget, profileVerifyTarget, origin),
+		)
+	}
 	if report.ExitCode() != 0 {
 		return conformanceFailureError(report)
 	}
 	return nil
+}
+
+func applyProfilePersistenceEvidence(report *Report, evidence ProfilePersistenceEvidence, err error) {
+	if report == nil {
+		return
+	}
+	report.ProfilePersistence = evidence
+	if err == nil && evidence.Valid() {
+		return
+	}
+	report.Verdict = VerdictFail
+	report.Errors = append(report.Errors, "managed browser profile persistence conformance failed")
+	report.FailureClasses = append(report.FailureClasses, failureClassProfilePersistence)
 }
 
 func tunnelHealthTimeout(configured time.Duration) time.Duration {
@@ -1519,13 +1667,14 @@ type diagnosticHealthClientFactory func(string, diagnosticHealthDialer) *http.Cl
 func defaultDependencies(stderr io.Writer, newHealthClient diagnosticHealthClientFactory) Dependencies {
 	client := &http.Client{Timeout: 45 * time.Second}
 	return Dependencies{
-		Tunnel:            &pinnedCloudflaredTunnel{client: client, stderr: stderr},
-		HTTPClient:        client,
-		TunnelHTTPClient:  newHealthClient(diagnosticDNSResolverAddress, nil),
-		LaunchDirect:      launchDirectChrome,
-		LaunchAttached:    launchAttachedProvider,
-		ValidateLifecycle: validateCandidateLifecycle,
-		InspectVersions:   inspectCandidateVersions,
+		Tunnel:                     &pinnedCloudflaredTunnel{client: client, stderr: stderr},
+		HTTPClient:                 client,
+		TunnelHTTPClient:           newHealthClient(diagnosticDNSResolverAddress, nil),
+		LaunchDirect:               launchDirectChrome,
+		LaunchAttached:             launchAttachedProvider,
+		ValidateLifecycle:          validateCandidateLifecycle,
+		ValidateProfilePersistence: validateManagedProfilePersistence,
+		InspectVersions:            inspectCandidateVersions,
 	}
 }
 
@@ -2116,6 +2265,463 @@ func attachedProviderContainerArgs(image, target string, managedTunnel bool) []s
 	return args
 }
 
+func profileDiagnosticContainerArgs(image, target string, managedTunnel bool, volume, name string) []string {
+	parsed, _ := url.Parse(target)
+	origin := parsed.Scheme + "://" + parsed.Host
+	args := []string{
+		"run", "--platform", "linux/amd64", "--name", name,
+		"--hostname", "product-capture-profile-conformance",
+	}
+	dnsArgs := quickTunnelDNSArgs(target, managedTunnel)
+	args = append(args, dnsArgs...)
+	args = append(args,
+		"-v", volume+":/profile",
+		"-e", "PRODUCT_CAPTURE_BROWSER_HEADLESS=false",
+		"-e", "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS="+origin,
+		"-e", "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR=/profile/chrome",
+		"-e", "PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE=runtime-conformance-v1",
+		"--entrypoint", "/usr/local/bin/product-capture-provider", image,
+		"--browser-diagnostic-url", target,
+		"--browser-profile-conformance",
+	)
+	if len(dnsArgs) > 0 {
+		args = append(args, "--browser-diagnostic-require-ipv4")
+	}
+	return args
+}
+
+func profileStartupCrashContainerArgs(image, target string, managedTunnel bool, volume, name string) []string {
+	parsed, _ := url.Parse(target)
+	origin := parsed.Scheme + "://" + parsed.Host
+	args := []string{
+		"run", "--platform", "linux/amd64", "--name", name,
+		"--hostname", "product-capture-profile-conformance",
+	}
+	dnsArgs := quickTunnelDNSArgs(target, managedTunnel)
+	args = append(args, dnsArgs...)
+	args = append(args,
+		"-v", volume+":/profile",
+		"-e", "PRODUCT_CAPTURE_BROWSER_HEADLESS=false",
+		"-e", "PRODUCT_CAPTURE_BROWSER_DIAGNOSTIC_ALLOWED_ORIGINS="+origin,
+		"-e", "PRODUCT_CAPTURE_BROWSER_PROFILE_DIR=/profile/chrome",
+		"-e", "PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE=runtime-conformance-v1",
+		"--entrypoint", "/usr/local/bin/product-capture-provider", image,
+		"--browser-diagnostic-url", target,
+		"--browser-profile-conformance",
+		"--browser-profile-conformance-crash-before-owner",
+	)
+	if len(dnsArgs) > 0 {
+		args = append(args, "--browser-diagnostic-require-ipv4")
+	}
+	return args
+}
+
+const profileStartupCrashProbeScript = `
+attempt=0
+while :; do
+  if test -L /profile/chrome/SingletonLock &&
+     test -f /profile/chrome/.product-capture-chrome-launch.json &&
+     test ! -L /profile/chrome/.product-capture-chrome-launch.json &&
+     test ! -e /profile/chrome/.product-capture-chrome-owner.json &&
+     test ! -L /profile/chrome/.product-capture-chrome-owner.json &&
+     test -f /profile/chrome/.product-capture-chrome-conformance-pre-owner-ready &&
+     test ! -L /profile/chrome/.product-capture-chrome-conformance-pre-owner-ready; then
+    printf 'confirmed\n'
+    exit 0
+  fi
+  attempt=$((attempt + 1))
+  test "$attempt" -lt 600 || exit 1
+  sleep 0.05
+done
+`
+
+func profileStartupCrashProbeContainerArgs(image, volume, name string) []string {
+	return []string{
+		"run", "--rm", "--platform", "linux/amd64", "--name", name,
+		"--network", "none",
+		"--user", "1000:1000",
+		"-v", volume + ":/profile:ro",
+		"--entrypoint", "/bin/sh", image,
+		"-c", profileStartupCrashProbeScript,
+	}
+}
+
+func waitForManagedProfileStartupCrashBoundary(ctx context.Context, image, volume string) error {
+	name := "product-capture-profile-startup-probe-" + mustRandomSuffix()
+	output, err := runManagedContainerOutput(
+		ctx,
+		name,
+		profileStartupCrashProbeContainerArgs(image, volume, name),
+		1024,
+	)
+	if err != nil {
+		return fmt.Errorf("verify pre-owner managed profile crash boundary: %w", err)
+	}
+	if output != "confirmed" {
+		return errors.New("pre-owner managed profile crash probe returned invalid output")
+	}
+	return nil
+}
+
+const profileCookiePersistenceProbeScript = `
+const fs = require('fs');
+const { DatabaseSync } = require('node:sqlite');
+const databasePath = '/profile/chrome/Default/Cookies';
+const host = process.argv[1];
+const cookiePath = process.argv[2];
+const deadline = Date.now() + 45000;
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+(async () => {
+  while (Date.now() < deadline) {
+    if (fs.existsSync(databasePath)) {
+      let database;
+      try {
+        database = new DatabaseSync(databasePath, { readOnly: true });
+        const row = database.prepare(
+          "SELECT count(*) AS count FROM cookies WHERE host_key = ? AND name = 'pc_runtime_conformance' AND path = ? AND is_persistent = 1"
+        ).get(host, cookiePath);
+        if (Number(row.count) === 1) {
+          process.stdout.write('durable\n');
+          return;
+        }
+      } catch (err) {
+        if (!err || (err.code !== 'ERR_SQLITE_ERROR' && err.code !== 'SQLITE_BUSY' && err.code !== 'SQLITE_CANTOPEN')) throw err;
+      } finally {
+        if (database) database.close();
+      }
+    }
+    await sleep(250);
+  }
+  throw new Error('managed profile cookie did not become durable before timeout');
+})().catch((err) => {
+  console.error(err && err.message ? err.message : 'managed profile cookie persistence probe failed');
+  process.exitCode = 1;
+});
+`
+
+func profileCookiePersistenceProbeContainerArgs(image, volume, host, cookiePath, name string) []string {
+	return []string{
+		"run", "--rm", "--platform", "linux/amd64", "--name", name,
+		"--network", "none",
+		"--user", "1000:1000",
+		"-v", volume + ":/profile:ro",
+		"--entrypoint", "node", image,
+		"-e", profileCookiePersistenceProbeScript, host, cookiePath,
+	}
+}
+
+func waitForManagedProfileCookiePersistence(ctx context.Context, image, volume, host, cookiePath string) error {
+	name := "product-capture-profile-cookie-probe-" + mustRandomSuffix()
+	output, err := runManagedContainerOutput(
+		ctx,
+		name,
+		profileCookiePersistenceProbeContainerArgs(image, volume, host, cookiePath, name),
+		1024,
+	)
+	if err != nil {
+		return fmt.Errorf("wait for durable managed profile cookie: %w", err)
+	}
+	if output != "durable" {
+		return errors.New("managed profile cookie persistence probe returned invalid output")
+	}
+	return nil
+}
+
+func validateManagedProfilePersistence(
+	ctx context.Context,
+	image, origin string,
+	managedTunnel bool,
+	collector *Collector,
+) (evidence ProfilePersistenceEvidence, runErr error) {
+	if collector == nil {
+		return evidence, errors.New("profile persistence collector is unavailable")
+	}
+	volume := "product-capture-profile-" + mustRandomSuffix()
+	if err := dockerCommand(ctx, "volume", "create", volume); err != nil {
+		return evidence, fmt.Errorf("create managed profile volume: %w", err)
+	}
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), candidateFinalRemoveTimeout)
+		defer cancel()
+		runErr = errors.Join(runErr, dockerCommand(cleanupCtx, "volume", "rm", "-f", volume))
+	}()
+
+	initName := "product-capture-profile-init-" + mustRandomSuffix()
+	initArgs := []string{
+		"run", "--rm", "--platform", "linux/amd64", "--name", initName,
+		"--user", "0", "-v", volume + ":/profile",
+		"--entrypoint", "/bin/sh", image,
+		"-c", "chown 1000:1000 /profile && chmod 0700 /profile",
+	}
+	if err := runManagedContainer(ctx, initName, initArgs, nil); err != nil {
+		return evidence, fmt.Errorf("initialize managed profile volume: %w", err)
+	}
+
+	startupTarget := origin + "/runs/" + collector.runID + "/profile-startup"
+	startupName := "product-capture-profile-startup-" + mustRandomSuffix()
+	if err := runManagedProfileStartupCrash(
+		ctx,
+		startupName,
+		profileStartupCrashContainerArgs(image, startupTarget, managedTunnel, volume, startupName),
+		func(ctx context.Context) error {
+			return waitForManagedProfileStartupCrashBoundary(ctx, image, volume)
+		},
+	); err != nil {
+		return evidence, fmt.Errorf("inject pre-owner managed profile crash: %w", err)
+	}
+	if err := waitForManagedProfileStartupCrashBoundary(ctx, image, volume); err != nil {
+		return evidence, err
+	}
+	evidence.StartupCrashInjected = true
+
+	seedTarget := origin + "/runs/" + collector.runID + "/profile-seed"
+	seedURL, err := url.Parse(seedTarget)
+	if err != nil || seedURL.Hostname() == "" {
+		return evidence, errors.New("managed profile seed target is invalid")
+	}
+	seedName := "product-capture-profile-seed-" + mustRandomSuffix()
+	if err := runManagedProfileSeedCrash(
+		ctx,
+		collector,
+		seedName,
+		profileDiagnosticContainerArgs(image, seedTarget, managedTunnel, volume, seedName),
+		func(ctx context.Context) error {
+			return waitForManagedProfileCookiePersistence(
+				ctx,
+				image,
+				volume,
+				seedURL.Hostname(),
+				"/runs/"+collector.runID+"/",
+			)
+		},
+	); err != nil {
+		return evidence, fmt.Errorf("seed managed profile and inject crash: %w", err)
+	}
+	evidence.SeedCookieObserved = true
+	evidence.CrashInjected = true
+
+	verifyTarget := origin + "/runs/" + collector.runID + "/profile-verify"
+	verifyName := "product-capture-profile-verify-" + mustRandomSuffix()
+	verifyOutput, err := runManagedContainerOutput(
+		ctx,
+		verifyName,
+		profileDiagnosticContainerArgs(image, verifyTarget, managedTunnel, volume, verifyName),
+		maxBrowserDiagnosticOutputBytes,
+	)
+	if err != nil {
+		return evidence, fmt.Errorf("recover managed profile after crash: %w", err)
+	}
+	evidence.RecoveredAfterCrash = true
+	if err := profileDiagnosticPosted(verifyOutput); err != nil {
+		return evidence, fmt.Errorf("validate managed profile recovery diagnostic: %w", err)
+	}
+	if err := collector.WaitProfileVerify(ctx); err != nil {
+		return evidence, err
+	}
+	evidence.CookiePersisted = true
+	return evidence, nil
+}
+
+const maxBrowserDiagnosticOutputBytes = 64 << 10
+
+func runManagedProfileStartupCrash(
+	ctx context.Context,
+	name string,
+	args []string,
+	waitForBoundary func(context.Context) error,
+) (runErr error) {
+	cmd := exec.Command("docker", args...)
+	var output boundedWriter
+	output.limit = maxBrowserDiagnosticOutputBytes
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start managed profile startup crash container: %w", err)
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	processReaped := false
+	containerRemoved := false
+	defer func() {
+		if runErr != nil {
+			runErr = errors.Join(runErr, cleanupManagedProfileCrash(name, wait, processReaped, containerRemoved))
+		}
+	}()
+
+	if waitForBoundary == nil {
+		return errors.New("managed profile startup boundary probe is unavailable")
+	}
+	probeCtx, probeCancel := context.WithCancel(ctx)
+	boundaryObserved := make(chan error, 1)
+	probeDone := false
+	go func() { boundaryObserved <- waitForBoundary(probeCtx) }()
+	defer func() {
+		probeCancel()
+		if probeDone {
+			return
+		}
+		select {
+		case probeErr := <-boundaryObserved:
+			if probeErr != nil {
+				runErr = errors.Join(runErr, fmt.Errorf("stop managed profile startup boundary probe: %w", probeErr))
+			}
+		case <-time.After(candidateReapGrace):
+			runErr = errors.Join(runErr, errors.New("managed profile startup boundary probe did not stop"))
+		}
+	}()
+	select {
+	case err := <-boundaryObserved:
+		probeDone = true
+		if err != nil {
+			return err
+		}
+	case err := <-wait:
+		processReaped = true
+		return fmt.Errorf("managed profile startup container exited before crash injection: %w: %s", err, output.String())
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	killCtx, killCancel := context.WithTimeout(context.Background(), candidateForceRemoveTimeout)
+	killErr := dockerCommand(killCtx, "kill", "--signal", "KILL", name)
+	killCancel()
+	if killErr != nil {
+		return killErr
+	}
+
+	var waitErr error
+	select {
+	case waitErr = <-wait:
+		processReaped = true
+	case <-time.After(candidateReapGrace):
+		return errors.New("managed profile startup crash container did not reap")
+	}
+	if waitErr == nil {
+		return fmt.Errorf("managed profile startup crash container exited successfully: %s", output.String())
+	}
+	inspectCtx, inspectCancel := context.WithTimeout(context.Background(), candidateInspectTimeout)
+	exitCode, inspectErr := dockerOutput(inspectCtx, "container", "inspect", "--format", "{{.State.ExitCode}}", name)
+	inspectCancel()
+	if inspectErr != nil {
+		return fmt.Errorf("inspect managed profile startup crash exit: %w", inspectErr)
+	}
+	if exitCode != "137" {
+		return fmt.Errorf("managed profile startup crash exit code = %s, want 137: %s", exitCode, output.String())
+	}
+	removeCtx, removeCancel := context.WithTimeout(context.Background(), candidateFinalRemoveTimeout)
+	removeErr := dockerCommand(removeCtx, "rm", "-f", name)
+	removeCancel()
+	if removeErr != nil {
+		return removeErr
+	}
+	containerRemoved = true
+	return assertContainerGone(name)
+}
+
+func profileDiagnosticPosted(output string) error {
+	var artifact struct {
+		PostedToOrigin bool `json:"posted_to_origin"`
+	}
+	if err := json.Unmarshal([]byte(output), &artifact); err != nil {
+		return fmt.Errorf("decode browser diagnostic: %w", err)
+	}
+	if !artifact.PostedToOrigin {
+		return errors.New("browser diagnostic did not post to the controlled origin")
+	}
+	return nil
+}
+
+func runManagedProfileSeedCrash(
+	ctx context.Context,
+	collector *Collector,
+	name string,
+	args []string,
+	waitForPersistence func(context.Context) error,
+) (runErr error) {
+	cmd := exec.Command("docker", args...)
+	var output boundedWriter
+	output.limit = maxBrowserDiagnosticOutputBytes
+	cmd.Stdout, cmd.Stderr = &output, &output
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start managed profile crash container: %w", err)
+	}
+	wait := make(chan error, 1)
+	go func() { wait <- cmd.Wait() }()
+	processReaped := false
+	containerRemoved := false
+	defer func() {
+		collector.ReleaseProfileSeed()
+		if runErr != nil {
+			runErr = errors.Join(runErr, cleanupManagedProfileCrash(name, wait, processReaped, containerRemoved))
+		}
+	}()
+	seedObserved := make(chan error, 1)
+	go func() { seedObserved <- collector.WaitProfileSeed(ctx) }()
+	select {
+	case err := <-seedObserved:
+		if err != nil {
+			return err
+		}
+	case err := <-wait:
+		processReaped = true
+		return fmt.Errorf("managed profile seed container exited before crash injection: %w: %s", err, output.String())
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	if waitForPersistence == nil {
+		return errors.New("managed profile persistence probe is unavailable")
+	}
+	if err := waitForPersistence(ctx); err != nil {
+		return err
+	}
+	killCtx, cancel := context.WithTimeout(context.Background(), candidateForceRemoveTimeout)
+	killErr := dockerCommand(killCtx, "kill", "--signal", "KILL", name)
+	cancel()
+	if killErr != nil {
+		return killErr
+	}
+
+	var waitErr error
+	select {
+	case waitErr = <-wait:
+		processReaped = true
+	case <-time.After(candidateReapGrace):
+		return errors.New("managed profile crash container did not reap")
+	}
+	if waitErr == nil {
+		return errors.New("managed profile crash container exited successfully after SIGKILL")
+	}
+	inspectCtx, inspectCancel := context.WithTimeout(context.Background(), candidateInspectTimeout)
+	exitCode, inspectErr := dockerOutput(inspectCtx, "container", "inspect", "--format", "{{.State.ExitCode}}", name)
+	inspectCancel()
+	if inspectErr != nil {
+		return fmt.Errorf("inspect managed profile crash exit: %w", inspectErr)
+	}
+	if exitCode != "137" {
+		return fmt.Errorf("managed profile crash exit code = %s, want 137", exitCode)
+	}
+	removeCtx, removeCancel := context.WithTimeout(context.Background(), candidateFinalRemoveTimeout)
+	removeErr := dockerCommand(removeCtx, "rm", "-f", name)
+	removeCancel()
+	if removeErr != nil {
+		return removeErr
+	}
+	containerRemoved = true
+	return assertContainerGone(name)
+}
+
+func cleanupManagedProfileCrash(name string, wait <-chan error, processReaped, containerRemoved bool) error {
+	if containerRemoved {
+		return nil
+	}
+	if processReaped {
+		removeCtx, removeCancel := context.WithTimeout(context.Background(), candidateFinalRemoveTimeout)
+		defer removeCancel()
+		removeErr := ignoreMissingContainer(dockerCommand(removeCtx, "rm", "-f", name))
+		return errors.Join(removeErr, assertContainerGone(name))
+	}
+	return cleanupLifecycleContainer(name, wait, processReaped, "kill")
+}
+
 func quickTunnelDNSArgs(target string, managedTunnel bool) []string {
 	if !managedTunnel {
 		return nil
@@ -2210,25 +2816,54 @@ func (w *boundedWriter) Write(data []byte) (int, error) {
 	return original, nil
 }
 
-func (w *boundedWriter) String() string { return strings.TrimSpace(w.buffer.String()) }
+func (w *boundedWriter) String() string {
+	return strings.TrimSpace(strings.ToValidUTF8(w.buffer.String(), "?"))
+}
+
+const maxDockerHelperOutputBytes = 4 << 10
+
+func runDockerCommandBounded(ctx context.Context, args ...string) (boundedWriter, boundedWriter, error) {
+	stdout := boundedWriter{limit: maxDockerHelperOutputBytes}
+	stderr := boundedWriter{limit: maxDockerHelperOutputBytes}
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	return stdout, stderr, err
+}
+
+func joinedDockerOutput(stdout, stderr boundedWriter) string {
+	parts := make([]string, 0, 2)
+	if value := stdout.String(); value != "" {
+		parts = append(parts, value)
+	}
+	if value := stderr.String(); value != "" {
+		parts = append(parts, value)
+	}
+	return strings.Join(parts, "\n")
+}
 
 func dockerCommand(ctx context.Context, args ...string) error {
-	output, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	stdout, stderr, err := runDockerCommandBounded(ctx, args...)
+	output := joinedDockerOutput(stdout, stderr)
+	if err == nil {
+		return nil
 	}
-	return nil
+	if stdout.over || stderr.over {
+		return fmt.Errorf("docker %s: %w: output exceeds %d bytes: %s", strings.Join(args, " "), err, maxDockerHelperOutputBytes, output)
+	}
+	return fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, output)
 }
 
 func assertContainerGone(name string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), candidateInspectTimeout)
 	defer cancel()
-	output, err := exec.CommandContext(ctx, "docker", "container", "inspect", name).CombinedOutput()
+	err := dockerCommand(ctx, "container", "inspect", name)
 	if err == nil {
 		return fmt.Errorf("candidate container %s remains after cleanup", name)
 	}
-	if !strings.Contains(string(output), "No such") {
-		return fmt.Errorf("inspect candidate cleanup %s: %w: %s", name, err, strings.TrimSpace(string(output)))
+	if !strings.Contains(err.Error(), "No such") {
+		return fmt.Errorf("inspect candidate cleanup %s: %w", name, err)
 	}
 	return nil
 }
@@ -2414,24 +3049,33 @@ func dockerOutput(ctx context.Context, args ...string) (string, error) {
 		namedArgs = append(namedArgs, args[1:]...)
 		return managedDockerRunOutput(ctx, name, namedArgs)
 	}
-	output, err := exec.CommandContext(ctx, "docker", args...).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(output)))
+	stdout, stderr, err := runDockerCommandBounded(ctx, args...)
+	output := joinedDockerOutput(stdout, stderr)
+	if stdout.over || stderr.over {
+		return "", fmt.Errorf("docker %s returned invalid bounded output", strings.Join(args, " "))
 	}
-	value := strings.TrimSpace(string(output))
-	if value == "" || len(value) > 4096 {
+	if err != nil {
+		return "", fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, output)
+	}
+	value := strings.TrimSpace(output)
+	if value == "" {
 		return "", fmt.Errorf("docker %s returned invalid bounded output", strings.Join(args, " "))
 	}
 	return value, nil
 }
 
 func managedDockerRunOutput(ctx context.Context, name string, args []string) (string, error) {
+	return runManagedContainerOutput(ctx, name, args, 4096)
+}
+
+func runManagedContainerOutput(ctx context.Context, name string, args []string, limit int) (string, error) {
 	cmd := exec.Command("docker", args...)
-	var output boundedWriter
-	output.limit = 4096
-	cmd.Stdout, cmd.Stderr = &output, &output
+	stdout := boundedWriter{limit: limit}
+	stderr := boundedWriter{limit: limit}
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
-		return "", fmt.Errorf("start Docker version probe %s: %w", name, err)
+		return "", fmt.Errorf("start Docker candidate %s: %w", name, err)
 	}
 	wait := make(chan error, 1)
 	go func() { wait <- cmd.Wait() }()
@@ -2445,14 +3089,15 @@ func managedDockerRunOutput(ctx context.Context, name string, args []string) (st
 	}
 	cleanupErr := cleanupLifecycleContainer(name, wait, processReaped, "stop")
 	if waitErr != nil {
-		return "", errors.Join(fmt.Errorf("docker version probe %s: %w: %s", name, waitErr, output.String()), cleanupErr)
+		diagnostic := strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n"))
+		return "", errors.Join(fmt.Errorf("docker candidate %s: %w: %s", name, waitErr, diagnostic), cleanupErr)
 	}
 	if cleanupErr != nil {
 		return "", cleanupErr
 	}
-	value := output.String()
-	if value == "" || output.over {
-		return "", fmt.Errorf("docker version probe %s returned invalid bounded output", name)
+	value := stdout.String()
+	if value == "" || stdout.over {
+		return "", fmt.Errorf("docker candidate %s returned invalid bounded output", name)
 	}
 	return value, nil
 }

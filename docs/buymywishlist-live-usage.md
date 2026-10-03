@@ -29,7 +29,13 @@ Retained `product-capture-browser` workers may set
 Chrome state should persist between captures. This can reduce repeated Amazon
 continuation gates after a successful benign pass-through. It must not reference
 a logged-in Amazon or operator browser profile, and operators can reset the
-capture identity by deleting the directory.
+capture identity by deleting the directory. Persistent profiles also require
+`PRODUCT_CAPTURE_BROWSER_PROFILE_SCOPE` with a stable trusted
+org/pool/provider-enrollment identity and rotation version. Changing that scope
+fails closed until a new profile directory is configured. The provider runtime
+must run with container-level denial for private, link-local, cloud metadata,
+and workflow-control-plane egress; browser URL filtering is defense in depth,
+not the network isolation boundary.
 
 If Amazon starts returning interstitials or CAPTCHA pages, first run a browser
 diagnostic from the same staging worker/runtime before changing capture
@@ -48,6 +54,9 @@ cookie presence and length, never cookie values. Compare the staging worker
 result against a normal Chrome visit and a local Playwright run so mismatched
 client hints, platform, headless/browser surfaces, locale/timezone, WebGL, and
 network-origin signals are visible before making further capture changes.
+The automation comparison checks only `window.__playwright__binding__` and
+`window.__pwInitScripts`. Their absence is limited comparative evidence, not an
+assertion that no automation context can be detected.
 
 The deployment is not live-ready until a BMW-shaped provider task returns an
 accepted proof from a `product-capture-browser` agent in the target wfcompute
@@ -61,20 +70,20 @@ plane and embedded in the invite/setup flow.
 
 ## Current Release Target
 
-Use `workflow-plugin-product-capture` `v0.1.65` for the next BuyMyWishlist
+Use `workflow-plugin-product-capture` `v0.1.66` for the next BuyMyWishlist
 live-incorporation pass. Downstream workflow-compute scenarios, staging proof
 defaults, and BuyMyWishlist plugin pins should all reference this tag once its
 release workflow has published the matching browser runtime image digest.
 
 Do not copy a digest from this source tree. The digest that matters is the
-GHCR `product-capture-browser@sha256:<digest>` emitted by the `v0.1.65`
+GHCR `product-capture-browser@sha256:<digest>` emitted by the `v0.1.66`
 release workflow. For component-backed deployments, use the wfcompute package
 campaign's promoted component digest for
 `provider://workflow-plugin-product-capture/browser/runtime`.
 
 ## Product-Owned Staging Proof
 
-After the `v0.1.65` release publishes its browser image, dispatch
+After the `v0.1.66` release publishes its browser image, dispatch
 `.github/workflows/staging-proof.yml` from `main`. Supply the exact released
 image reference, the registered retained staging worker ID, and a real Amazon
 product URL. Store a credential scoped to `agent:read`, `task:read`, and

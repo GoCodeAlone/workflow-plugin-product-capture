@@ -875,3 +875,72 @@ name beginning `artifacts/` remains valid and maps to an HTTP path containing
 `/artifacts/artifacts/`; no unversioned reserved name segment is introduced.
 This corrects failed Task 1/Task 5 contract assumptions without changing the
 locked task or PR manifest.
+
+### Backport 2026-10-02: Crash-recovery profile conformance
+
+Cause: unit recovery tests did not prove the shipped provider and installed
+Chrome preserve anonymous browser state after an ungraceful container exit.
+The general diagnostic invariant also prohibited any retained profile, so the
+release gate could not exercise the production capture profile lifecycle.
+
+Change: keep ordinary and dynamic diagnostics ephemeral. Add a CLI-only release
+conformance mode that runs the shipped provider twice against a fresh named
+volume, stable hostname, and stable profile scope. A controlled HTTPS endpoint
+sets and verifies one exact run-derived, host-only, `Secure`, `HttpOnly`,
+non-auth cookie. Hold the seed POST open, send literal `SIGKILL`, require exit
+137 before removing the first container, then require the restarted provider to
+recover and return the exact cookie. Reports initially expose four booleans; all must
+be true before image promotion. Always delete the volume and containers.
+
+Scope: no locked Scope Manifest change; existing runtime/conformance work owns
+managed-profile lifecycle proof. Credentialed shopping profiles remain
+forbidden.
+
+Evidence: focused macOS tests plus the Linux-only temp-cleanup regression pass;
+exact candidate-image conformance remains the authoritative runtime gate.
+
+### Backport 2026-10-02: Pre-owner recovery and durable cookie evidence
+
+Cause: Chrome can create `SingletonLock` before Node publishes the owner record;
+a crash in that interval left recovery without sufficient authority. The first
+cookie conformance also killed Chrome after the diagnostic POST but before
+Chrome's delayed SQLite flush, so in-memory observation did not prove durable
+profile state.
+
+Change: publish an immutable launch journal bound to profile generation, scope,
+hostname, launch ID, and lock inode before starting Node. Inherit the held lock
+FD through Node and the Chrome supervisor. Owner v2 binds to the same launch;
+owner v1 remains readable for upgrade recovery. An ownerless dead
+`SingletonLock` is removable only with a matching journal, while live or
+mismatched identities fail closed. Release conformance first kills the shipped
+provider when journal + singleton exist and owner does not, then requires the
+next launch to recover. The cookie phase uses a networkless read-only SQLite
+probe that selects only host/name/path/persistence metadata and waits up to 45
+seconds before `SIGKILL`. Reports now expose five booleans, all required.
+
+Additional corrections: release runs reject Rosetta and require native
+`x86_64`; capture stderr uses a bounded redacted tail; normalized Amazon
+navigation preserves submitted query/fragment; page canonicals require trusted
+HTTPS Amazon host + matching ASIN; schema bounds cap strings, maps, and images.
+
+**Execution backport 2026-10-02 (deterministic pre-owner boundary):** Three
+external timing strategies could not reliably interrupt the interval between
+Chrome's `SingletonLock` creation and owner publication because the provider's
+Node process can publish the owner while Chrome itself is stopped. Keep the
+normal runtime unchanged and add a guarded, operator-only conformance flag to
+the shipped provider. At the exact lifecycle boundary, the provider verifies
+the launch journal, singleton target, and Chrome process identity, stops the
+Chrome process group, then stops itself before owner publication. A separate
+networkless, read-only volume probe requires launch journal + singleton + no
+owner before and after the host sends container `SIGKILL`; the next unmodified
+profile-conformance launch must recover. Exact amd64 candidate image
+`sha256:7d1b0b6cdfe699a013ee06caaa4ce4368faa185de86fe671fc918a24b2d2b111`
+passed with all five profile-persistence booleans true, zero mismatches, and no
+remaining containers or volumes. This replaces the racy monitor without a
+Scope Manifest change.
+
+Scope: no manifest change; Tasks 2-4 already own runtime lifecycle, candidate
+conformance, release gating, and bounded product output.
+
+Evidence: focused Linux/amd64 package integration and mutation proofs pass;
+exact rebuilt-image conformance remains the authoritative promotion gate.

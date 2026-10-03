@@ -45,7 +45,9 @@ func run(ctx context.Context, args []string, stdout io.Writer, getenv func(strin
 	diagnosticURL := fs.String("browser-diagnostic-url", "", "optional controlled HTTPS browser diagnostic endpoint")
 	imageRef := fs.String("provider-image-ref", "", "exact digest-pinned provider image reference")
 	contractPath := fs.String("contract", "contracts/product-capture-provider.json", "provider contract path")
+	productInputSchemaPath := fs.String("product-input-schema", "schemas/product-capture-operation-input.schema.json", "product input schema path")
 	productSchemaPath := fs.String("product-schema", "schemas/product-capture-operation-output.schema.json", "product output schema path")
+	diagnosticInputSchemaPath := fs.String("diagnostic-input-schema", "schemas/browser-diagnostic-operation-input.schema.json", "browser diagnostic input schema path")
 	diagnosticSchemaPath := fs.String("diagnostic-schema", "schemas/browser-diagnostic-result.schema.json", "browser diagnostic artifact schema path")
 	outputPath := fs.String("output", "product-capture-staging-proof.json", "redacted summary output path")
 	pollInterval := fs.Duration("poll-interval", 30*time.Second, "control-plane poll interval")
@@ -75,37 +77,47 @@ func run(ctx context.Context, args []string, stdout io.Writer, getenv func(strin
 	if err := protocol.DecodeStrict(strings.NewReader(string(contractData)), &contract); err != nil {
 		return fmt.Errorf("decode provider contract: %w", err)
 	}
+	productInputSchema, err := os.ReadFile(*productInputSchemaPath)
+	if err != nil {
+		return fmt.Errorf("read product input schema: %w", err)
+	}
 	productSchema, err := os.ReadFile(*productSchemaPath)
 	if err != nil {
 		return fmt.Errorf("read product schema: %w", err)
 	}
-	var diagnosticSchema []byte
+	var diagnosticInputSchema, diagnosticSchema []byte
 	if *diagnosticURL != "" {
+		diagnosticInputSchema, err = os.ReadFile(*diagnosticInputSchemaPath)
+		if err != nil {
+			return fmt.Errorf("read browser diagnostic input schema: %w", err)
+		}
 		diagnosticSchema, err = os.ReadFile(*diagnosticSchemaPath)
 		if err != nil {
 			return fmt.Errorf("read browser diagnostic schema: %w", err)
 		}
 	}
 	summary, err := execute(ctx, stagingproof.Config{
-		ServerURL:            *serverURL,
-		Token:                token,
-		OrgID:                *orgID,
-		PoolID:               *poolID,
-		ProductID:            *productID,
-		PolicyID:             *policyID,
-		WorkerID:             *workerID,
-		ProductURL:           *productURL,
-		AllowedHost:          *allowedHost,
-		BrowserDiagnosticURL: *diagnosticURL,
-		ProviderImageRef:     *imageRef,
-		Contract:             contract,
-		ProductSchema:        productSchema,
-		DiagnosticSchema:     diagnosticSchema,
-		PollInterval:         *pollInterval,
-		CapacityTimeout:      *capacityTimeout,
-		ResultTimeout:        *resultTimeout,
-		ArtifactTimeout:      *artifactTimeout,
-		TaskTimeoutSeconds:   *taskTimeout,
+		ServerURL:             *serverURL,
+		Token:                 token,
+		OrgID:                 *orgID,
+		PoolID:                *poolID,
+		ProductID:             *productID,
+		PolicyID:              *policyID,
+		WorkerID:              *workerID,
+		ProductURL:            *productURL,
+		AllowedHost:           *allowedHost,
+		BrowserDiagnosticURL:  *diagnosticURL,
+		ProviderImageRef:      *imageRef,
+		Contract:              contract,
+		ProductInputSchema:    productInputSchema,
+		ProductSchema:         productSchema,
+		DiagnosticInputSchema: diagnosticInputSchema,
+		DiagnosticSchema:      diagnosticSchema,
+		PollInterval:          *pollInterval,
+		CapacityTimeout:       *capacityTimeout,
+		ResultTimeout:         *resultTimeout,
+		ArtifactTimeout:       *artifactTimeout,
+		TaskTimeoutSeconds:    *taskTimeout,
 	})
 	if err != nil {
 		return err

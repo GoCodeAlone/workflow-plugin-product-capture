@@ -283,6 +283,103 @@ func TestReleaseWorkflowRetainsFailedConformanceReport(t *testing.T) {
 	}
 }
 
+func TestReleaseWorkflowRequiresManagedProfileCrashRecoveryBeforePromotion(t *testing.T) {
+	conformanceRun := releaseRuntimeStepRun(t, "Run exact candidate browser conformance")
+	for _, required := range []string{
+		`.profile_persistence.startup_crash_injected == true`,
+		`.profile_persistence.seed_cookie_observed == true`,
+		`.profile_persistence.crash_injected == true`,
+		`.profile_persistence.recovered_after_crash == true`,
+		`.profile_persistence.cookie_persisted == true`,
+	} {
+		if !strings.Contains(conformanceRun, required) {
+			t.Errorf("release conformance step must require %q", required)
+		}
+	}
+}
+
+func TestReleaseWorkflowBindsPromotedDigestToTestedLocalImage(t *testing.T) {
+	promotionRun := releaseRuntimeStepRun(t, "Push exact tested browser image")
+	for _, required := range []string{
+		`docker image inspect --format '{{.Id}}' "$CANDIDATE"`,
+		`docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$CANDIDATE"`,
+		`mapfile -t pushed_refs`,
+		`provider_image_ref="${pushed_refs[0]}"`,
+		`digest="${provider_image_ref#*@}"`,
+		`docker buildx imagetools inspect "${repository}@${digest}"`,
+		`if [ "$remote_digest" != "$digest" ]`,
+	} {
+		if !strings.Contains(promotionRun, required) {
+			t.Errorf("release promotion step missing tested-image digest binding %q", required)
+		}
+	}
+	if strings.Contains(promotionRun, `imagetools inspect "$CANDIDATE"`) {
+		t.Fatal("release promotion resolves a mutable tag after conformance")
+	}
+}
+
+func releaseRuntimeStepRun(t *testing.T, stepName string) string {
+	t.Helper()
+	data, err := os.ReadFile(".github/workflows/release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var workflow struct {
+		Jobs map[string]struct {
+			Steps []struct {
+				Name string `yaml:"name"`
+				Run  string `yaml:"run"`
+			} `yaml:"steps"`
+		} `yaml:"jobs"`
+	}
+	if err := yaml.Unmarshal(data, &workflow); err != nil {
+		t.Fatalf("release workflow is not valid YAML: %v", err)
+	}
+	for _, step := range workflow.Jobs["runtime-image"].Steps {
+		if step.Name == stepName {
+			if strings.TrimSpace(step.Run) == "" {
+				t.Fatalf("release runtime step %q has no executable run body", stepName)
+			}
+			return step.Run
+		}
+	}
+	t.Fatalf("release runtime step %q is missing", stepName)
+	return ""
+}
+
+func TestReleaseWorkflowVerifiesNativeAMD64RunnerBeforeConformance(t *testing.T) {
+	data, err := os.ReadFile(".github/workflows/release.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed yaml.Node
+	if err := yaml.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("release workflow is not valid YAML: %v", err)
+	}
+	workflow := string(data)
+	runtimeStart := strings.Index(workflow, "  runtime-image:")
+	publishStart := strings.Index(workflow, "  publish-release:")
+	if runtimeStart < 0 || publishStart <= runtimeStart {
+		t.Fatal("release workflow runtime-image job boundaries are missing")
+	}
+	runtimeJob := workflow[runtimeStart:publishStart]
+	verifyStart := strings.Index(runtimeJob, "name: Verify native amd64 release runner")
+	conformanceStart := strings.Index(runtimeJob, "name: Run exact candidate browser conformance")
+	if verifyStart < 0 || conformanceStart <= verifyStart {
+		t.Fatal("native amd64 runner verification must run before exact candidate conformance")
+	}
+	verifyStep := runtimeJob[verifyStart:conformanceStart]
+	for _, required := range []string{
+		"set -euo pipefail",
+		`test "$(uname -m)" = "x86_64"`,
+		"test ! -e /run/rosetta/rosetta",
+	} {
+		if !strings.Contains(verifyStep, required) {
+			t.Errorf("native amd64 runner verification missing %q", required)
+		}
+	}
+}
+
 func assertWorkflowUsesPinnedActions(t *testing.T, path, workflow string) {
 	t.Helper()
 	for _, line := range strings.Split(workflow, "\n") {

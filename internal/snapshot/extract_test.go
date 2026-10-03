@@ -309,6 +309,46 @@ func TestExtractAmazonRejectsDOMTitleWhenCanonicalASINDiffers(t *testing.T) {
 	t.Fatalf("expected mismatched requested/canonical ASIN to fail closed, got external_id=%q canonical_url=%q", got.ExternalID, got.CanonicalURL)
 }
 
+func TestExtractAmazonDoesNotTrustUnsafeCanonicalURL(t *testing.T) {
+	requestedURL := "https://www.amazon.com/dp/B09B8V1LZ3?th=1"
+	for name, canonicalURL := range map[string]string{
+		"foreign host":     "https://attacker.example/dp/B09B8V1LZ3",
+		"insecure":         "http://www.amazon.com/dp/B09B8V1LZ3",
+		"userinfo":         "https://user@www.amazon.com/dp/B09B8V1LZ3",
+		"nonstandard port": "https://www.amazon.com:444/dp/B09B8V1LZ3",
+		"missing ASIN":     "https://www.amazon.com/",
+	} {
+		t.Run(name, func(t *testing.T) {
+			html := `<!doctype html><html><head><link rel="canonical" href="` + canonicalURL + `"></head><body>` +
+				`<span id="productTitle">Amazon Echo Dot</span>` +
+				`<img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg">` +
+				`</body></html>`
+			got, err := ExtractAmazon(html, ExtractOptions{URL: requestedURL, CapturedAt: time.Unix(100, 0).UTC()})
+			if err != nil {
+				t.Fatalf("extract: %v", err)
+			}
+			if got.CanonicalURL != requestedURL {
+				t.Fatalf("canonical_url = %q, want trusted fallback %q", got.CanonicalURL, requestedURL)
+			}
+		})
+	}
+}
+
+func TestExtractAmazonReducesTrustedCanonicalURLToProductPath(t *testing.T) {
+	const requestedURL = "https://www.amazon.com/dp/B09B8V1LZ3?th=1#details"
+	html := `<!doctype html><html><head><link rel="canonical" href="https://amazon.com:443/Echo-Dot/dp/B09B8V1LZ3/ref=cm_cr?tag=page#reviews"></head><body>` +
+		`<span id="productTitle">Amazon Echo Dot</span>` +
+		`<img id="landingImage" src="https://m.media-amazon.com/images/I/echo.jpg">` +
+		`</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{URL: requestedURL, CapturedAt: time.Unix(100, 0).UTC()})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.CanonicalURL != "https://www.amazon.com/dp/B09B8V1LZ3" {
+		t.Fatalf("canonical_url = %q", got.CanonicalURL)
+	}
+}
+
 func TestExtractAmazonMetadataTitleAcceptsPriceContainerEvidence(t *testing.T) {
 	html := `<!doctype html>
 <html><head>
@@ -586,6 +626,32 @@ func TestExtractAmazonFallsBackToImageWrapperPhoto(t *testing.T) {
 	}
 	if got.ImageURL != "https://m.media-amazon.com/images/I/xbox-hires.jpg" {
 		t.Fatalf("image_url: %q", got.ImageURL)
+	}
+}
+
+func TestExtractAmazonFiltersUnsafeImageURLs(t *testing.T) {
+	html := `<!doctype html>
+<html><body>
+  <span id="productTitle">Xbox Series X - Gaming Console</span>
+  <div id="corePrice_feature_div"><span class="a-offscreen">$637.00</span></div>
+  <img id="landingImage" src="http://127.0.0.1/internal.jpg"
+       data-a-dynamic-image='{"http://127.0.0.1/internal.jpg":[342,342],"https://m.media-amazon.com/images/I/xbox-safe.jpg":[425,425]}'>
+  <div id="imgTagWrapperId">
+    <img data-old-hires="https://m.media-amazon.com/images/I/xbox-safe.jpg">
+  </div>
+</body></html>`
+	got, err := ExtractAmazon(html, ExtractOptions{
+		URL:        "https://www.amazon.com/dp/B08H75RTZ8",
+		CapturedAt: time.Unix(100, 0).UTC(),
+	})
+	if err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if got.ImageURL != "https://m.media-amazon.com/images/I/xbox-safe.jpg" {
+		t.Fatalf("image_url = %q, want safe fallback", got.ImageURL)
+	}
+	if len(got.Images) != 1 || got.Images[0] != got.ImageURL {
+		t.Fatalf("images = %v, want only safe URLs", got.Images)
 	}
 }
 

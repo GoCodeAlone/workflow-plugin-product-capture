@@ -104,11 +104,23 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.version=${{ github.ref_name }}
             org.opencontainers.image.description=workflow-compute product capture runtime with Node, Playwright, and Google Chrome
+      - name: Verify native amd64 release runner
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "x86_64"
+          test ! -e /run/rosetta/rosetta
       - name: Run exact candidate browser conformance
         run: |
           set -euo pipefail
           go run ./cmd/browser-runtime-conformance --image "$CANDIDATE" --output conformance.json
           jq -e '.verdict == "pass"' conformance.json
+          jq -e '
+            .profile_persistence.startup_crash_injected == true and
+            .profile_persistence.seed_cookie_observed == true and
+            .profile_persistence.crash_injected == true and
+            .profile_persistence.recovered_after_crash == true and
+            .profile_persistence.cookie_persisted == true
+          ' conformance.json
           tested_image_id=$(jq -r '.versions.image_id' conformance.json)
           if [ "$tested_image_id" != "${{ steps.build.outputs.imageid }}" ]; then
             echo "tested image ID does not match the loaded build" >&2
@@ -131,13 +143,27 @@ jobs:
             echo "local candidate image ID changed after conformance" >&2
             exit 1
           fi
+          repository="${CANDIDATE%:*}"
           docker push "$CANDIDATE"
-          digest=$(docker buildx imagetools inspect "$CANDIDATE" --format '{{json .Manifest.Digest}}' | tr -d '"')
-          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "registry returned invalid digest: $digest" >&2
+          mapfile -t pushed_refs < <(
+            docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$CANDIDATE" |
+              awk -v prefix="${repository}@" 'index($0, prefix) == 1'
+          )
+          if [ "${#pushed_refs[@]}" -ne 1 ]; then
+            echo "local candidate does not have exactly one pushed repository digest" >&2
             exit 1
           fi
-          provider_image_ref="${CANDIDATE%:*}@${digest}"
+          provider_image_ref="${pushed_refs[0]}"
+          digest="${provider_image_ref#*@}"
+          if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "local pushed image has invalid repository digest: $digest" >&2
+            exit 1
+          fi
+          remote_digest=$(docker buildx imagetools inspect "${repository}@${digest}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          if [ "$remote_digest" != "$digest" ]; then
+            echo "immutable registry digest does not match the pushed local image" >&2
+            exit 1
+          fi
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
           echo "provider_image_ref=$provider_image_ref" >> "$GITHUB_OUTPUT"
       - name: Report tested runtime provenance

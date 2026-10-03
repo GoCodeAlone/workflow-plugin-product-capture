@@ -52,7 +52,7 @@ func TestRunCompletesGenericProductCaptureRoundTrip(t *testing.T) {
 		t.Fatalf("capacity = %+v", summary.Capacity)
 	}
 	if summary.Product.Title != "Example product" ||
-		summary.Product.ImageURL != "https://images.example.test/product.jpg" ||
+		summary.Product.ImageURL != "https://m.media-amazon.com/images/I/product.jpg" ||
 		summary.Product.Price != "19.99" ||
 		summary.Product.Currency != "USD" {
 		t.Fatalf("product = %+v", summary.Product)
@@ -125,6 +125,109 @@ func TestRunCompletesGenericProductCaptureRoundTrip(t *testing.T) {
 		if strings.Contains(string(encoded), secret) {
 			t.Fatalf("summary leaked redacted input %q: %s", secret, encoded)
 		}
+	}
+}
+
+func TestBoundedProductSummaryAcceptsCanonicalAmazonAlias(t *testing.T) {
+	const requestedURL = "https://amazon.com/Example-Product/dp/B000000000?tag=wishlist"
+	summary, err := boundedProductSummary(productArtifact{
+		Provider:     "browser_capture",
+		URL:          "https://www.amazon.com/dp/B000000000",
+		RequestedURL: requestedURL,
+		CanonicalURL: "https://www.amazon.com/dp/B000000000",
+		ExternalID:   "B000000000",
+		Title:        "Example product",
+		ImageURL:     "https://m.media-amazon.com/images/I/product.jpg",
+		Price:        "19.99",
+		Currency:     "USD",
+	}, Config{
+		ProductURL:  requestedURL,
+		AllowedHost: "amazon.com",
+	})
+	if err != nil {
+		t.Fatalf("canonical Amazon alias summary: %v", err)
+	}
+	if summary.Price != "19.99" || summary.Currency != "USD" {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+func TestBoundedProductSummaryRejectsNonHTTPSProductURLs(t *testing.T) {
+	base := productArtifact{
+		Provider:     "browser_capture",
+		URL:          "https://www.amazon.com/dp/B000000000",
+		RequestedURL: "https://www.amazon.com/dp/B000000000",
+		CanonicalURL: "https://www.amazon.com/dp/B000000000",
+		ExternalID:   "B000000000",
+		Title:        "Example product",
+		ImageURL:     "https://m.media-amazon.com/images/I/product.jpg",
+		Price:        "19.99",
+		Currency:     "USD",
+	}
+	tests := map[string]func(*productArtifact){
+		"product url":   func(product *productArtifact) { product.URL = "http://www.amazon.com/dp/B000000000" },
+		"canonical url": func(product *productArtifact) { product.CanonicalURL = "http://www.amazon.com/dp/B000000000" },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			product := base
+			mutate(&product)
+			if _, err := boundedProductSummary(product, Config{
+				ProductURL:  base.RequestedURL,
+				AllowedHost: "www.amazon.com",
+			}); err == nil {
+				t.Fatal("boundedProductSummary accepted a non-HTTPS product URL")
+			}
+		})
+	}
+}
+
+func TestRunRejectsCaptureInputOutsidePublishedSchemaBeforeNetworkAccess(t *testing.T) {
+	tests := map[string]struct {
+		productURL string
+		want       string
+	}{
+		"non-HTTPS": {
+			productURL: "http://www.amazon.com/dp/B000000000",
+			want:       "absolute HTTPS",
+		},
+		"schema URL bound": {
+			productURL: "https://www.amazon.com/" + strings.Repeat("x", 2048) + "/dp/B000000000",
+			want:       "capture_product input schema",
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+			t.Cleanup(server.Close)
+			cfg := testConfig(t, server.URL)
+			cfg.ProductURL = tc.productURL
+
+			_, err := Run(t.Context(), cfg)
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("Run error = %v, want %q rejection", err, tc.want)
+			}
+			if calls != 0 {
+				t.Fatalf("capture input validation made %d control-plane requests", calls)
+			}
+		})
+	}
+}
+
+func TestRunRejectsDiagnosticInputOutsidePublishedSchemaBeforeNetworkAccess(t *testing.T) {
+	calls := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { calls++ }))
+	t.Cleanup(server.Close)
+	cfg := testConfig(t, server.URL)
+	cfg.BrowserDiagnosticURL = "https://diagnostic.example.test/" + strings.Repeat("x", 2048)
+
+	_, err := Run(t.Context(), cfg)
+	if err == nil || !strings.Contains(err.Error(), "browser_diagnostic input schema") {
+		t.Fatalf("Run error = %v, want diagnostic input schema rejection", err)
+	}
+	if calls != 0 {
+		t.Fatalf("diagnostic input validation made %d control-plane requests", calls)
 	}
 }
 
@@ -387,6 +490,9 @@ func TestRunRejectsInvalidProductArtifacts(t *testing.T) {
 		"wrong content type":     func(f *computeFixture) { f.artifactContentType = "text/plain" },
 		"oversized metadata":     func(f *computeFixture) { f.artifactSize = (1 << 20) + 1 },
 		"metadata size mismatch": func(f *computeFixture) { f.artifactSize = int64(len(valid) - 1) },
+		"truncated product output": func(f *computeFixture) {
+			f.artifactTruncated = true
+		},
 		"oversized body": func(f *computeFixture) {
 			f.productBody = append(valid, make([]byte, (1<<20)-len(valid)+1)...)
 			f.artifactSize = int64(len(valid))
@@ -408,11 +514,17 @@ func TestRunRejectsInvalidProductArtifacts(t *testing.T) {
 		"wrong result host": func(f *computeFixture) {
 			setProductField(f, "url", "https://example.test/dp/B000000000")
 		},
+		"non-default result port": func(f *computeFixture) {
+			setProductField(f, "url", "https://www.amazon.com:8443/dp/B000000000")
+		},
 		"wrong result asin": func(f *computeFixture) {
 			setProductField(f, "url", "https://www.amazon.com/dp/B111111111")
 		},
 		"wrong canonical asin": func(f *computeFixture) {
 			setProductField(f, "canonical_url", "https://www.amazon.com/dp/B111111111")
+		},
+		"non-default canonical port": func(f *computeFixture) {
+			setProductField(f, "canonical_url", "https://www.amazon.com:8443/dp/B000000000")
 		},
 		"wrong external id": func(f *computeFixture) { setProductField(f, "external_id", "B111111111") },
 		"wrong provider":    func(f *computeFixture) { setProductField(f, "provider", "amazon") },
@@ -420,6 +532,15 @@ func TestRunRejectsInvalidProductArtifacts(t *testing.T) {
 		"missing currency":  func(f *computeFixture) { setProductField(f, "currency", "") },
 		"credential image url": func(f *computeFixture) {
 			setProductField(f, "image_url", "https://user:password@images.example.test/product.jpg")
+		},
+		"plaintext image url": func(f *computeFixture) {
+			setProductField(f, "image_url", "http://images.example.test/product.jpg")
+		},
+		"non-default image port": func(f *computeFixture) {
+			setProductField(f, "image_url", "https://images.example.test:8443/product.jpg")
+		},
+		"literal image host": func(f *computeFixture) {
+			setProductField(f, "image_url", "https://127.0.0.1/product.jpg")
 		},
 		"unbounded title": func(f *computeFixture) {
 			var product map[string]any
@@ -1335,29 +1456,39 @@ func testConfig(t *testing.T, serverURL string) Config {
 	if err != nil {
 		t.Fatalf("read product schema: %v", err)
 	}
+	productInputSchema, err := os.ReadFile(filepath.Join("..", "..", "schemas", "product-capture-operation-input.schema.json"))
+	if err != nil {
+		t.Fatalf("read product input schema: %v", err)
+	}
 	diagnosticSchema, err := os.ReadFile(filepath.Join("..", "..", "schemas", "browser-diagnostic-result.schema.json"))
 	if err != nil {
 		t.Fatalf("read diagnostic schema: %v", err)
 	}
+	diagnosticInputSchema, err := os.ReadFile(filepath.Join("..", "..", "schemas", "browser-diagnostic-operation-input.schema.json"))
+	if err != nil {
+		t.Fatalf("read diagnostic input schema: %v", err)
+	}
 	return Config{
-		ServerURL:          serverURL,
-		Token:              "scoped-task-token",
-		OrgID:              "org-1",
-		PoolID:             "pool-1",
-		ProductID:          "bmw-product-capture",
-		PolicyID:           "product-capture-staging",
-		WorkerID:           "worker-1",
-		ProductURL:         "https://www.amazon.com/dp/B000000000",
-		AllowedHost:        "www.amazon.com",
-		ProviderImageRef:   testImageRef,
-		Contract:           contract,
-		ProductSchema:      productSchema,
-		DiagnosticSchema:   diagnosticSchema,
-		PollInterval:       time.Millisecond,
-		CapacityTimeout:    100 * time.Millisecond,
-		ResultTimeout:      100 * time.Millisecond,
-		ArtifactTimeout:    100 * time.Millisecond,
-		TaskTimeoutSeconds: 120,
+		ServerURL:             serverURL,
+		Token:                 "scoped-task-token",
+		OrgID:                 "org-1",
+		PoolID:                "pool-1",
+		ProductID:             "bmw-product-capture",
+		PolicyID:              "product-capture-staging",
+		WorkerID:              "worker-1",
+		ProductURL:            "https://www.amazon.com/dp/B000000000",
+		AllowedHost:           "www.amazon.com",
+		ProviderImageRef:      testImageRef,
+		Contract:              contract,
+		ProductInputSchema:    productInputSchema,
+		ProductSchema:         productSchema,
+		DiagnosticInputSchema: diagnosticInputSchema,
+		DiagnosticSchema:      diagnosticSchema,
+		PollInterval:          time.Millisecond,
+		CapacityTimeout:       100 * time.Millisecond,
+		ResultTimeout:         100 * time.Millisecond,
+		ArtifactTimeout:       100 * time.Millisecond,
+		TaskTimeoutSeconds:    120,
 	}
 }
 
@@ -1376,6 +1507,7 @@ type computeFixture struct {
 	artifactSize                      int64
 	artifactSHA256                    string
 	artifactRef                       string
+	artifactTruncated                 bool
 	runLogBody                        []byte
 	diagnosticRunLogBody              []byte
 	taskStatus                        protocol.TaskStatus
@@ -1648,12 +1780,30 @@ func (f *computeFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if f.artifactRef != "" {
 			ref = f.artifactRef
 		}
-		f.writeJSON(w, map[string]any{"artifacts": []protocol.TaskArtifact{{
+		artifact := protocol.TaskArtifact{
 			TaskID: task.ID, ProofID: proofID, PoolID: task.PoolID,
 			Name: name, Ref: ref,
 			ContentType: contentType, SHA256: sha, SizeBytes: size,
 			CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour).UTC(),
-		}}})
+			Truncated: f.artifactTruncated,
+		}
+		if artifact.Truncated {
+			artifact.OriginalSizeBytes = size + 1
+		}
+		if name == "run-logs/stderr.txt" {
+			artifact.ContentType = "application/octet-stream"
+			artifact.ArtifactClass = "run-log"
+			artifact.Visibility = protocol.AccessVisibilityPrivate
+			artifact.UploaderKind = "agent"
+			artifact.UploaderID = "worker-1"
+			artifact.PolicySource = "provider"
+			artifact.PolicyRef = "provider:workflow-plugin-product-capture/browser"
+			artifact.PolicyHash = sha256RefForTest([]byte("product-capture-run-log-policy"))
+			artifact.ProviderEnrollmentID = "provider-enrollment-product-capture"
+			artifact.PolicyRetentionSeconds = 3600
+			artifact.PolicyRequestAdjusted = true
+		}
+		f.writeJSON(w, map[string]any{"artifacts": []protocol.TaskArtifact{artifact}})
 	case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/proofs/") && strings.Contains(r.URL.Path, "/artifacts/"):
 		body := f.productBody
 		if strings.HasSuffix(r.URL.Path, "/artifacts/run-logs/stderr.txt") {
@@ -1779,7 +1929,7 @@ func productJSON() []byte {
 		"variant_key":"exact-url-sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"price":"19.99",
 		"currency":"USD",
-		"image_url":"https://images.example.test/product.jpg",
+		"image_url":"https://m.media-amazon.com/images/I/product.jpg",
 		"captured_at":"2026-07-13T12:00:00Z",
 		"requires_user_confirmation":true
 	}`)

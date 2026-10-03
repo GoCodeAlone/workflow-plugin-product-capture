@@ -18,9 +18,9 @@
     {
       "id": "capture_product",
       "input_schema_ref": "schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/input/v1",
-      "input_schema_digest": "sha256:6ed4104153a293d6b75edf6a9fa8190ad3fa71d62df1af93f7e46f72c6bb3e8c",
+      "input_schema_digest": "sha256:c8671390a38b278d75595584c4f02870ad4d52a6c0ee77c72cf6d9a3fdb07b6e",
       "output_schema_ref": "schema://providers/workflow-plugin-product-capture/browser/operations/capture_product/output/v1",
-      "output_schema_digest": "sha256:d2e9b8b1d9c8b8e48b1d3789f6f6325e2c54aada7ab23d25d8c857a7ab20ab84",
+      "output_schema_digest": "sha256:3f0e97c257737c99069aadf194dc44fc923c0383defe46f39bf452e1d2f87b52",
       "artifact_specs": [
         {
           "name": "product_json",
