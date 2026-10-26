@@ -3418,10 +3418,10 @@ func startTruncatedTestDNSServer(t *testing.T, expectedName string, aRecord [4]b
 }
 
 func TestPinnedCloudflaredReleaseMetadata(t *testing.T) {
-	if CloudflaredVersion != "2026.7.1" || CloudflaredSHA256 != "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1" {
+	if CloudflaredVersion != "2026.10.3" || CloudflaredSHA256 != "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0" {
 		t.Fatalf("cloudflared pin = %s/%s", CloudflaredVersion, CloudflaredSHA256)
 	}
-	wantURL := "https://github.com/cloudflare/cloudflared/releases/download/2026.7.1/cloudflared-linux-amd64"
+	wantURL := "https://github.com/cloudflare/cloudflared/releases/download/2026.10.3/cloudflared-linux-amd64"
 	if CloudflaredDownloadURL != wantURL {
 		t.Fatalf("cloudflared URL = %q, want %q", CloudflaredDownloadURL, wantURL)
 	}

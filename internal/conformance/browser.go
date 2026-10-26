@@ -38,8 +38,8 @@ const (
 	VerdictFail                    = "fail"
 	MaxObservationBytes            = 64 << 10
 	MaxPageBytes                   = 16 << 10
-	CloudflaredVersion             = "2026.7.1"
-	CloudflaredSHA256              = "79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1"
+	CloudflaredVersion             = "2026.10.3"
+	CloudflaredSHA256              = "053b80b0a23031a038fdbf3c073f59f82b8f1f152aa67971d7383ffafc0dbab0"
 	CloudflaredDownloadURL         = "https://github.com/cloudflare/cloudflared/releases/download/" + CloudflaredVersion + "/cloudflared-linux-amd64"
 	diagnosticDNSResolverIP        = "1.1.1.1"
 	diagnosticDNSResolverAddress   = diagnosticDNSResolverIP + ":53"
